@@ -68,11 +68,13 @@ func (s *Server) CompareAndSwap(_ context.Context, req *kvv1.CASRequest) (*kvv1.
 
 // toStatus maps store errors to gRPC codes. Clients use the code to decide
 // whether a retry is safe: Unavailable/Internal are retryable (with the
-// same RequestMeta!), InvalidArgument/Unimplemented are not.
+// same RequestMeta!), InvalidArgument/FailedPrecondition are not.
 func toStatus(err error) error {
 	switch {
-	case errors.Is(err, store.ErrNotImplemented):
-		return status.Error(codes.Unimplemented, err.Error())
+	case errors.Is(err, store.ErrClosed):
+		return status.Error(codes.Unavailable, err.Error())
+	case errors.Is(err, store.ErrStaleRequest):
+		return status.Error(codes.FailedPrecondition, err.Error())
 	default:
 		return status.Error(codes.Internal, err.Error())
 	}

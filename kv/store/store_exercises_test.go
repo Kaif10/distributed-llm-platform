@@ -1,12 +1,6 @@
-//go:build exercises
-
-// These tests describe the Phase 1 exercises. They are excluded from the
-// normal build so `make test` stays green while you work. Run them with:
-//
-//	make test-exercises
-//
-// When they pass, remove the build tag at the top of this file so they run
-// with everything else forever.
+// These tests describe the Phase 1 exercises: compare-and-swap and
+// idempotent retries. They were gated behind a build tag until the
+// exercises were implemented; now they run with everything else.
 package store
 
 import (

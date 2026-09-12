@@ -20,9 +20,9 @@ test:
 test-crash:
 	go test -count=1 -run TestCrashRecovery -v ./kv/wal/ -crash-iterations=200
 
-# Phase 1 exercises (CAS, idempotent retries). Fails until you implement them.
+# Phase 1 exercise tests (CAS, idempotent retries, group commit).
 test-exercises:
-	go test -race -count=1 -tags exercises ./kv/store/
+	go test -race -count=1 -v -run 'TestCAS|TestDuplicate|TestDedup|TestGroupCommit|TestClose|TestStale' ./kv/store/
 
 lint:
 	go vet ./...

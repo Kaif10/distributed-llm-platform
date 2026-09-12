@@ -52,7 +52,7 @@ docs/       per-phase notes, exercises, interview prep
 ## Status
 
 - [x] Phase 0: toolchain
-- [ ] Phase 1: durable single-node KV (WAL done; CAS + idempotent retries are your exercises)
+- [x] Phase 1: durable single-node KV (WAL, CAS, idempotent retries, group commit)
 - [ ] Phase 2: Raft
 - [ ] Phase 3: sharding
 - [ ] Phase 4: scheduler

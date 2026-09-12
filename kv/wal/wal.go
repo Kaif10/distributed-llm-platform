@@ -119,22 +119,42 @@ func (w *WAL) Replay(fn func(payload []byte) error) error {
 // Append writes one record and, unless NoSync is set, fsyncs it. When Append
 // returns nil the record is durable.
 func (w *WAL) Append(payload []byte) error {
-	if len(payload) > maxPayloadSize {
-		return fmt.Errorf("wal: payload too large: %d bytes", len(payload))
+	return w.AppendBatch([][]byte{payload})
+}
+
+// AppendBatch writes several records with a single write and a single fsync.
+// When it returns nil every record in the batch is durable. This is the
+// primitive behind group commit: the cost of an fsync is paid once per batch
+// instead of once per record.
+//
+// If it fails, the caller must assume none of the batch is durable; a crash
+// may leave a prefix of it, which recovery handles like any torn tail.
+func (w *WAL) AppendBatch(payloads [][]byte) error {
+	total := 0
+	for _, p := range payloads {
+		if len(p) > maxPayloadSize {
+			return fmt.Errorf("wal: payload too large: %d bytes", len(p))
+		}
+		total += headerSize + len(p)
 	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
 		return ErrClosed
 	}
 
-	// Build the whole record in one buffer and issue a single write. A single
+	// Build every record into one buffer and issue a single write. A single
 	// write is not atomic on most filesystems, but it minimizes the window
 	// for a torn record and avoids interleaving.
-	buf := make([]byte, headerSize+len(payload))
-	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(payload)))
-	binary.LittleEndian.PutUint32(buf[4:8], crc32.Checksum(payload, castagnoli))
-	copy(buf[headerSize:], payload)
+	buf := make([]byte, total)
+	at := 0
+	for _, p := range payloads {
+		binary.LittleEndian.PutUint32(buf[at:at+4], uint32(len(p)))
+		binary.LittleEndian.PutUint32(buf[at+4:at+8], crc32.Checksum(p, castagnoli))
+		copy(buf[at+headerSize:], p)
+		at += headerSize + len(p)
+	}
 
 	if _, err := w.f.WriteAt(buf, w.off); err != nil {
 		return err
