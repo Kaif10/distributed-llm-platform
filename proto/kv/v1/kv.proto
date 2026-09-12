@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+package kv.v1;
+
+option go_package = "dsys/gen/kv/v1;kvv1";
+
+// KV is the client-facing API of the store.
+//
+// Every mutating request carries RequestMeta so the server can detect a
+// retried request and return the original result instead of applying the
+// mutation twice. This is how "exactly-once" is actually built: at-least-once
+// delivery (client retries) + server-side deduplication.
+service KV {
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc CompareAndSwap(CASRequest) returns (CASResponse);
+}
+
+// RequestMeta identifies a logical client request. A client picks a random
+// client_id at startup and increments request_id for every new request.
+// A retry of the same request reuses the same (client_id, request_id).
+message RequestMeta {
+  string client_id = 1;
+  uint64 request_id = 2;
+}
+
+message PutRequest {
+  RequestMeta meta = 1;
+  string key = 2;
+  bytes value = 3;
+}
+message PutResponse {}
+
+message GetRequest {
+  string key = 1;
+}
+message GetResponse {
+  bytes value = 1;
+  bool found = 2;
+}
+
+message DeleteRequest {
+  RequestMeta meta = 1;
+  string key = 2;
+}
+message DeleteResponse {
+  bool existed = 1;
+}
+
+// CompareAndSwap writes value only if the current value equals expected
+// (or the key is absent, when expect_absent is set). It is the primitive
+// that later phases build locks, leases, and counters on top of.
+message CASRequest {
+  RequestMeta meta = 1;
+  string key = 2;
+  bytes expected = 3;
+  bool expect_absent = 4;
+  bytes value = 5;
+}
+message CASResponse {
+  bool swapped = 1;
+  bytes current = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Storage-side types. These are what goes into the write-ahead log.
+// In Phase 2 these exact entries become the payload Raft replicates.
+// ---------------------------------------------------------------------------
+
+enum Op {
+  OP_UNSPECIFIED = 0;
+  OP_PUT = 1;
+  OP_DELETE = 2;
+  OP_CAS = 3;
+}
+
+message LogEntry {
+  Op op = 1;
+  string key = 2;
+  bytes value = 3;
+  bytes expected = 4;
+  bool expect_absent = 5;
+  RequestMeta meta = 6;
+}
