@@ -3,10 +3,10 @@
 //
 // # The core pattern (remember this, it is Raft's state machine too)
 //
-//	1. Serialize the command (a LogEntry).
-//	2. Append it to the log and wait until it is durable.
-//	3. Apply it to the in-memory state.
-//	4. Reply to the client.
+//  1. Serialize the command (a LogEntry).
+//  2. Append it to the log and wait until it is durable.
+//  3. Apply it to the in-memory state.
+//  4. Reply to the client.
 //
 // On restart: replay the log, applying every entry in order, and you are back
 // exactly where you were. For that to be true, apply must be deterministic:
@@ -16,6 +16,11 @@
 //
 // In Phase 2 the only change is that step 2 becomes "get a majority of
 // replicas to durably log it" instead of "fsync locally".
+//
+// The package is split along that seam. Machine (machine.go) is step 3 on
+// its own: the deterministic in-memory state plus snapshot/restore, with no
+// locks or I/O. Store (this file) is steps 1, 2 and 4 around it: the WAL,
+// the committer, and the locking. Raft replaces Store and keeps Machine.
 //
 // # Group commit
 //
@@ -40,7 +45,6 @@
 package store
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -81,24 +85,10 @@ type Stats struct {
 
 // Store is safe for concurrent use.
 type Store struct {
-	// mu guards data and sessions. It is held only for in-memory work:
-	// reads, the dedup fast path, and apply. Never across an fsync.
-	mu   sync.RWMutex
-	data map[string][]byte
-
-	// sessions is the deduplication table: for each client, the highest
-	// request id applied so far and the result it produced. A retry with the
-	// same id gets that result back without being applied again.
-	//
-	// It lives in memory only, and that is enough: it is updated inside
-	// apply, and apply runs on replay, so a restart rebuilds it from the log
-	// exactly like it rebuilds data.
-	//
-	// Assumption: one outstanding request per client at a time, so ids
-	// arrive in increasing order and remembering only the latest suffices.
-	// This is the same assumption the MIT 6.5840 labs make. Relaxing it
-	// means remembering a window of ids per client, and bounding it.
-	sessions map[string]session
+	// mu guards m. It is held only for in-memory work: reads, the dedup
+	// fast path, and apply. Never across an fsync.
+	mu sync.RWMutex
+	m  *Machine
 
 	log *wal.WAL
 
@@ -113,12 +103,6 @@ type Store struct {
 	entries atomic.Uint64
 }
 
-// session is what we remember per client.
-type session struct {
-	lastID     uint64
-	lastResult result
-}
-
 // pending is one write waiting for the committer.
 type pending struct {
 	entry   *kvv1.LogEntry
@@ -127,16 +111,8 @@ type pending struct {
 }
 
 type outcome struct {
-	r   result
+	r   Result
 	err error
-}
-
-// result is what applying an entry produces. It is returned to the caller
-// and remembered per client so a retried request gets the same answer.
-type result struct {
-	existed bool   // Delete
-	swapped bool   // CAS
-	current []byte // CAS
 }
 
 // Open opens or creates a store in dir, replaying its log.
@@ -149,19 +125,19 @@ func Open(dir string, opts Options) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		data:     make(map[string][]byte),
-		sessions: make(map[string]session),
-		log:      w,
-		queue:    make(chan *pending, maxBatch),
+		m:     NewMachine(),
+		log:   w,
+		queue: make(chan *pending, maxBatch),
 	}
 
-	// Recovery is just "apply every logged command again".
+	// Recovery is just "apply every logged command again". Nobody else has
+	// a reference to s yet, so no lock is needed around Apply here.
 	err = w.Replay(func(payload []byte) error {
 		var e kvv1.LogEntry
 		if err := proto.Unmarshal(payload, &e); err != nil {
 			return fmt.Errorf("store: decode log entry: %w", err)
 		}
-		s.apply(&e)
+		s.m.Apply(&e)
 		return nil
 	})
 	if err != nil {
@@ -199,12 +175,7 @@ func (s *Store) Stats() Stats {
 func (s *Store) Get(key string) ([]byte, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	v, ok := s.data[key]
-	if !ok {
-		return nil, false
-	}
-	// Return a copy so callers cannot mutate our state behind the lock.
-	return append([]byte(nil), v...), true
+	return s.m.Get(key)
 }
 
 // Put durably sets key to value.
@@ -219,7 +190,7 @@ func (s *Store) Delete(key string, meta *kvv1.RequestMeta) (existed bool, err er
 	if err != nil {
 		return false, err
 	}
-	return r.existed, nil
+	return r.Existed, nil
 }
 
 // CompareAndSwap sets key to value if its current value equals expected
@@ -250,20 +221,20 @@ func (s *Store) CompareAndSwap(key string, expected []byte, expectAbsent bool, v
 	if err != nil {
 		return false, nil, err
 	}
-	return r.swapped, r.current, nil
+	return r.Swapped, r.Current, nil
 }
 
 // commit is the write path: hand the entry to the committer and wait.
-func (s *Store) commit(e *kvv1.LogEntry) (result, error) {
+func (s *Store) commit(e *kvv1.LogEntry) (Result, error) {
 	payload, err := proto.Marshal(e)
 	if err != nil {
-		return result{}, err
+		return Result{}, err
 	}
 
 	// Fast path: a retry of something already applied never touches the
-	// disk. apply would catch it too; this just saves the write.
+	// disk. Apply would catch it too; this just saves the write.
 	s.mu.RLock()
-	r, done, err := s.dedup(e.Meta)
+	r, done, err := s.m.Dedup(e.Meta)
 	s.mu.RUnlock()
 	if done || err != nil {
 		return r, err
@@ -274,7 +245,7 @@ func (s *Store) commit(e *kvv1.LogEntry) (result, error) {
 	s.qmu.RLock()
 	if s.closed {
 		s.qmu.RUnlock()
-		return result{}, ErrClosed
+		return Result{}, ErrClosed
 	}
 	s.queue <- p // may block briefly if the committer is behind; that is backpressure
 	s.qmu.RUnlock()
@@ -283,7 +254,7 @@ func (s *Store) commit(e *kvv1.LogEntry) (result, error) {
 	return o.r, o.err
 }
 
-// committer is the only goroutine that writes to the log or calls apply on
+// committer is the only goroutine that writes to the log or calls Apply on
 // the live path. It runs until Close closes the queue and the queue drains.
 func (s *Store) committer() {
 	defer s.wg.Done()
@@ -324,91 +295,9 @@ func (s *Store) committer() {
 				p.done <- outcome{err: err}
 				continue
 			}
-			p.done <- outcome{r: s.apply(p.entry)}
+			p.done <- outcome{r: s.m.Apply(p.entry)}
 		}
 		s.mu.Unlock()
-	}
-}
-
-// dedup reports whether the request described by meta has already been
-// applied (done=true, with its original result) or is stale (err != nil).
-// Requests without meta are always applied; that is the caller opting out
-// of exactly-once. Caller holds mu (read or write).
-func (s *Store) dedup(meta *kvv1.RequestMeta) (r result, done bool, err error) {
-	if meta == nil || meta.ClientId == "" {
-		return result{}, false, nil
-	}
-	sess, ok := s.sessions[meta.ClientId]
-	if !ok {
-		return result{}, false, nil
-	}
-	switch {
-	case meta.RequestId == sess.lastID:
-		return sess.lastResult, true, nil
-	case meta.RequestId < sess.lastID:
-		return result{}, false, ErrStaleRequest
-	}
-	return result{}, false, nil
-}
-
-// apply mutates in-memory state. Caller holds mu. Must be deterministic.
-//
-// apply is itself idempotent with respect to RequestMeta: applying the same
-// (client, request) twice mutates once. That makes the log tolerant of
-// duplicate entries, which matters because a duplicate can land in the same
-// batch as its original (both passed the fast path before either was
-// applied), and again in Raft, where a leader change can cause a client's
-// retry to be logged a second time.
-func (s *Store) apply(e *kvv1.LogEntry) result {
-	if r, done, err := s.dedup(e.Meta); done || err != nil {
-		// Stale ids are also skipped here: on replay there is nobody to
-		// return an error to, and skipping is the only deterministic choice.
-		return r
-	}
-	r := s.applyOp(e)
-	if e.Meta != nil && e.Meta.ClientId != "" {
-		s.sessions[e.Meta.ClientId] = session{lastID: e.Meta.RequestId, lastResult: r}
-	}
-	return r
-}
-
-// applyOp performs the state change for one entry. Caller holds mu.
-func (s *Store) applyOp(e *kvv1.LogEntry) result {
-	switch e.Op {
-	case kvv1.Op_OP_PUT:
-		s.data[e.Key] = e.Value
-		return result{}
-	case kvv1.Op_OP_DELETE:
-		_, existed := s.data[e.Key]
-		delete(s.data, e.Key)
-		return result{existed: existed}
-	case kvv1.Op_OP_CAS:
-		// This runs both live and on replay, and must reach the same decision
-		// both times. It does, because the decision depends only on
-		// (current state, entry), and replay reproduces both in order.
-		cur, present := s.data[e.Key]
-		var matches bool
-		if e.ExpectAbsent {
-			matches = !present
-		} else {
-			matches = present && bytes.Equal(cur, e.Expected)
-		}
-		// Report what was there at decision time, copied so the caller
-		// cannot alias our map. On a failed CAS this lets a client retry
-		// with the right expectation instead of doing a separate Get.
-		res := result{}
-		if present {
-			res.current = append([]byte(nil), cur...)
-		}
-		if matches {
-			s.data[e.Key] = e.Value
-			res.swapped = true
-		}
-		return res
-	default:
-		// An unknown op in the log means a newer binary wrote it. Crashing
-		// loudly is better than silently skipping a write.
-		panic(fmt.Sprintf("store: unknown op %v in log", e.Op))
 	}
 }
 
@@ -416,5 +305,5 @@ func (s *Store) applyOp(e *kvv1.LogEntry) result {
 func (s *Store) Len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return len(s.data)
+	return s.m.Len()
 }

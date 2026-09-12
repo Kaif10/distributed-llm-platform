@@ -28,6 +28,10 @@ const (
 	Op_OP_PUT         Op = 1
 	Op_OP_DELETE      Op = 2
 	Op_OP_CAS         Op = 3
+	// OP_GET is a read that goes through the log. A plain Get reads local
+	// state, which is fine on a single node but not on a Raft replica that may
+	// be behind; logging the read makes it linearizable.
+	Op_OP_GET Op = 4
 )
 
 // Enum value maps for Op.
@@ -37,12 +41,14 @@ var (
 		1: "OP_PUT",
 		2: "OP_DELETE",
 		3: "OP_CAS",
+		4: "OP_GET",
 	}
 	Op_value = map[string]int32{
 		"OP_UNSPECIFIED": 0,
 		"OP_PUT":         1,
 		"OP_DELETE":      2,
 		"OP_CAS":         3,
+		"OP_GET":         4,
 	}
 )
 
@@ -673,14 +679,16 @@ const file_kv_v1_kv_proto_rawDesc = "" +
 	"\x05value\x18\x03 \x01(\fR\x05value\x12\x1a\n" +
 	"\bexpected\x18\x04 \x01(\fR\bexpected\x12#\n" +
 	"\rexpect_absent\x18\x05 \x01(\bR\fexpectAbsent\x12&\n" +
-	"\x04meta\x18\x06 \x01(\v2\x12.kv.v1.RequestMetaR\x04meta*?\n" +
+	"\x04meta\x18\x06 \x01(\v2\x12.kv.v1.RequestMetaR\x04meta*K\n" +
 	"\x02Op\x12\x12\n" +
 	"\x0eOP_UNSPECIFIED\x10\x00\x12\n" +
 	"\n" +
 	"\x06OP_PUT\x10\x01\x12\r\n" +
 	"\tOP_DELETE\x10\x02\x12\n" +
 	"\n" +
-	"\x06OP_CAS\x10\x032\xd0\x01\n" +
+	"\x06OP_CAS\x10\x03\x12\n" +
+	"\n" +
+	"\x06OP_GET\x10\x042\xd0\x01\n" +
 	"\x02KV\x12,\n" +
 	"\x03Put\x12\x11.kv.v1.PutRequest\x1a\x12.kv.v1.PutResponse\x12,\n" +
 	"\x03Get\x12\x11.kv.v1.GetRequest\x1a\x12.kv.v1.GetResponse\x125\n" +

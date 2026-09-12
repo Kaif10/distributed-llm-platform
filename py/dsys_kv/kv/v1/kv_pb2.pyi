@@ -12,10 +12,12 @@ class Op(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     OP_PUT: _ClassVar[Op]
     OP_DELETE: _ClassVar[Op]
     OP_CAS: _ClassVar[Op]
+    OP_GET: _ClassVar[Op]
 OP_UNSPECIFIED: Op
 OP_PUT: Op
 OP_DELETE: Op
 OP_CAS: Op
+OP_GET: Op
 
 class RequestMeta(_message.Message):
     __slots__ = ("client_id", "request_id")

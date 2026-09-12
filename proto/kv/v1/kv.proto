@@ -73,6 +73,10 @@ enum Op {
   OP_PUT = 1;
   OP_DELETE = 2;
   OP_CAS = 3;
+  // OP_GET is a read that goes through the log. A plain Get reads local
+  // state, which is fine on a single node but not on a Raft replica that may
+  // be behind; logging the read makes it linearizable.
+  OP_GET = 4;
 }
 
 message LogEntry {
