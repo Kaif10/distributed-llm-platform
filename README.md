@@ -16,6 +16,9 @@ make test-crash        # kill-mid-write durability test, 200 iterations
 make build             # bin/kvserver.exe, bin/raftkv.exe, bin/kvctl.exe
 make test-raft         # Raft suite: elections, replication, persistence, snapshots
 make test-lin          # Porcupine linearizability check under partitions and crashes
+make test-shard        # sharding: rebalancing + migration, linearizability across shard moves
+make test-sched        # scheduler: exactly-once under 1000+ pauses/crashes, plus over real Raft
+make e2e-sched         # scheduler end to end against real processes (crash + zombie worker)
 ```
 
 ```bash
@@ -58,6 +61,20 @@ while writes are in flight: the controller rebalances shards onto it live,
 each shard's data and dedup sessions migrate, and every key keeps resolving
 through `kvctl` with no manual intervention.
 
+Job scheduler (Phase 4) on top of any KV cluster above, flat or sharded:
+
+```powershell
+.\bin\sched.exe -addr 127.0.0.1:7400 -kv 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
+.\bin\worker.exe -sched 127.0.0.1:7400 -name w1 -concurrency 2
+.\bin\schedctl.exe -sched 127.0.0.1:7400 submit '{"sleep_ms":200,"echo":"hi"}'
+.\bin\schedctl.exe -sched 127.0.0.1:7400 watch 1
+```
+
+The roadmap's "break it" experiment: start a worker with `-suppress-heartbeat -slow-after 1`,
+watch it finish a job after its lease expired, and see its result refused as fenced while the
+job is completed exactly once by another worker. `make e2e-sched` runs that whole scenario
+against real processes, plus a crashed worker, and checks every job.
+
 Single-node server (Phase 1):
 
 ```powershell
@@ -94,8 +111,15 @@ shardkv/    one shard-owning replica group: Machine driven by Raft, plus a
             loop that pulls shards in from their previous owner
 shardkv/grpctransport  cross-group shard migration RPC, and a Controller
             adapter around the shardctrl client
-cmd/        kvserver (single node), raftkv (replica), shardctrl, shardkv,
-            kvctl (leader- and shard-aware client), shardctl (admin CLI)
+kv/client   the reusable KV client: retries with a stable RequestMeta, follows
+            leader hints, resolves shard owners, re-resolves on wrong-group
+sched/      job queue built purely from CAS: leases for liveness, gen (fencing
+            token) for safety, bounded admission, leader-elected reaper
+sched/worker  pull-model worker library: heartbeats, cancel-on-fence, no
+            retry of a fenced Complete
+cmd/        kvserver, raftkv, shardctrl, shardkv, sched, worker,
+            kvctl, shardctl, schedctl
+scripts/    e2e_sched.sh: real-process end-to-end scenario for the scheduler
 py/         Python client + generated stubs
 docs/       per-phase notes, exercises, interview prep
 ```
@@ -106,7 +130,7 @@ docs/       per-phase notes, exercises, interview prep
 - [x] Phase 1: durable single-node KV (WAL, CAS, idempotent retries, group commit)
 - [x] Phase 2: Raft consensus, replicated KV, linearizability-checked
 - [x] Phase 3: sharding, live migration, deterministic rebalancing
-- [ ] Phase 4: scheduler
+- [x] Phase 4: scheduler: leases, fencing tokens, exactly-once commit, admission control
 - [ ] Phase 5: LLM layer
 - [ ] Phase 6: chaos + observability
 - [ ] Phase 7: write-up

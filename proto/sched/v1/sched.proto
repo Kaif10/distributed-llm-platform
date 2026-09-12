@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+package sched.v1;
+
+option go_package = "dsys/gen/sched/v1;schedv1";
+
+// Scheduler is the job queue's client-facing API. Producers Submit jobs;
+// workers Claim them under a lease, Heartbeat to keep the lease, and
+// Complete or Fail them. Every worker-side mutation carries the fencing
+// token (gen) the worker was given at Claim time; a stale token is refused
+// with FailedPrecondition, which is how a worker that was paused past its
+// lease finds out its work has been given to someone else.
+service Scheduler {
+  // Submit enqueues a job. ResourceExhausted (with retry_after_ms in the
+  // error details/message) when the queue is at capacity: shed load at
+  // admission, do not accept work you cannot start.
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
+  // Claim hands the caller the oldest runnable job under a fresh lease.
+  // found=false when nothing is runnable; poll again after a backoff.
+  rpc Claim(ClaimRequest) returns (ClaimResponse);
+  // Heartbeat extends the lease. FailedPrecondition if gen is stale.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  // Complete records the result and finishes the job. FailedPrecondition
+  // if gen is stale: someone else owns the job now, discard your result.
+  rpc Complete(CompleteRequest) returns (CompleteResponse);
+  // Fail reports an attempt failed; the job is requeued (gen advances) or
+  // marked FAILED once attempts are exhausted. FailedPrecondition if stale.
+  rpc Fail(FailRequest) returns (FailResponse);
+  // Status reads a job record.
+  rpc Status(StatusRequest) returns (StatusResponse);
+  // Stats reports queue depth.
+  rpc Stats(StatsRequest) returns (StatsResponse);
+}
+
+enum State {
+  STATE_UNSPECIFIED = 0;
+  STATE_PENDING = 1; // runnable, nobody holds it
+  STATE_RUNNING = 2; // claimed under a lease
+  STATE_DONE = 3;    // terminal, result recorded exactly once
+  STATE_FAILED = 4;  // terminal, attempts exhausted
+}
+
+// Job is the record stored in the KV at <prefix>/job/<id>. It is the whole
+// truth about a job: the scheduler holds no state of its own.
+message Job {
+  uint64 id = 1;
+  bytes payload = 2;
+  State state = 3;
+  // gen is the fencing token. It increments every time the job changes
+  // hands (each Claim, each reap). A worker may only mutate the job while
+  // presenting the gen it was given; any other gen is a zombie's.
+  uint64 gen = 4;
+  string worker = 5;
+  // lease_until_ms is the wall-clock deadline (unix ms, scheduler's clock)
+  // after which the reaper may reclaim a RUNNING job. Leases are for
+  // liveness; gen is for safety. Clock skew can only make reclaim happen
+  // early or late, never let two holders both succeed.
+  int64 lease_until_ms = 6;
+  bytes result = 7;
+  uint32 attempts = 8;
+  string last_error = 9;
+  int64 submitted_ms = 10;
+}
+
+message SubmitRequest {
+  bytes payload = 1;
+  // Optional client-chosen idempotency key. Two Submits with the same key
+  // return the same job id instead of enqueueing twice.
+  string idempotency_key = 2;
+}
+message SubmitResponse {
+  uint64 id = 1;
+}
+
+message ClaimRequest {
+  string worker = 1;
+  int64 lease_ms = 2; // 0 = scheduler default
+}
+message ClaimResponse {
+  bool found = 1;
+  Job job = 2;
+}
+
+message HeartbeatRequest {
+  uint64 id = 1;
+  uint64 gen = 2;
+  int64 lease_ms = 3;
+}
+message HeartbeatResponse {
+  int64 lease_until_ms = 1;
+}
+
+message CompleteRequest {
+  uint64 id = 1;
+  uint64 gen = 2;
+  bytes result = 3;
+}
+message CompleteResponse {}
+
+message FailRequest {
+  uint64 id = 1;
+  uint64 gen = 2;
+  string error = 3;
+}
+message FailResponse {
+  bool requeued = 1; // false = terminal FAILED
+}
+
+message StatusRequest {
+  uint64 id = 1;
+}
+message StatusResponse {
+  Job job = 1;
+}
+
+message StatsRequest {}
+message StatsResponse {
+  uint64 head = 1;    // lowest id that may still be live
+  uint64 tail = 2;    // next id to be assigned
+  uint64 max_queue = 3;
+}

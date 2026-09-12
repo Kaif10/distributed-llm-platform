@@ -1,6 +1,6 @@
 # Run `. .\env.ps1` (PowerShell) or `source ./env.sh` (Git Bash) first.
 
-.PHONY: all proto build test test-crash test-exercises test-raft test-lin test-shard lint tidy clean
+.PHONY: all proto build test test-crash test-exercises test-raft test-lin test-shard test-sched e2e-sched lint tidy clean
 
 all: proto build test
 
@@ -11,7 +11,8 @@ proto:
 		proto/kv/v1/kv.proto \
 		proto/raft/v1/raft.proto \
 		proto/shardctrl/v1/shardctrl.proto \
-		proto/shardkv/v1/shardkv.proto
+		proto/shardkv/v1/shardkv.proto \
+		proto/sched/v1/sched.proto
 
 build:
 	go build -o bin/ ./cmd/...
@@ -38,6 +39,17 @@ test-lin:
 # Phase 3 exit criterion: rebalancing + migration under a Porcupine check.
 test-shard:
 	go test -race -count=1 -v ./shardctrl/... ./shardkv/...
+
+# Phase 4 exit criterion: exactly-once completion under >=1000 random pauses/crashes,
+# plus the queue over a real Raft KV with a leader outage.
+test-sched:
+	go test -race -count=1 -v ./sched/ -chaos-events=1000
+	go test -race -count=1 ./sched/grpcserver/ ./sched/kvadapter/ ./sched/worker/ ./kv/client/
+
+# Phase 4 end to end: real raftkv + sched + worker processes, a crashed worker,
+# a zombie worker that must be fenced, every job DONE.
+e2e-sched:
+	bash scripts/e2e_sched.sh 200
 
 lint:
 	go vet ./...

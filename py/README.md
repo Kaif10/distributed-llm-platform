@@ -56,3 +56,37 @@ with KVClient("localhost:7001") as kv:
 
 Every mutating call carries a `RequestMeta(client_id, request_id)`. A retry of a
 failed call must reuse the same meta so the server can deduplicate it.
+
+## Scheduler worker (`sched.v1`)
+
+`py/worker.py` is a pull-model worker for the job queue in `proto/sched/v1/sched.proto`,
+with the same contract as the Go library in `sched/worker`: claim a job under a lease,
+heartbeat every `lease/3` carrying the fencing token `gen`, and treat `FAILED_PRECONDITION`
+from Heartbeat/Complete/Fail as "the job is no longer mine" (log, count as fenced, move on;
+never retry, never re-claim). Read `sched/api.go`'s package doc for why.
+
+Regenerate stubs after editing the proto (output lands in `py/dsys_sched/sched/v1/`):
+
+```
+python -m grpc_tools.protoc -I proto --python_out=py/dsys_sched --grpc_python_out=py/dsys_sched --pyi_out=py/dsys_sched proto/sched/v1/sched.proto
+```
+
+Run the demo worker against a scheduler (defaults to `localhost:7100`; `LEASE_MS` overrides the lease):
+
+```
+python py/worker.py host:port
+```
+
+Use it from your own code. A handler gets the job and a `threading.Event` that is set when
+the worker has been fenced off the job; check it between expensive steps. Handlers may run
+more than once for the same job, so side effects must be idempotent on `job.id`.
+
+```python
+import sys; sys.path.insert(0, "py")
+from worker import SchedWorker
+
+def handle(job, fenced) -> bytes:
+    return job.payload.upper()
+
+SchedWorker("localhost:7100", handle, name="py-1", lease_ms=5000).run()
+```
