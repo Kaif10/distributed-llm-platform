@@ -1,0 +1,106 @@
+syntax = "proto3";
+
+package shardctrl.v1;
+
+option go_package = "dsys/gen/shardctrl/v1;shardctrlv1";
+
+// ShardCtrl is the control-plane API for a sharded key-value store: it
+// tracks which replica group owns which shard, and produces a new,
+// numbered Config every time group membership changes (Join, Leave) or an
+// operator forces a single shard to move (Move).
+//
+// Like KV, every mutating request carries RequestMeta so the server can
+// detect a retried request and return the original result instead of
+// applying the change twice.
+service ShardCtrl {
+  rpc Join(JoinRequest) returns (JoinResponse);
+  rpc Leave(LeaveRequest) returns (LeaveResponse);
+  rpc Move(MoveRequest) returns (MoveResponse);
+  rpc Query(QueryRequest) returns (QueryResponse);
+}
+
+// RequestMeta identifies a logical client request. A client picks a random
+// client_id at startup and increments request_id for every new request. A
+// retry of the same request reuses the same (client_id, request_id).
+message RequestMeta {
+  string client_id = 1;
+  uint64 request_id = 2;
+}
+
+// Group is a replica group's client-reachable addresses (one per replica,
+// in the same order every group member uses for its own peer list).
+message Group {
+  repeated string addrs = 1;
+}
+
+// Config is one numbered snapshot of the cluster's shard assignment.
+// shards has exactly shard.NShards entries; shards[i] is the id of the
+// group owning shard i, or 0 if the shard is currently unassigned.
+message Config {
+  int64 num = 1;
+  repeated int64 shards = 2;
+  map<int64, Group> groups = 3;
+}
+
+// Join adds (or re-adds, with possibly new addresses) replica groups and
+// rebalances shards across the resulting group set.
+message JoinRequest {
+  RequestMeta meta = 1;
+  map<int64, Group> groups = 2;
+}
+message JoinResponse {}
+
+// Leave removes replica groups and redistributes the shards they held
+// across whatever groups remain.
+message LeaveRequest {
+  RequestMeta meta = 1;
+  repeated int64 gids = 2;
+}
+message LeaveResponse {}
+
+// Move forces one shard to one group, overriding the rebalancer for that
+// shard only.
+message MoveRequest {
+  RequestMeta meta = 1;
+  int64 shard = 2;
+  int64 gid = 3;
+}
+message MoveResponse {}
+
+// Query returns a past Config by number, or the latest one. num < 0, or a
+// num past the latest, means "the latest config".
+message QueryRequest {
+  int64 num = 1;
+}
+message QueryResponse {
+  Config config = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Storage-side types. LogEntry is what goes into the Raft log: the single
+// wire format every Join/Leave/Move/Query request is translated into before
+// being proposed, so one apply loop can dispatch on Op the same way
+// kv.v1.LogEntry lets raftkv's apply loop dispatch on a single log format.
+// ---------------------------------------------------------------------------
+
+enum LogOp {
+  LOG_OP_UNSPECIFIED = 0;
+  LOG_OP_JOIN = 1;
+  LOG_OP_LEAVE = 2;
+  LOG_OP_MOVE = 3;
+  // LOG_OP_QUERY is a read that goes through the log, exactly like kv.v1's
+  // OP_GET: logging it orders it against every Join/Leave/Move ordered
+  // before it, which is what makes it linearizable on any replica, not just
+  // the leader.
+  LOG_OP_QUERY = 4;
+}
+
+message LogEntry {
+  LogOp op = 1;
+  RequestMeta meta = 2;
+  map<int64, Group> groups = 3; // Join
+  repeated int64 gids = 4;      // Leave
+  int64 shard = 5;              // Move
+  int64 gid = 6;                // Move
+  int64 query_num = 7;          // Query
+}

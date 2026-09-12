@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package shardkv.v1;
+
+option go_package = "dsys/gen/shardkv/v1;shardkvv1";
+
+// ShardMigration is called BETWEEN shard-owning replica groups, never by
+// clients. When group B's configuration says it now owns a shard that group
+// A owned under the previous configuration, B pulls the shard's state from
+// A. This is a "pull" design: the new owner is the one that must make
+// progress, so it is the one that asks.
+//
+// Only the leader of the group being asked can answer with real data;
+// followers reply have_it=false so the asker retries against another
+// replica of A (found the same way a client would: try a peer, follow the
+// leader hint on failure).
+service ShardMigration {
+  rpc PullShard(PullShardRequest) returns (PullShardResponse);
+}
+
+message PullShardRequest {
+  // The configuration number the asker is trying to move into. The
+  // responder must serve the shard's state as of the END of the PREVIOUS
+  // configuration (i.e. everything committed before it stopped owning the
+  // shard), not its current live state, which may have moved on.
+  int64 config_num = 1;
+  int32 shard = 2;
+}
+
+message PullShardResponse {
+  // have_it is false if the responder is not the leader, or does not (yet,
+  // or any longer) hold a snapshot for this shard at this config number.
+  bool have_it = 1;
+  // machine_snapshot is store.Machine.Snapshot() for exactly this shard's
+  // data and its request-dedup sessions, gob-encoded. Sessions travel with
+  // the shard so a client's retry is still recognised after the shard moves.
+  bytes machine_snapshot = 2;
+}

@@ -1,6 +1,6 @@
 # Run `. .\env.ps1` (PowerShell) or `source ./env.sh` (Git Bash) first.
 
-.PHONY: all proto build test test-crash test-exercises test-raft test-lin lint tidy clean
+.PHONY: all proto build test test-crash test-exercises test-raft test-lin test-shard lint tidy clean
 
 all: proto build test
 
@@ -9,7 +9,9 @@ proto:
 		--go_out=. --go_opt=module=dsys \
 		--go-grpc_out=. --go-grpc_opt=module=dsys \
 		proto/kv/v1/kv.proto \
-		proto/raft/v1/raft.proto
+		proto/raft/v1/raft.proto \
+		proto/shardctrl/v1/shardctrl.proto \
+		proto/shardkv/v1/shardkv.proto
 
 build:
 	go build -o bin/ ./cmd/...
@@ -32,6 +34,10 @@ test-raft:
 # Phase 2 exit criterion: random clients + partitions + crashes, checked by Porcupine.
 test-lin:
 	go test -race -count=1 -run TestLinearizability -v ./kv/raftkv/
+
+# Phase 3 exit criterion: rebalancing + migration under a Porcupine check.
+test-shard:
+	go test -race -count=1 -v ./shardctrl/... ./shardkv/...
 
 lint:
 	go vet ./...

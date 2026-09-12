@@ -1,0 +1,330 @@
+// Server wires Machine to Raft, the same "propose an op, wait for it to
+// come back on the apply channel, wake the waiter keyed by log index"
+// pattern kv/raftkv.Server uses for the data path (see that file's doc
+// comment for the full rationale: log-then-apply, the term check on the
+// waiter, and why even Query goes through consensus). shardctrl is small
+// enough that this file is a close copy of raftkv/server.go with KV's four
+// ops swapped for Join/Leave/Move/Query.
+package shardctrl
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+
+	shardctrlv1 "dsys/gen/shardctrl/v1"
+	"dsys/raft"
+)
+
+var (
+	// ErrNotLeader means this replica cannot accept requests. The client
+	// should try another replica.
+	ErrNotLeader = errors.New("shardctrl: not leader")
+	// ErrLeaderChanged means the entry was proposed but leadership changed
+	// before it committed; it may or may not have been applied. Safe to
+	// retry with the same RequestMeta.
+	ErrLeaderChanged = errors.New("shardctrl: leader changed before commit")
+	// ErrTimeout means the entry did not commit within the wait budget.
+	// Usually a partition. Safe to retry with the same RequestMeta.
+	ErrTimeout = errors.New("shardctrl: timed out waiting for commit")
+	// ErrShutdown means the server is stopping.
+	ErrShutdown = errors.New("shardctrl: shutting down")
+)
+
+// Config for a shard controller replica.
+type Config struct {
+	// CommitTimeout bounds how long a request waits to commit before the
+	// client is told to retry. Defaults to 3s.
+	CommitTimeout time.Duration
+	// Addrs, if set, maps peer id to a client-reachable address, used for
+	// leader hints in NotLeader errors.
+	Addrs []string
+	Raft  raft.Config
+}
+
+// Server is one shard-controller replica. It implements
+// shardctrlv1.ShardCtrlServer.
+//
+// # On snapshotting
+//
+// Unlike raftkv, Server never calls rf.Snapshot(). A KV store's Raft log
+// grows with every client Get/Put, so it must be compacted to keep the log
+// (and the time to replay it after a restart) bounded. The controller's
+// log only grows with administrative operations — Join, Leave, Move, and
+// Query, which are also logged but produce no new Config — issued by
+// whoever operates the cluster, which in practice is orders of magnitude
+// rarer than client traffic. Its bounded-by-admin-activity log, and the
+// Machine's whole-history Snapshot/Restore (see machine.go), make
+// compaction unnecessary for the scope of this phase. InstallSnapshot
+// delivery is still handled below (a SnapshotValid message just calls
+// Machine.Restore), defensively, in case a future caller adds it — Raft's
+// contract permits a service to receive one at any time regardless of
+// whether that service ever calls Snapshot.
+type Server struct {
+	shardctrlv1.UnimplementedShardCtrlServer
+
+	me        int
+	rf        *raft.Raft
+	persister raft.Persister
+	cfg       Config
+	applyCh   chan raft.ApplyMsg
+	done      chan struct{}
+
+	mu          sync.Mutex
+	m           *Machine
+	lastApplied uint64
+	waiters     map[uint64]*waiter // by log index
+}
+
+type waiter struct {
+	term uint64 // the term Start reported; must match the applied entry
+	ch   chan outcome
+}
+
+type outcome struct {
+	cfg *shardctrlv1.Config
+	err error
+}
+
+// New creates a replica and its Raft peer. peers[me] is unused.
+func New(peers []raft.Peer, me int, persister raft.Persister, cfg Config) *Server {
+	if cfg.CommitTimeout <= 0 {
+		cfg.CommitTimeout = 3 * time.Second
+	}
+	s := &Server{
+		me:        me,
+		persister: persister,
+		cfg:       cfg,
+		applyCh:   make(chan raft.ApplyMsg, 64),
+		done:      make(chan struct{}),
+		m:         NewMachine(),
+		waiters:   make(map[uint64]*waiter),
+	}
+	s.rf = raft.New(peers, me, persister, s.applyCh, cfg.Raft)
+	go s.applyLoop()
+	return s
+}
+
+// Raft exposes the underlying peer (tests, admin).
+func (s *Server) Raft() *raft.Raft { return s.rf }
+
+// Kill stops the replica.
+func (s *Server) Kill() {
+	s.rf.Kill()
+	s.mu.Lock()
+	select {
+	case <-s.done:
+	default:
+		close(s.done)
+	}
+	for idx, w := range s.waiters {
+		w.ch <- outcome{err: ErrShutdown}
+		delete(s.waiters, idx)
+	}
+	s.mu.Unlock()
+}
+
+// LastApplied returns the highest log index applied to this replica.
+func (s *Server) LastApplied() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastApplied
+}
+
+// IsLeader reports whether this replica currently believes it leads.
+func (s *Server) IsLeader() bool {
+	_, isLeader := s.rf.GetState()
+	return isLeader
+}
+
+// ---------------------------------------------------------------------------
+// The apply loop: the only goroutine that touches the Machine's state.
+// ---------------------------------------------------------------------------
+
+func (s *Server) applyLoop() {
+	for {
+		var msg raft.ApplyMsg
+		select {
+		case <-s.done:
+			return
+		case msg = <-s.applyCh:
+		}
+
+		s.mu.Lock()
+		switch {
+		case msg.SnapshotValid:
+			if msg.SnapshotIndex > s.lastApplied {
+				if err := s.m.Restore(msg.Snapshot); err != nil {
+					panic(fmt.Sprintf("shardctrl: restore snapshot: %v", err))
+				}
+				s.lastApplied = msg.SnapshotIndex
+			}
+
+		case msg.CommandValid:
+			if msg.CommandIndex <= s.lastApplied {
+				break // duplicate delivery after a snapshot; already applied
+			}
+			var e shardctrlv1.LogEntry
+			if err := proto.Unmarshal(msg.Command, &e); err != nil {
+				panic(fmt.Sprintf("shardctrl: bad log entry at %d: %v", msg.CommandIndex, err))
+			}
+			cfg, err := s.m.Apply(commandFromProto(&e))
+			s.lastApplied = msg.CommandIndex
+
+			if w, ok := s.waiters[msg.CommandIndex]; ok {
+				delete(s.waiters, msg.CommandIndex)
+				if w.term == msg.CommandTerm {
+					w.ch <- outcome{cfg: cfg, err: err}
+				} else {
+					w.ch <- outcome{err: ErrLeaderChanged}
+				}
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Proposing
+// ---------------------------------------------------------------------------
+
+// propose runs one entry through consensus and returns its result.
+func (s *Server) propose(ctx context.Context, e *shardctrlv1.LogEntry) (*shardctrlv1.Config, error) {
+	// Fast path: an already-applied request is answered from memory on any
+	// replica; the answer is immutable once applied.
+	s.mu.Lock()
+	if cfg, done, err := s.m.Dedup(e.Meta); done || err != nil {
+		s.mu.Unlock()
+		return cfg, err
+	}
+	s.mu.Unlock()
+
+	payload, err := proto.Marshal(e)
+	if err != nil {
+		return nil, err
+	}
+	index, term, isLeader := s.rf.Start(payload)
+	if !isLeader {
+		return nil, ErrNotLeader
+	}
+
+	w := &waiter{term: term, ch: make(chan outcome, 1)}
+	s.mu.Lock()
+	if old, ok := s.waiters[index]; ok {
+		// Someone else was waiting on this index from an earlier term of
+		// leadership. Their entry has been superseded by ours.
+		old.ch <- outcome{err: ErrLeaderChanged}
+	}
+	s.waiters[index] = w
+	s.mu.Unlock()
+
+	timer := time.NewTimer(s.cfg.CommitTimeout)
+	defer timer.Stop()
+	select {
+	case o := <-w.ch:
+		return o.cfg, o.err
+	case <-timer.C:
+		s.abandon(index, w)
+		return nil, ErrTimeout
+	case <-ctx.Done():
+		s.abandon(index, w)
+		return nil, ctx.Err()
+	case <-s.done:
+		return nil, ErrShutdown
+	}
+}
+
+func (s *Server) abandon(index uint64, w *waiter) {
+	s.mu.Lock()
+	if s.waiters[index] == w {
+		delete(s.waiters, index)
+	}
+	s.mu.Unlock()
+}
+
+// ---------------------------------------------------------------------------
+// gRPC surface
+// ---------------------------------------------------------------------------
+
+func (s *Server) Join(ctx context.Context, req *shardctrlv1.JoinRequest) (*shardctrlv1.JoinResponse, error) {
+	_, err := s.propose(ctx, &shardctrlv1.LogEntry{Op: shardctrlv1.LogOp_LOG_OP_JOIN, Meta: req.Meta, Groups: req.Groups})
+	if err != nil {
+		return nil, s.toStatus(err)
+	}
+	return &shardctrlv1.JoinResponse{}, nil
+}
+
+func (s *Server) Leave(ctx context.Context, req *shardctrlv1.LeaveRequest) (*shardctrlv1.LeaveResponse, error) {
+	_, err := s.propose(ctx, &shardctrlv1.LogEntry{Op: shardctrlv1.LogOp_LOG_OP_LEAVE, Meta: req.Meta, Gids: req.Gids})
+	if err != nil {
+		return nil, s.toStatus(err)
+	}
+	return &shardctrlv1.LeaveResponse{}, nil
+}
+
+func (s *Server) Move(ctx context.Context, req *shardctrlv1.MoveRequest) (*shardctrlv1.MoveResponse, error) {
+	_, err := s.propose(ctx, &shardctrlv1.LogEntry{
+		Op: shardctrlv1.LogOp_LOG_OP_MOVE, Meta: req.Meta, Shard: req.Shard, Gid: req.Gid,
+	})
+	if err != nil {
+		return nil, s.toStatus(err)
+	}
+	return &shardctrlv1.MoveResponse{}, nil
+}
+
+func (s *Server) Query(ctx context.Context, req *shardctrlv1.QueryRequest) (*shardctrlv1.QueryResponse, error) {
+	cfg, err := s.propose(ctx, &shardctrlv1.LogEntry{Op: shardctrlv1.LogOp_LOG_OP_QUERY, QueryNum: req.Num})
+	if err != nil {
+		return nil, s.toStatus(err)
+	}
+	return &shardctrlv1.QueryResponse{Config: cfg}, nil
+}
+
+// commandFromProto converts the wire LogEntry into the Machine's internal
+// Command. Kept separate from Machine so Machine has no proto-wire-format
+// dependency beyond the Config/Group types it already returns.
+func commandFromProto(e *shardctrlv1.LogEntry) *Command {
+	c := &Command{Meta: e.Meta, Groups: e.Groups, Gids: e.Gids, Shard: e.Shard, Gid: e.Gid, QueryNum: e.QueryNum}
+	switch e.Op {
+	case shardctrlv1.LogOp_LOG_OP_JOIN:
+		c.Op = OpJoin
+	case shardctrlv1.LogOp_LOG_OP_LEAVE:
+		c.Op = OpLeave
+	case shardctrlv1.LogOp_LOG_OP_MOVE:
+		c.Op = OpMove
+	case shardctrlv1.LogOp_LOG_OP_QUERY:
+		c.Op = OpQuery
+	default:
+		panic(fmt.Sprintf("shardctrl: unknown wire op %v in log", e.Op))
+	}
+	return c
+}
+
+// toStatus maps errors to gRPC codes. Unavailable means "retry, possibly
+// elsewhere, with the same RequestMeta". The leader hint lets a client jump
+// straight to the right replica instead of probing.
+func (s *Server) toStatus(err error) error {
+	switch {
+	case errors.Is(err, ErrNotLeader):
+		if hint := s.rf.LeaderHint(); hint >= 0 && hint < len(s.cfg.Addrs) && hint != s.me {
+			return status.Errorf(codes.Unavailable, "not leader leader=%s", s.cfg.Addrs[hint])
+		}
+		return status.Error(codes.Unavailable, "not leader")
+	case errors.Is(err, ErrLeaderChanged), errors.Is(err, ErrTimeout), errors.Is(err, ErrShutdown):
+		return status.Error(codes.Unavailable, err.Error())
+	case errors.Is(err, ErrStaleRequest):
+		return status.Error(codes.FailedPrecondition, err.Error())
+	case errors.Is(err, ErrUnknownGroup), errors.Is(err, ErrInvalidShard):
+		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return status.Error(codes.DeadlineExceeded, err.Error())
+	default:
+		return status.Error(codes.Internal, err.Error())
+	}
+}
