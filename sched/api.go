@@ -47,9 +47,10 @@
 package sched
 
 import (
-	"context"
 	"errors"
 	"time"
+
+	"dsys/kvapi"
 )
 
 // KV is the subset of the store the scheduler needs. Every operation must
@@ -63,11 +64,10 @@ import (
 // the store rather than applied twice (see kv/store's package doc). A CAS
 // that returns swapped=false with err=nil is a normal outcome, not an error:
 // someone else got there first, and current is what they wrote.
-type KV interface {
-	Get(ctx context.Context, key string) (value []byte, found bool, err error)
-	Put(ctx context.Context, key string, value []byte) error
-	CAS(ctx context.Context, key string, expected []byte, expectAbsent bool, value []byte) (swapped bool, current []byte, err error)
-}
+//
+// KV is an alias for kvapi.KV: the same interface Phase 5's rate limiter,
+// registry and cache use, so one adapter serves every layer.
+type KV = kvapi.KV
 
 // Errors returned by Queue. The gRPC layer maps them to status codes.
 var (

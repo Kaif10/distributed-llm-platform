@@ -1,6 +1,6 @@
 # Run `. .\env.ps1` (PowerShell) or `source ./env.sh` (Git Bash) first.
 
-.PHONY: all proto build test test-crash test-exercises test-raft test-lin test-shard test-sched e2e-sched lint tidy clean
+.PHONY: all proto build test test-crash test-exercises test-raft test-lin test-shard test-sched e2e-sched test-llm e2e-llm lint tidy clean
 
 all: proto build test
 
@@ -12,7 +12,7 @@ proto:
 		proto/raft/v1/raft.proto \
 		proto/shardctrl/v1/shardctrl.proto \
 		proto/shardkv/v1/shardkv.proto \
-		proto/sched/v1/sched.proto
+		proto/sched/v1/sched.proto 		proto/infer/v1/infer.proto 		proto/gateway/v1/gateway.proto
 
 build:
 	go build -o bin/ ./cmd/...
@@ -50,6 +50,16 @@ test-sched:
 # a zombie worker that must be fenced, every job DONE.
 e2e-sched:
 	bash scripts/e2e_sched.sh 200
+
+# Phase 5: gateway, rate limiter, router, semantic cache, mock worker.
+test-llm:
+	go test -race -count=1 -v ./gateway/ ./ratelimit/ ./router/ ./semcache/ ./infer/...
+
+# Phase 5 exit criterion: real raftkv + gateway + 4 Python inference workers;
+# measures prefix routing and hedging against their baselines and CHECKS the
+# result, plus rate limiting, semantic cache and cancellation.
+e2e-llm:
+	bash scripts/e2e_llm.sh 240
 
 lint:
 	go vet ./...

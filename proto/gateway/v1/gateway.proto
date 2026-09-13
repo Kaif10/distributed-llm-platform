@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package gateway.v1;
+
+option go_package = "dsys/gen/gateway/v1;gatewayv1";
+
+// Gateway is the CLIENT-facing inference API. Every request passes, in
+// order, through: per-tenant distributed rate limiting (token bucket in the
+// KV), the semantic cache, prefix-aware routing to a worker, and hedging
+// for tail latency. Tokens stream back; cancelling the stream cancels the
+// worker.
+service Gateway {
+  rpc Generate(GenerateRequest) returns (stream Token);
+  // RegisterWorker is called by inference workers periodically (a lease):
+  // the gateway records them in the shared registry so every gateway
+  // replica routes over the same live set.
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  rpc Stats(StatsRequest) returns (StatsResponse);
+}
+
+message GenerateRequest {
+  string tenant = 1;
+  string prompt = 2;
+  int32 max_tokens = 3;
+  // no_cache bypasses the semantic cache (benchmarks; or callers that need
+  // a fresh sample every time).
+  bool no_cache = 4;
+}
+
+message Token {
+  string text = 1;
+  int32 index = 2;
+  bool done = 3;
+  string finish_reason = 4;
+
+  // Set on the FIRST token: where it came from and how long it took.
+  bool cached = 5;              // served from the semantic cache, no worker
+  string worker = 6;            // worker id that produced the stream
+  bool hedged = 7;              // a second attempt was launched
+  bool hedge_won = 8;           // ...and the second attempt is the one you got
+  int64 ttft_ms = 9;            // time to first token as seen by the gateway
+  bool prefix_cache_hit = 10;   // from the worker
+  int64 prefill_ms = 11;        // from the worker
+}
+
+message RegisterWorkerRequest {
+  string worker_id = 1;
+  string addr = 2;       // host:port of the worker's Inference service
+  int32 inflight = 3;    // current load, for load-aware routing
+  int64 lease_ms = 4;    // how long this registration is valid; re-register before it expires
+  string model = 5;
+}
+message RegisterWorkerResponse {
+  int64 lease_until_ms = 1;
+}
+
+message StatsRequest {}
+message StatsResponse {
+  uint64 requests = 1;
+  uint64 rate_limited = 2;
+  uint64 cache_hits = 3;
+  uint64 hedges_launched = 4;
+  uint64 hedges_won = 5;
+  uint64 cancelled = 6;
+  uint64 worker_errors = 7;
+  map<string, uint64> routed_to = 8; // worker id -> streams started
+  int32 live_workers = 9;
+}

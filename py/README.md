@@ -90,3 +90,71 @@ def handle(job, fenced) -> bytes:
 
 SchedWorker("localhost:7100", handle, name="py-1", lease_ms=5000).run()
 ```
+
+## Inference worker and gateway client (`infer.v1`, `gateway.v1`)
+
+Phase 5 adds two services. `infer.v1.Inference` is what the gateway speaks to a model host;
+`gateway.v1.Gateway` is what clients speak to the gateway (rate limit -> semantic cache ->
+prefix-aware routing -> hedging). Read `proto/infer/v1/infer.proto`, `proto/gateway/v1/gateway.proto`
+and the package doc in `gateway/api.go`.
+
+Regenerate stubs after editing either proto (output lands in `py/dsys_infer/infer/v1/` and
+`py/dsys_gateway/gateway/v1/`):
+
+```
+python -m grpc_tools.protoc -I proto --python_out=py/dsys_infer --grpc_python_out=py/dsys_infer --pyi_out=py/dsys_infer proto/infer/v1/infer.proto
+python -m grpc_tools.protoc -I proto --python_out=py/dsys_gateway --grpc_python_out=py/dsys_gateway --pyi_out=py/dsys_gateway proto/gateway/v1/gateway.proto
+```
+
+### `py/infer_worker.py`
+
+An inference worker: serves `Inference` and keeps itself registered with the gateway under a
+lease (`RegisterWorker` every `lease_ms/3`; a worker that dies drops out of routing when its
+lease lapses, the Phase 4 idea reused for service discovery). Cancellation is honoured on every
+token: a cancelled stream stops generating and bumps the `cancelled` counter.
+
+```
+python py/infer_worker.py --addr 127.0.0.1:7600 --gateway 127.0.0.1:7500[,127.0.0.1:7501]
+```
+
+| flag | default | meaning |
+|---|---|---|
+| `--addr` / `--advertise` | `127.0.0.1:7600` | listen address (advertised as-is unless `--advertise`) |
+| `--gateway` | `127.0.0.1:7500` | comma-separated gateways; on failure the next one is tried |
+| `--lease-ms` | 3000 | registration lease; renewed every third of it |
+| `--concurrency` | 4 | gRPC thread pool |
+| `--backend` | `mock` | `mock` or `hf` |
+| `--kv-cache-blocks` | 512 | mock: LRU size of 64-char prefix blocks |
+| `--token-ms` | 12 | mock: inter-token interval |
+| `--stall-prob` / `--stall-ms` | 0.0 / 400 | mock: tail stall added to prefill (what hedging is for) |
+| `--stats-every` | `10s` | log claimed/completed/cancelled/prefix-hit-rate |
+
+The mock's latency model matches the Go mock in `infer/mock` exactly, because `cmd/llmbench`
+mixes both behind one gateway: `prefill_ms = 20 + 0.25 * (len(prompt) - cached_prefix_chars)`
+where the cached prefix is the longest run of leading 64-char blocks this worker has prefilled
+before (an LRU of cumulative block hashes stands in for the attention KV cache). Same prompt
+twice on the same worker: second time `prefix_cache_hit=true` and a much lower `prefill_ms`.
+That is the effect prefix-aware routing in the gateway is meant to produce fleet-wide.
+
+`--backend hf --model <name>` streams greedy tokens from a HuggingFace causal LM. It needs
+`pip install torch transformers` in the venv (not in `requirements.txt`) and is untested here.
+
+### `py/gateway_client.py`
+
+```python
+import sys; sys.path.insert(0, "py")
+from gateway_client import GatewayClient, RateLimited
+
+with GatewayClient("localhost:7500") as gw:
+    try:
+        for tok in gw.generate("hello", tenant="t0", max_tokens=16):
+            print(tok.text, end="")   # tok.index == 0 carries cached/worker/hedged/ttft_ms/...
+    except RateLimited as e:
+        print("over quota:", e.hint)
+```
+
+`generate()` yields tokens; breaking out of the loop cancels the stream, which cancels the
+worker. `start()` returns the raw call for explicit `.cancel()`. The demo
+(`python py/gateway_client.py [host:port]`) streams one prompt, prints the first token's
+metadata, then starts a second stream, reads three tokens, cancels it and shows the gateway's
+`cancelled` counter.

@@ -19,6 +19,8 @@ make test-lin          # Porcupine linearizability check under partitions and cr
 make test-shard        # sharding: rebalancing + migration, linearizability across shard moves
 make test-sched        # scheduler: exactly-once under 1000+ pauses/crashes, plus over real Raft
 make e2e-sched         # scheduler end to end against real processes (crash + zombie worker)
+make test-llm          # gateway, rate limiter, prefix router, semantic cache
+make e2e-llm           # LLM serving end to end: prefix routing and hedging measured vs baselines
 ```
 
 ```bash
@@ -75,6 +77,22 @@ watch it finish a job after its lease expired, and see its result refused as fen
 job is completed exactly once by another worker. `make e2e-sched` runs that whole scenario
 against real processes, plus a crashed worker, and checks every job.
 
+LLM serving layer (Phase 5) on top of any KV cluster above:
+
+```powershell
+.\bin\gateway.exe -addr 127.0.0.1:7500 -kv 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 -hedge-after 250ms
+.venv\Scripts\python.exe py\infer_worker.py --addr 127.0.0.1:7600 --gateway 127.0.0.1:7500 --worker-id py-0
+.venv\Scripts\python.exe py\infer_worker.py --addr 127.0.0.1:7601 --gateway 127.0.0.1:7500 --worker-id py-1
+.venv\Scripts\python.exe py\gateway_client.py
+.\bin\llmbench.exe -gateway 127.0.0.1:7500 -n 300 -c 16
+```
+
+Workers register with the gateway under a lease, so a worker you kill drops out of
+routing on its own. `make e2e-llm` runs the whole stack and checks that prefix-aware
+routing raises the worker prefix-cache hit rate, that hedging cuts p99 time-to-first-token,
+that the semantic cache serves repeats, that per-tenant limits shed load, and that a
+cancelled stream actually stops the worker.
+
 Single-node server (Phase 1):
 
 ```powershell
@@ -117,9 +135,18 @@ sched/      job queue built purely from CAS: leases for liveness, gen (fencing
             token) for safety, bounded admission, leader-elected reaper
 sched/worker  pull-model worker library: heartbeats, cancel-on-fence, no
             retry of a fenced Complete
-cmd/        kvserver, raftkv, shardctrl, shardkv, sched, worker,
-            kvctl, shardctl, schedctl
-scripts/    e2e_sched.sh: real-process end-to-end scenario for the scheduler
+cmd/        kvserver, raftkv, shardctrl, shardkv, sched, worker, gateway,
+            kvctl, shardctl, schedctl, llmbench
+kvapi/      the one KV interface every higher layer programs against
+ratelimit/  per-tenant distributed token bucket in the KV (CAS)
+router/     worker registry (lease-based discovery) + rendezvous-hash
+            prefix-affinity placement, load-aware
+semcache/   semantic cache: exact index shared in the KV, vectors local
+gateway/    the inference front end: rate limit -> cache -> route -> hedge ->
+            stream, with cancellation propagated to the worker
+infer/mock  a GPU-free inference worker with a realistic prefill/prefix-cache
+            /decode latency model, matched by py/infer_worker.py
+scripts/    e2e_sched.sh, e2e_llm.sh: real-process end-to-end scenarios
 py/         Python client + generated stubs
 docs/       per-phase notes, exercises, interview prep
 ```
@@ -131,6 +158,6 @@ docs/       per-phase notes, exercises, interview prep
 - [x] Phase 2: Raft consensus, replicated KV, linearizability-checked
 - [x] Phase 3: sharding, live migration, deterministic rebalancing
 - [x] Phase 4: scheduler: leases, fencing tokens, exactly-once commit, admission control
-- [ ] Phase 5: LLM layer
+- [x] Phase 5: LLM serving layer: distributed rate limiting, semantic cache, prefix-aware routing, hedging
 - [ ] Phase 6: chaos + observability
 - [ ] Phase 7: write-up
