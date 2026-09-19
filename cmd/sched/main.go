@@ -24,6 +24,7 @@ import (
 	"flag"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -34,6 +35,7 @@ import (
 
 	schedv1 "dsys/gen/sched/v1"
 	"dsys/kv/client"
+	"dsys/obs"
 	"dsys/sched"
 	"dsys/sched/grpcserver"
 	"dsys/sched/kvadapter"
@@ -50,6 +52,9 @@ func main() {
 	reapInterval := flag.Duration("reap-interval", time.Second, "how often the reaper scans for expired leases")
 	sessions := flag.Int("kv-sessions", kvadapter.DefaultSessions, "KV client identities kept for concurrent mutations")
 	kvTimeout := flag.Duration("kv-timeout", 10*time.Second, "give up retrying one KV operation after this long")
+	otlpEndpoint := flag.String("otlp-endpoint", "", "OTLP/gRPC endpoint for traces, e.g. 127.0.0.1:4317 (empty = tracing disabled)")
+	metricsAddr := flag.String("metrics-addr", ":9092", "address to serve Prometheus /metrics on")
+	queueDepthEvery := flag.Duration("queue-depth-every", 2*time.Second, "how often to refresh the sched_queue_depth gauge")
 	flag.Parse()
 
 	kvAddrs := splitAddrs(*kvFlag)
@@ -60,6 +65,19 @@ func main() {
 	if len(kvAddrs) > 0 && len(ctrlAddrs) > 0 {
 		log.Fatal("-kv and -ctrl are mutually exclusive; give exactly one")
 	}
+
+	tracingShutdown, err := obs.InitTracing(context.Background(), "sched", *otlpEndpoint)
+	if err != nil {
+		log.Fatalf("obs: init tracing: %v", err)
+	}
+	defer func() {
+		shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tracingShutdown(shCtx); err != nil {
+			log.Printf("obs: tracing shutdown: %v", err)
+		}
+	}()
+	metrics := obs.NewMetrics("sched")
 
 	opts := []client.Option{client.WithTimeout(*kvTimeout), client.WithLogger(log.Printf)}
 	var kvc *client.Client
@@ -84,8 +102,21 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen %s: %v", *addr, err)
 	}
-	gs := grpc.NewServer()
-	schedv1.RegisterSchedulerServer(gs, grpcserver.New(q))
+	gs := grpc.NewServer(obs.GRPCServerOption())
+	schedv1.RegisterSchedulerServer(gs, grpcserver.New(q, metrics))
+
+	metricsLis, err := net.Listen("tcp", *metricsAddr)
+	if err != nil {
+		log.Fatalf("listen (metrics) %s: %v", *metricsAddr, err)
+	}
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", metrics.Handler())
+	metricsSrv := &http.Server{Handler: metricsMux}
+	go func() {
+		if err := metricsSrv.Serve(metricsLis); err != nil && err != http.ErrServerClosed {
+			log.Printf("metrics server: %v", err)
+		}
+	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -101,6 +132,24 @@ func main() {
 		sched.RunReaper(ctx, q, holder, *reapInterval)
 	}()
 
+	// sched_queue_depth (tail-head) has no natural mutation hook the way the
+	// gRPC-level counters do, so a small ticker polls Stats() the way the
+	// task description asks for.
+	go func() {
+		t := time.NewTicker(*queueDepthEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if head, tail, err := q.Stats(ctx); err == nil {
+					metrics.SetQueueDepth(int64(tail) - int64(head))
+				}
+			}
+		}
+	}()
+
 	go func() {
 		<-ctx.Done()
 		log.Print("shutting down")
@@ -113,9 +162,13 @@ func main() {
 		case <-time.After(5 * time.Second):
 			gs.Stop()
 		}
+		shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = metricsSrv.Shutdown(shCtx)
 	}()
 
-	log.Printf("sched listening on %s (prefix %q, %s, reaper %q every %v)", lis.Addr(), *prefix, backend, holder, *reapInterval)
+	log.Printf("sched listening on %s (prefix %q, %s, reaper %q every %v), metrics on %s",
+		lis.Addr(), *prefix, backend, holder, *reapInterval, metricsLis.Addr())
 	if err := gs.Serve(lis); err != nil {
 		log.Fatalf("serve: %v", err)
 	}

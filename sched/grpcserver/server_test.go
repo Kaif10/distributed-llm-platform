@@ -66,7 +66,7 @@ func start(t *testing.T, opts sched.Options) schedv1.SchedulerClient {
 		t.Fatal(err)
 	}
 	gs := grpc.NewServer()
-	schedv1.RegisterSchedulerServer(gs, New(q))
+	schedv1.RegisterSchedulerServer(gs, New(q, nil))
 	go gs.Serve(lis)
 	t.Cleanup(gs.Stop)
 

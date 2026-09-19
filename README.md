@@ -21,6 +21,10 @@ make test-sched        # scheduler: exactly-once under 1000+ pauses/crashes, plu
 make e2e-sched         # scheduler end to end against real processes (crash + zombie worker)
 make test-llm          # gateway, rate limiter, prefix router, semantic cache
 make e2e-llm           # LLM serving end to end: prefix routing and hedging measured vs baselines
+make test-chaos        # deterministic-ish simulation: 12 seeds x KV+scheduler(+gateway) chaos
+make simrun            # one seeded chaos run against the in-process harness, verbose
+make chaos-docker      # chaos against REAL containers (Docker Desktop must be running)
+make obs-up            # Prometheus + Grafana + Jaeger for tracing/metrics (make obs-down to stop)
 ```
 
 ```bash
@@ -93,6 +97,23 @@ routing raises the worker prefix-cache hit rate, that hedging cuts p99 time-to-f
 that the semantic cache serves repeats, that per-tenant limits shed load, and that a
 cancelled stream actually stops the worker.
 
+Chaos and observability (Phase 6): a seed reproduces a bug, not just a benchmark.
+
+```powershell
+go run .\cmd\simrun -seed 42 -duration 10s -nemesis-interval 30 -gateway
+```
+
+`simrun` wires a real 5-node Raft KV cluster, a scheduler, and (with `-gateway`) a
+gateway and mock workers in one process, drives them with concurrent clients, and
+injects partitions/crashes/pauses on a schedule bounded to never take down a
+majority. It checks the result with Porcupine (KV linearizability) and an
+exactly-once check (every scheduler job completed exactly once), and on failure
+prints the exact command to reproduce it. `make chaos-docker` runs the same kind
+of chaos against real containers instead (partitions, crashes, `tc netem`
+latency/loss injection); `make obs-up` brings up Prometheus, Grafana, and Jaeger
+so a request's trace end to end (gateway → worker, or scheduler submit → complete)
+is one query away.
+
 Single-node server (Phase 1):
 
 ```powershell
@@ -136,7 +157,7 @@ sched/      job queue built purely from CAS: leases for liveness, gen (fencing
 sched/worker  pull-model worker library: heartbeats, cancel-on-fence, no
             retry of a fenced Complete
 cmd/        kvserver, raftkv, shardctrl, shardkv, sched, worker, gateway,
-            kvctl, shardctl, schedctl, llmbench
+            kvctl, shardctl, schedctl, llmbench, simrun
 kvapi/      the one KV interface every higher layer programs against
 ratelimit/  per-tenant distributed token bucket in the KV (CAS)
 router/     worker registry (lease-based discovery) + rendezvous-hash
@@ -146,7 +167,19 @@ gateway/    the inference front end: rate limit -> cache -> route -> hedge ->
             stream, with cancellation propagated to the worker
 infer/mock  a GPU-free inference worker with a realistic prefill/prefix-cache
             /decode latency model, matched by py/infer_worker.py
-scripts/    e2e_sched.sh, e2e_llm.sh: real-process end-to-end scenarios
+chaos/      seed-driven, whole-stack simulation harness: a real Raft KV
+            cluster + scheduler (+ optional gateway/workers) driven by a
+            nemesis of partitions/crashes/pauses, checked with Porcupine
+            and an exactly-once scheduler check
+obs/        OpenTelemetry tracing + Prometheus metrics, wired into the
+            gateway and scheduler
+docker/     Dockerfiles + docker-compose.yml: a real containerized cluster
+            for chaos against actual processes (scripts/chaos_docker.sh)
+docker/observability/  otel-collector, Prometheus, Grafana provisioning
+            (docker-compose.observability.yml)
+k6/         load test against the gateway's streaming Generate RPC
+scripts/    e2e_sched.sh, e2e_llm.sh, chaos_docker.sh: real-process and
+            real-container end-to-end scenarios
 py/         Python client + generated stubs
 docs/       per-phase notes, exercises, interview prep
 ```
@@ -159,5 +192,5 @@ docs/       per-phase notes, exercises, interview prep
 - [x] Phase 3: sharding, live migration, deterministic rebalancing
 - [x] Phase 4: scheduler: leases, fencing tokens, exactly-once commit, admission control
 - [x] Phase 5: LLM serving layer: distributed rate limiting, semantic cache, prefix-aware routing, hedging
-- [ ] Phase 6: chaos + observability
+- [x] Phase 6: chaos + observability: seed-driven simulation, real-container chaos, tracing/metrics
 - [ ] Phase 7: write-up

@@ -1,0 +1,41 @@
+# otel-collector: TRACES ONLY.
+#
+# Design choice (documented per the Phase 5 observability task): metrics are
+# scraped by Prometheus directly off each Go process's client_golang
+# /metrics endpoint (see prometheus.yml) — the collector is not in the
+# metrics path at all, so there is exactly one place a gateway_/sched_ metric
+# is produced and exactly one place it is scraped, with no risk of double
+# counting. The collector's only job is to receive OTLP spans from the
+# gateway, sched, and the Python inference worker, batch them, and forward
+# them to Jaeger (which speaks OTLP natively as of 1.35+, so no separate
+# jaeger-exporter component is needed).
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/jaeger, debug]
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      address: 0.0.0.0:8888

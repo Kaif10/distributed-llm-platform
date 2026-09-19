@@ -1,0 +1,149 @@
+# Containerized analogue of scripts/e2e_sched.sh / e2e_llm.sh: a 3-node
+# raftkv cluster, a scheduler and a gateway on top of it, and a handful of
+# Python inference workers - wired with docker compose instead of local
+# processes so scripts/chaos_docker.sh can inject real network chaos
+# (partition, crash, latency/loss) against a live stack.
+#
+# Networking notes (verified against cmd/raftkv/main.go, cmd/sched/main.go,
+# cmd/gateway/main.go, py/infer_worker.py before writing this):
+#
+#   - raftkv derives ITS OWN listen address by indexing -id into -peers
+#     (net.Listen("tcp", addrs[id])); it does not have a separate -addr flag.
+#     Compose gives every service a DNS name matching the service name that
+#     resolves, from inside that very container, to that container's own IP
+#     - so "-peers kv0:7001,kv1:7001,kv2:7001 -id 0" makes kv0 listen on its
+#     own address exactly as the bare-metal "-peers 127.0.0.1:700x" example
+#     in the README does on one host.
+#   - sched and gateway default -addr to 127.0.0.1:..., which would refuse
+#     connections from other containers; both are overridden to ":<port>"
+#     (all interfaces) below.
+#   - infer_worker.py's --addr must also be 0.0.0.0 to accept the gateway's
+#     callback connection, but a worker registers --addr as the address
+#     OTHERS should dial it on. --advertise exists for exactly this split:
+#     bind 0.0.0.0, advertise <service-name>:<port>.
+#
+# Explicit project `name:` below: without it, compose derives the project
+# name from the current directory ("distributed_systems") - which is also
+# what docker-compose.observability.yml (another engineer's file, same repo
+# root, no `name:` of its own) defaults to. Same default project name would
+# put both stacks' containers under one project namespace, so THIS stack's
+# `docker compose down --remove-orphans` (used by scripts/chaos_docker.sh)
+# could delete THEIR grafana/jaeger/prometheus/otel-collector containers as
+# "orphans" of this project. Pinning a distinct name here avoids that
+# collision entirely, regardless of which stack came up first.
+name: dsys-chaos
+
+networks:
+  dsysnet:
+    name: dsysnet
+
+volumes:
+  kv0-data:
+  kv1-data:
+  kv2-data:
+
+x-kv-healthcheck: &kv-healthcheck
+  # kvctl exits 0 on both a successful get of an EXISTING key and of a
+  # MISSING one (cmd/kvctl/main.go: `found` false just prints "(not found)"
+  # and err stays nil) - so this succeeds as soon as the 3-node cluster can
+  # serve a linearizable read, i.e. has a leader and quorum, without needing
+  # any data to be preloaded. Exec form: no shell required on distroless.
+  test: ["CMD", "/usr/local/bin/kvctl", "-addr", "kv0:7001,kv1:7001,kv2:7001", "-timeout", "3s", "get", "healthcheck-probe-key"]
+  interval: 5s
+  timeout: 4s
+  retries: 20
+  start_period: 5s
+
+services:
+  # All five Go services share one image (build once, run a different binary
+  # per service via the command override) - explicit `image:` on every one
+  # of them, identical `build:`, is what makes compose build it ONCE and
+  # reuse the tag instead of five near-identical builds.
+  kv0:
+    image: dsys-go:local
+    build: {context: ., dockerfile: docker/Dockerfile.services}
+    command: ["raftkv", "-id", "0", "-peers", "kv0:7001,kv1:7001,kv2:7001", "-data", "/data", "-v"]
+    volumes: ["kv0-data:/data"]
+    networks: [dsysnet]
+    healthcheck: *kv-healthcheck
+
+  kv1:
+    image: dsys-go:local
+    build: {context: ., dockerfile: docker/Dockerfile.services}
+    command: ["raftkv", "-id", "1", "-peers", "kv0:7001,kv1:7001,kv2:7001", "-data", "/data", "-v"]
+    volumes: ["kv1-data:/data"]
+    networks: [dsysnet]
+    healthcheck: *kv-healthcheck
+
+  kv2:
+    image: dsys-go:local
+    build: {context: ., dockerfile: docker/Dockerfile.services}
+    command: ["raftkv", "-id", "2", "-peers", "kv0:7001,kv1:7001,kv2:7001", "-data", "/data", "-v"]
+    volumes: ["kv2-data:/data"]
+    networks: [dsysnet]
+    healthcheck: *kv-healthcheck
+
+  sched:
+    image: dsys-go:local
+    build: {context: ., dockerfile: docker/Dockerfile.services}
+    command: ["sched", "-addr", ":9001", "-kv", "kv0:7001,kv1:7001,kv2:7001", "-lease", "3s", "-reap-interval", "500ms", "-max-attempts", "5"]
+    networks: [dsysnet]
+    depends_on:
+      kv0: {condition: service_healthy}
+      kv1: {condition: service_healthy}
+      kv2: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/schedctl", "-sched", "127.0.0.1:9001", "-timeout", "3s", "stats"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 5s
+
+  gateway:
+    image: dsys-go:local
+    build: {context: ., dockerfile: docker/Dockerfile.services}
+    command: ["gateway", "-addr", ":7500", "-kv", "kv0:7001,kv1:7001,kv2:7001", "-hedge-after", "250ms"]
+    networks: [dsysnet]
+    depends_on:
+      kv0: {condition: service_healthy}
+      kv1: {condition: service_healthy}
+      kv2: {condition: service_healthy}
+
+  worker0:
+    image: dsys-worker:local
+    build: {context: ., dockerfile: docker/Dockerfile.worker}
+    command: ["--addr", "0.0.0.0:7600", "--advertise", "worker0:7600", "--gateway", "gateway:7500", "--worker-id", "py-0", "--token-ms", "6"]
+    networks: [dsysnet]
+    depends_on: [gateway]
+
+  worker1:
+    image: dsys-worker:local
+    build: {context: ., dockerfile: docker/Dockerfile.worker}
+    command: ["--addr", "0.0.0.0:7600", "--advertise", "worker1:7600", "--gateway", "gateway:7500", "--worker-id", "py-1", "--token-ms", "6"]
+    networks: [dsysnet]
+    depends_on: [gateway]
+
+  worker2:
+    image: dsys-worker:local
+    build: {context: ., dockerfile: docker/Dockerfile.worker}
+    # This one deliberately stalls its tail 15% of the time, matching
+    # scripts/e2e_llm.sh's pattern, so the gateway's -hedge-after has
+    # something real to rescue.
+    command: ["--addr", "0.0.0.0:7600", "--advertise", "worker2:7600", "--gateway", "gateway:7500", "--worker-id", "py-2", "--token-ms", "6", "--stall-prob", "0.15", "--stall-ms", "400"]
+    networks: [dsysnet]
+    depends_on: [gateway]
+
+  # netshoot sharing kv1's network namespace: kv1 itself is distroless (no
+  # shell, no tc), so `tc qdisc` has to run from a container that has it but
+  # points at kv1's interface. network_mode: "service:kv1" makes chaosbox's
+  # eth0 literally BE kv1's eth0 (same netns), so tc changes here affect
+  # kv1's real traffic. It also means chaosbox answers to kv1's DNS name and
+  # shares its port space - expected and harmless since we only ever exec
+  # into it by its own service name ("chaosbox"), never publish ports on it.
+  chaosbox:
+    image: nicolaka/netshoot
+    cap_add: [NET_ADMIN]
+    network_mode: "service:kv1"
+    depends_on:
+      kv1: {condition: service_healthy}
+    command: ["sleep", "infinity"]

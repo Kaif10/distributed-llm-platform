@@ -36,10 +36,32 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/proto"
 
 	schedv1 "dsys/gen/sched/v1"
+	"dsys/obs"
 )
+
+// tracer is package-scoped so every Queue method shares one Tracer instance;
+// it is backed by whatever TracerProvider obs.InitTracing installed (or the
+// global no-op default if tracing was never initialised), so these spans are
+// free to leave in place in tests and binaries that don't pass
+// -otlp-endpoint.
+var tracer = obs.Tracer("sched")
+
+// endSpan records err on span (if non-nil) before ending it. A nil err
+// leaves the span's default (unset) status, matching the OTel convention
+// that "unset" means success.
+func endSpan(span trace.Span, err error) {
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, err.Error())
+	}
+	span.End()
+}
 
 // Queue is safe for concurrent use; it holds no mutable state of its own.
 type Queue struct {
@@ -152,7 +174,12 @@ func terminal(s schedv1.State) bool {
 // repairs tail past it, and moves on. The reverse order (bump tail, then
 // write) would instead leave a permanent hole that every scan has to step
 // over, with no way to tell "not written yet" from "never will be".
-func (q *Queue) Submit(ctx context.Context, payload []byte, idempotencyKey string) (uint64, error) {
+func (q *Queue) Submit(ctx context.Context, payload []byte, idempotencyKey string) (id uint64, err error) {
+	ctx, span := tracer.Start(ctx, "sched.Submit", trace.WithAttributes(
+		attribute.Bool("idempotent", idempotencyKey != ""),
+	))
+	defer func() { endSpan(span, err) }()
+
 	var release func(uint64) error
 	if idempotencyKey != "" {
 		id, rel, err := q.claimIdem(ctx, idempotencyKey)
@@ -289,7 +316,19 @@ func (q *Queue) claimIdem(ctx context.Context, key string) (uint64, func(uint64)
 // Claim hands the caller the oldest runnable job under a fresh lease, or
 // ErrNoJob. Runnable means PENDING, or RUNNING with an expired lease (the
 // claimer reaps it in passing; it does not have to wait for the reaper).
-func (q *Queue) Claim(ctx context.Context, worker string, lease time.Duration) (*schedv1.Job, error) {
+func (q *Queue) Claim(ctx context.Context, worker string, lease time.Duration) (job *schedv1.Job, err error) {
+	ctx, span := tracer.Start(ctx, "sched.Claim", trace.WithAttributes(attribute.String("worker", worker)))
+	defer func() {
+		// ErrNoJob is the normal "queue empty" outcome, not a failure; don't
+		// mark the span as errored for it (mirrors grpcserver's ErrNoJob ->
+		// ClaimResponse{Found:false} treatment).
+		if errors.Is(err, ErrNoJob) {
+			span.End()
+			return
+		}
+		endSpan(span, err)
+	}()
+
 	lease = q.leaseOrDefault(lease)
 	head, headRaw, err := q.readCounter(ctx, q.keyHead(), 1)
 	if err != nil {
@@ -383,7 +422,12 @@ func checkHolder(job *schedv1.Job, gen uint64) error {
 }
 
 // Heartbeat extends the lease and returns the new deadline.
-func (q *Queue) Heartbeat(ctx context.Context, id, gen uint64, lease time.Duration) (time.Time, error) {
+func (q *Queue) Heartbeat(ctx context.Context, id, gen uint64, lease time.Duration) (until time.Time, err error) {
+	ctx, span := tracer.Start(ctx, "sched.Heartbeat", trace.WithAttributes(
+		attribute.Int64("id", int64(id)), attribute.Int64("gen", int64(gen)),
+	))
+	defer func() { endSpan(span, err) }()
+
 	lease = q.leaseOrDefault(lease)
 	for {
 		job, raw, err := q.readJob(ctx, id)
@@ -413,7 +457,12 @@ func (q *Queue) Heartbeat(ctx context.Context, id, gen uint64, lease time.Durati
 // Complete records result and marks the job DONE. Calling it again with the
 // same gen is a no-op success, so a worker whose first call's reply was lost
 // can safely retry.
-func (q *Queue) Complete(ctx context.Context, id, gen uint64, result []byte) error {
+func (q *Queue) Complete(ctx context.Context, id, gen uint64, result []byte) (err error) {
+	ctx, span := tracer.Start(ctx, "sched.Complete", trace.WithAttributes(
+		attribute.Int64("id", int64(id)), attribute.Int64("gen", int64(gen)),
+	))
+	defer func() { endSpan(span, err) }()
+
 	for {
 		job, raw, err := q.readJob(ctx, id)
 		if err != nil {
@@ -442,7 +491,12 @@ func (q *Queue) Complete(ctx context.Context, id, gen uint64, result []byte) err
 // Fail reports a failed attempt. The job is requeued (gen advanced, so the
 // caller is fenced from any further writes) unless attempts are exhausted,
 // in which case it becomes FAILED.
-func (q *Queue) Fail(ctx context.Context, id, gen uint64, reason string) (bool, error) {
+func (q *Queue) Fail(ctx context.Context, id, gen uint64, reason string) (requeued bool, err error) {
+	ctx, span := tracer.Start(ctx, "sched.Fail", trace.WithAttributes(
+		attribute.Int64("id", int64(id)), attribute.Int64("gen", int64(gen)), attribute.String("reason", reason),
+	))
+	defer func() { endSpan(span, err) }()
+
 	for {
 		job, raw, err := q.readJob(ctx, id)
 		if err != nil {
@@ -504,7 +558,10 @@ func (q *Queue) Stats(ctx context.Context) (head, tail uint64, err error) {
 // and advances head past terminal jobs. It is safe to run from any number
 // of processes concurrently: every step is a CAS, and a lost CAS just means
 // another reaper (or a claimer) already did that step.
-func (q *Queue) Reap(ctx context.Context) (int, error) {
+func (q *Queue) Reap(ctx context.Context) (reclaimedOut int, err error) {
+	ctx, span := tracer.Start(ctx, "sched.Reap")
+	defer func() { endSpan(span, err) }()
+
 	head, headRaw, err := q.readCounter(ctx, q.keyHead(), 1)
 	if err != nil {
 		return 0, err

@@ -26,6 +26,7 @@ import (
 	"flag"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"sort"
@@ -38,6 +39,7 @@ import (
 	"dsys/gateway"
 	gatewayv1 "dsys/gen/gateway/v1"
 	"dsys/kv/client"
+	"dsys/obs"
 	"dsys/ratelimit"
 	"dsys/router"
 	"dsys/sched/kvadapter"
@@ -62,6 +64,8 @@ func main() {
 	sessions := flag.Int("kv-sessions", kvadapter.DefaultSessions, "KV client identities kept for concurrent mutations")
 	kvTimeout := flag.Duration("kv-timeout", 10*time.Second, "give up retrying one KV operation after this long")
 	verbose := flag.Bool("v", false, "log KV client retries")
+	otlpEndpoint := flag.String("otlp-endpoint", "", "OTLP/gRPC endpoint for traces, e.g. 127.0.0.1:4317 (empty = tracing disabled)")
+	metricsAddr := flag.String("metrics-addr", ":9091", "address to serve Prometheus /metrics on")
 	flag.Parse()
 
 	kvAddrs := splitAddrs(*kvFlag)
@@ -72,6 +76,19 @@ func main() {
 	if len(kvAddrs) > 0 && len(ctrlAddrs) > 0 {
 		log.Fatal("-kv and -ctrl are mutually exclusive; give exactly one")
 	}
+
+	tracingShutdown, err := obs.InitTracing(context.Background(), "gateway", *otlpEndpoint)
+	if err != nil {
+		log.Fatalf("obs: init tracing: %v", err)
+	}
+	defer func() {
+		shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tracingShutdown(shCtx); err != nil {
+			log.Printf("obs: tracing shutdown: %v", err)
+		}
+	}()
+	metrics := obs.NewMetrics("gateway")
 
 	opts := []client.Option{client.WithTimeout(*kvTimeout)}
 	if *verbose {
@@ -115,6 +132,7 @@ func main() {
 		MaxInflightPerWorker: *maxInflight,
 		HedgeAfter:           *hedgeAfter,
 		DefaultMaxTokens:     int32(*defaultMaxTokens),
+		Metrics:              metrics,
 	})
 	defer srv.Close()
 
@@ -122,8 +140,21 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen %s: %v", *addr, err)
 	}
-	gs := grpc.NewServer()
+	gs := grpc.NewServer(obs.GRPCServerOption())
 	gatewayv1.RegisterGatewayServer(gs, srv)
+
+	metricsLis, err := net.Listen("tcp", *metricsAddr)
+	if err != nil {
+		log.Fatalf("listen (metrics) %s: %v", *metricsAddr, err)
+	}
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", metrics.Handler())
+	metricsSrv := &http.Server{Handler: metricsMux}
+	go func() {
+		if err := metricsSrv.Serve(metricsLis); err != nil && err != http.ErrServerClosed {
+			log.Printf("metrics server: %v", err)
+		}
+	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -156,10 +187,13 @@ func main() {
 		case <-time.After(5 * time.Second):
 			gs.Stop()
 		}
+		shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = metricsSrv.Shutdown(shCtx)
 	}()
 
-	log.Printf("gateway listening on %s (%s, prefix-routing %v, hedge-after %v, rate %.3g/s burst %.3g, cache %s, max-inflight %d)",
-		lis.Addr(), backend, *prefixRouting, *hedgeAfter, *rate, *burst, cacheDesc, *maxInflight)
+	log.Printf("gateway listening on %s (%s, prefix-routing %v, hedge-after %v, rate %.3g/s burst %.3g, cache %s, max-inflight %d), metrics on %s",
+		lis.Addr(), backend, *prefixRouting, *hedgeAfter, *rate, *burst, cacheDesc, *maxInflight, metricsLis.Addr())
 	if err := gs.Serve(lis); err != nil {
 		log.Fatalf("serve: %v", err)
 	}

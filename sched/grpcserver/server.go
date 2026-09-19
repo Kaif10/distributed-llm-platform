@@ -23,6 +23,7 @@ import (
 	"time"
 
 	schedv1 "dsys/gen/sched/v1"
+	"dsys/obs"
 	"dsys/sched"
 
 	"google.golang.org/grpc/codes"
@@ -37,10 +38,12 @@ const RetryAfter = 200 * time.Millisecond
 type Server struct {
 	schedv1.UnimplementedSchedulerServer
 	q *sched.Queue
+	m *obs.Metrics // nil disables metrics; every use below nil-checks
 }
 
-// New returns a SchedulerServer serving q.
-func New(q *sched.Queue) schedv1.SchedulerServer { return &Server{q: q} }
+// New returns a SchedulerServer serving q. m may be nil to disable metrics
+// (obs.Metrics nil-checks every method, so this is always safe).
+func New(q *sched.Queue, m *obs.Metrics) schedv1.SchedulerServer { return &Server{q: q, m: m} }
 
 // toStatus maps a Queue error onto a gRPC status. nil passes through.
 func toStatus(err error) error {
@@ -69,6 +72,7 @@ func (s *Server) Submit(ctx context.Context, req *schedv1.SubmitRequest) (*sched
 	if err != nil {
 		return nil, toStatus(err)
 	}
+	s.m.IncJobsSubmitted()
 	return &schedv1.SubmitResponse{Id: id}, nil
 }
 
@@ -88,6 +92,9 @@ func (s *Server) Claim(ctx context.Context, req *schedv1.ClaimRequest) (*schedv1
 func (s *Server) Heartbeat(ctx context.Context, req *schedv1.HeartbeatRequest) (*schedv1.HeartbeatResponse, error) {
 	until, err := s.q.Heartbeat(ctx, req.GetId(), req.GetGen(), time.Duration(req.GetLeaseMs())*time.Millisecond)
 	if err != nil {
+		if errors.Is(err, sched.ErrFenced) || errors.Is(err, sched.ErrTerminal) {
+			s.m.IncJobsFenced()
+		}
 		return nil, toStatus(err)
 	}
 	return &schedv1.HeartbeatResponse{LeaseUntilMs: until.UnixMilli()}, nil
@@ -95,15 +102,25 @@ func (s *Server) Heartbeat(ctx context.Context, req *schedv1.HeartbeatRequest) (
 
 func (s *Server) Complete(ctx context.Context, req *schedv1.CompleteRequest) (*schedv1.CompleteResponse, error) {
 	if err := s.q.Complete(ctx, req.GetId(), req.GetGen(), req.GetResult()); err != nil {
+		if errors.Is(err, sched.ErrFenced) || errors.Is(err, sched.ErrTerminal) {
+			s.m.IncJobsFenced()
+		}
 		return nil, toStatus(err)
 	}
+	s.m.IncJobsCompleted()
 	return &schedv1.CompleteResponse{}, nil
 }
 
 func (s *Server) Fail(ctx context.Context, req *schedv1.FailRequest) (*schedv1.FailResponse, error) {
 	requeued, err := s.q.Fail(ctx, req.GetId(), req.GetGen(), req.GetError())
 	if err != nil {
+		if errors.Is(err, sched.ErrFenced) || errors.Is(err, sched.ErrTerminal) {
+			s.m.IncJobsFenced()
+		}
 		return nil, toStatus(err)
+	}
+	if !requeued {
+		s.m.IncJobsFailed() // attempts exhausted; job is now terminal FAILED
 	}
 	return &schedv1.FailResponse{Requeued: requeued}, nil
 }

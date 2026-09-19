@@ -1,0 +1,104 @@
+{
+  "id": null,
+  "uid": "llm-serving",
+  "title": "LLM Serving Layer",
+  "tags": ["dsys", "llm", "phase5"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request rate (by tenant)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "sum by (tenant) (rate(gateway_requests_total[1m]))", "legendFormat": "{{tenant}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "TTFT p50 / p95 / p99 (ms)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(gateway_ttft_ms_bucket[1m])))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(gateway_ttft_ms_bucket[1m])))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(gateway_ttft_ms_bucket[1m])))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Cache hit ratio",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 8 },
+      "targets": [{ "expr": "gateway_cache_hit_ratio" }],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] }
+    },
+    {
+      "id": 4,
+      "title": "Rate-limited requests/s (by tenant)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 9, "x": 6, "y": 8 },
+      "targets": [
+        { "expr": "sum by (tenant) (rate(gateway_rate_limited_total[1m]))", "legendFormat": "{{tenant}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Live workers",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 3, "x": 15, "y": 8 },
+      "targets": [{ "expr": "gateway_live_workers" }]
+    },
+    {
+      "id": 6,
+      "title": "Hedge launch / win rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 8 },
+      "targets": [
+        { "expr": "rate(gateway_hedges_launched_total[1m])", "legendFormat": "launched/s" },
+        { "expr": "rate(gateway_hedges_won_total[1m])", "legendFormat": "won/s" }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Per-worker request distribution",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "sum by (worker) (rate(gateway_routed_total[1m]))", "legendFormat": "{{worker}}" }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Hedged vs. non-hedged requests/s",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        { "expr": "sum by (hedged) (rate(gateway_requests_total[1m]))", "legendFormat": "hedged={{hedged}}" }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Scheduler queue depth",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 24 },
+      "targets": [{ "expr": "sched_queue_depth" }]
+    },
+    {
+      "id": 10,
+      "title": "Scheduler submitted/completed/failed/fenced per second",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 24 },
+      "targets": [
+        { "expr": "rate(sched_jobs_submitted_total[1m])", "legendFormat": "submitted/s" },
+        { "expr": "rate(sched_jobs_completed_total[1m])", "legendFormat": "completed/s" },
+        { "expr": "rate(sched_jobs_failed_total[1m])", "legendFormat": "failed/s" },
+        { "expr": "rate(sched_jobs_fenced_total[1m])", "legendFormat": "fenced/s" }
+      ]
+    }
+  ]
+}

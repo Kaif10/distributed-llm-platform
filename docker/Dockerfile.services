@@ -1,0 +1,25 @@
+# Multi-stage build producing every Go binary in cmd/ (raftkv, shardctrl,
+# shardkv, sched, worker, gateway, kvctl, shardctl, schedctl, llmbench) as one
+# image. They're small; simplest to build once and pick the binary to run via
+# the command override in docker-compose.yml.
+#
+# go.mod declares `go 1.27`; the local toolchain under .tools/go is go1.27.1,
+# and the golang:1.27 tag is published on Docker Hub (verified via `docker
+# pull golang:1.27` before writing this), so we use it as-is rather than
+# falling back to an older series.
+FROM golang:1.27 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/ ./cmd/...
+
+# CGO_ENABLED=0 static builds (pure Go + gRPC, nothing here needs cgo) let the
+# final stage be distroless: no shell, no package manager, minimal attack
+# surface. Health checks in docker-compose.yml exec our OWN compiled binaries
+# (e.g. kvctl) directly in JSON/exec form, so the absence of a shell (no sh,
+# no curl/wget) is not a problem here - unlike a shell-form/CMD-SHELL
+# healthcheck, exec-form CMD needs no shell at all.
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /out/ /usr/local/bin/
+ENTRYPOINT []

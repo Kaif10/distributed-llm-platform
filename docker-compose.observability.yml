@@ -1,0 +1,76 @@
+# Observability stack: otel-collector (traces only, see
+# docker/observability/otel-collector-config.yaml for why), Jaeger, Prometheus
+# and Grafana. Owned independently of docker-compose.yml (another engineer's
+# file) — this is a separate, self-sufficient overlay.
+#
+# USAGE 1 — standalone, against gateway/sched run directly on the host
+# (this is the primary, tested path; matches scripts/e2e_llm.sh and the k6
+# load test):
+#
+#   go run ./cmd/gateway -otlp-endpoint 127.0.0.1:4317 -metrics-addr :9091 ...
+#   go run ./cmd/sched    -otlp-endpoint 127.0.0.1:4317 -metrics-addr :9092 ...
+#   docker compose -f docker-compose.observability.yml up -d
+#
+#   Prometheus scrapes host.docker.internal:9091/:9092 (see prometheus.yml);
+#   Jaeger UI: http://localhost:16686  Prometheus UI: http://localhost:9090
+#   Grafana:   http://localhost:3000 (admin/admin, anonymous viewer allowed)
+#
+# USAGE 2 — alongside the other engineer's docker-compose.yml, if that stack
+# is also up (this file makes no assumption about its service names; if its
+# gateway/sched containers publish -metrics-addr to the host, USAGE 1's
+# host.docker.internal scrape targets keep working unmodified):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
+#
+# Tear down:  docker compose -f docker-compose.observability.yml down -v
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.112.0
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./docker/observability/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC (gateway/sched/-otlp-endpoint, infer_worker --otlp-endpoint)
+      - "4318:4318"   # OTLP HTTP
+      - "8888:8888"   # collector self-telemetry (scraped by prometheus.yml)
+    depends_on:
+      - jaeger
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686" # Jaeger UI / query API
+      - "4327:4317"   # OTLP gRPC direct-to-Jaeger (host-side debugging only; the collector talks to it on the internal 4317)
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    volumes:
+      - ./docker/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # no-op on Docker Desktop, required on Linux Docker Engine
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./docker/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/observability/grafana/dashboards:/etc/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - jaeger
+    restart: unless-stopped

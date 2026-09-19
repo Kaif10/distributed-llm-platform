@@ -1,0 +1,12 @@
+# Keeps the docker build context (repo root, per docker-compose.yml) small
+# and fast to send to the daemon. Neither build stage needs any of these:
+# Dockerfile.services installs its own Go toolchain and Dockerfile.worker installs
+# its own Python deps from py/requirements.txt.
+.git
+.tools
+.venv
+bin
+data
+docs
+*.exe
+**/__pycache__

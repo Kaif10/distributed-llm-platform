@@ -20,6 +20,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -27,6 +29,7 @@ import (
 
 	gatewayv1 "dsys/gen/gateway/v1"
 	inferv1 "dsys/gen/infer/v1"
+	"dsys/obs"
 	"dsys/router"
 )
 
@@ -91,7 +94,10 @@ func New(opts Options) *Server {
 }
 
 func (s *Server) dialGRPC(addr string) (inferv1.InferenceClient, error) {
-	cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// obs.GRPCDialOption propagates the caller's trace context (W3C
+	// traceparent) in outbound request metadata, so a worker's span nests
+	// under the gateway.attempt span that triggered it.
+	cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()), obs.GRPCDialOption())
 	if err != nil {
 		return nil, err
 	}
@@ -164,6 +170,7 @@ func (s *Server) countRoute(id string) {
 	s.routedMu.Lock()
 	s.routedTo[id]++
 	s.routedMu.Unlock()
+	s.opts.Metrics.IncRouted(id)
 }
 
 func (s *Server) addInflight(id string, delta int32) {
@@ -244,24 +251,47 @@ func (s *Server) Generate(req *gatewayv1.GenerateRequest, stream grpc.ServerStre
 		maxTokens = s.opts.DefaultMaxTokens
 	}
 
+	// One parent span for the whole request; the four stages below are
+	// child spans, and streamFromWorkers adds one gateway.attempt span per
+	// worker attempt (primary plus any hedge). See dsys/obs's doc comment
+	// for the full span-name list.
+	ctx, span := obs.Tracer("gateway").Start(ctx, "gateway.Generate", trace.WithAttributes(
+		attribute.String("tenant", tenant),
+		attribute.Int("prompt_chars", len(req.Prompt)),
+	))
+	defer span.End()
+
 	// 1. Rate limit. First, because it must be the cheapest rejection and
 	// must not be dodgeable by anything downstream.
 	if s.opts.Limiter != nil {
-		ok, retryAfter, err := s.opts.Limiter.Take(ctx, tenant, 1)
+		rlCtx, rlSpan := obs.Tracer("gateway").Start(ctx, "gateway.ratelimit")
+		ok, retryAfter, err := s.opts.Limiter.Take(rlCtx, tenant, 1)
 		if err != nil {
+			rlSpan.End()
 			return status.Errorf(codes.Unavailable, "rate limiter: %v", err)
 		}
 		if !ok {
 			s.rateLimited.Add(1)
+			s.opts.Metrics.IncRateLimited(tenant)
+			rlSpan.SetAttributes(attribute.Bool("limited", true))
+			rlSpan.End()
 			return status.Errorf(codes.ResourceExhausted,
 				"rate limit exceeded for tenant %q retry_after_ms=%d", tenant, retryAfter.Milliseconds())
 		}
+		rlSpan.SetAttributes(attribute.Bool("limited", false))
+		rlSpan.End()
 	}
 
 	// 2. Semantic cache. A hit costs one KV read and no GPU.
 	if s.opts.Cache != nil && !req.NoCache {
-		if text, hit, err := s.opts.Cache.Lookup(ctx, req.Prompt); err == nil && hit {
+		ccCtx, ccSpan := obs.Tracer("gateway").Start(ctx, "gateway.cache_lookup")
+		text, hit, err := s.opts.Cache.Lookup(ccCtx, req.Prompt)
+		ccSpan.SetAttributes(attribute.Bool("cache_hit", hit))
+		ccSpan.End()
+		if err == nil && hit {
 			s.cacheHits.Add(1)
+			span.SetAttributes(attribute.Bool("cached", true))
+			s.opts.Metrics.ObserveRequest(tenant, true, false)
 			return s.streamCached(stream, text, started)
 		} else if err != nil {
 			// A cache failure must never fail the request: fall through to
@@ -271,11 +301,17 @@ func (s *Server) Generate(req *gatewayv1.GenerateRequest, stream grpc.ServerStre
 	}
 
 	// 3. Route.
-	live, err := s.opts.Registry.Live(ctx)
+	rtCtx, rtSpan := obs.Tracer("gateway").Start(ctx, "gateway.route", trace.WithAttributes(
+		attribute.Bool("prefix_routing", s.opts.PrefixRouting),
+	))
+	live, err := s.opts.Registry.Live(rtCtx)
 	if err != nil {
+		rtSpan.End()
 		return status.Errorf(codes.Unavailable, "registry: %v", err)
 	}
+	s.opts.Metrics.SetLiveWorkers(len(live))
 	if len(live) == 0 {
+		rtSpan.End()
 		return status.Error(codes.Unavailable, "no inference workers registered")
 	}
 	prefix := router.Prefix(req.Prompt, s.opts.PrefixChars)
@@ -288,8 +324,11 @@ func (s *Server) Generate(req *gatewayv1.GenerateRequest, stream grpc.ServerStre
 		primary, ok = router.PickLeastLoaded(live, "")
 	}
 	if !ok {
+		rtSpan.End()
 		return status.Error(codes.Unavailable, "no eligible worker")
 	}
+	rtSpan.SetAttributes(attribute.String("worker", primary.ID))
+	rtSpan.End()
 
 	// 4. Stream, with hedging.
 	return s.streamFromWorkers(ctx, stream, req, tenant, maxTokens, prefix, live, primary, started)
@@ -300,6 +339,7 @@ func (s *Server) Generate(req *gatewayv1.GenerateRequest, stream grpc.ServerStre
 // the `cached` flag and the speed.
 func (s *Server) streamCached(stream grpc.ServerStreamingServer[gatewayv1.Token], text string, started time.Time) error {
 	ttft := s.opts.Clock().Sub(started).Milliseconds()
+	s.opts.Metrics.ObserveTTFT(float64(ttft))
 	if err := stream.Send(&gatewayv1.Token{
 		Text: text, Index: 0, Cached: true, TtftMs: ttft,
 	}); err != nil {
@@ -319,6 +359,7 @@ type attempt struct {
 	tokens chan *inferv1.Token
 	errs   chan error
 	cancel context.CancelFunc
+	span   trace.Span // gateway.attempt; ended when runAttempt returns
 }
 
 type attemptFirst struct {
@@ -359,10 +400,15 @@ func (s *Server) streamFromWorkers(
 		}
 		actx, cancel := context.WithCancel(runCtx)
 		a.cancel = cancel
+		actx, a.span = obs.Tracer("gateway").Start(actx, "gateway.attempt", trace.WithAttributes(
+			attribute.String("worker", w.ID),
+			attribute.Bool("hedge", isHedge),
+		))
 		s.countRoute(w.ID)
 		s.addInflight(w.ID, 1)
 		go func() {
 			defer s.addInflight(w.ID, -1)
+			defer a.span.End()
 			s.runAttempt(actx, a, reqID, req.Prompt, tenant, maxTokens)
 		}()
 		return a
@@ -404,6 +450,7 @@ func (s *Server) streamFromWorkers(
 			}
 			if ok {
 				s.hedgesLaunched.Add(1)
+				s.opts.Metrics.IncHedgeLaunched()
 				attempts = append(attempts, start(hedgeWorker, true))
 				pending++
 			}
@@ -442,15 +489,28 @@ func (s *Server) streamFromWorkers(
 	// Cancel the losers immediately: their tokens are waste.
 	for _, a := range attempts {
 		if a != winner {
+			a.span.SetAttributes(attribute.Bool("won", false))
 			a.cancel()
 		}
 	}
+	winner.span.SetAttributes(attribute.Bool("won", true))
 	if winner.isHedge {
 		s.hedgesWon.Add(1)
+		s.opts.Metrics.IncHedgeWon()
 	}
 
 	ttft := s.opts.Clock().Sub(started).Milliseconds()
 	hedged := len(attempts) > 1
+
+	trace.SpanFromContext(ctx).SetAttributes(
+		attribute.String("worker", winner.worker.ID),
+		attribute.Bool("cached", false),
+		attribute.Bool("hedged", hedged),
+		attribute.Bool("hedge_won", winner.isHedge),
+		attribute.Bool("prefix_cache_hit", firstTok.PrefixCacheHit),
+	)
+	s.opts.Metrics.ObserveRequest(tenant, false, hedged)
+	s.opts.Metrics.ObserveTTFT(float64(ttft))
 
 	// Forward the first token with the metadata the benchmark reads.
 	out := &gatewayv1.Token{

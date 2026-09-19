@@ -50,6 +50,12 @@ from concurrent import futures
 from typing import Iterator
 
 import grpc
+from opentelemetry import trace
+from opentelemetry.propagate import extract
+from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 
 # Same trick as worker.py / client.py: the generated *_pb2_grpc.py files do
 # bare `from infer.v1 import ...` / `from gateway.v1 import ...` imports
@@ -61,6 +67,20 @@ for _p in (_HERE, os.path.join(_HERE, "dsys_infer"), os.path.join(_HERE, "dsys_g
 
 from dsys_gateway.gateway.v1 import gateway_pb2, gateway_pb2_grpc  # noqa: E402
 from dsys_infer.infer.v1 import infer_pb2, infer_pb2_grpc  # noqa: E402
+
+tracer = trace.get_tracer("infer.worker")
+
+
+def init_tracing(otlp_endpoint: str, worker_id: str) -> None:
+    """Wires the global OTel TracerProvider to export spans via OTLP/gRPC to
+    otlp_endpoint. Called only when --otlp-endpoint is non-empty; otherwise
+    `tracer` above stays the SDK-less default no-op tracer (every span a
+    silent, allocation-cheap no-op), matching dsys/obs.InitTracing's Go-side
+    behaviour for an empty -otlp-endpoint.
+    """
+    provider = TracerProvider(resource=Resource.create({SERVICE_NAME: "infer-worker", "worker.id": worker_id}))
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True)))
+    trace.set_tracer_provider(provider)
 
 log = logging.getLogger("infer.worker")
 
@@ -258,24 +278,44 @@ class InferenceServicer(infer_pb2_grpc.InferenceServicer):
         # context.is_active() flips to False the moment the peer cancels or
         # its deadline passes; that is the signal the whole design rests on.
         active = context.is_active
+
+        # Extract the gateway's W3C traceparent from gRPC metadata (set by
+        # dsys/obs.GRPCDialOption on the Go gateway's client conn) so this
+        # span nests under the gateway.attempt span that triggered it. With
+        # no tracing configured on either side this is simply a no-op empty
+        # context, and start_as_current_span is a cheap no-op span.
+        carrier = dict(context.invocation_metadata())
+        parent_ctx = extract(carrier)
+
         finished = False
-        try:
-            for tok in self.backend.generate(request, active):
-                if tok.index == 0 and tok.prefix_cache_hit:
-                    with st.lock:
-                        st.prefix_hits += 1
-                yield tok
-                if tok.done:
-                    finished = True
-        finally:
-            with st.lock:
-                st.inflight -= 1
-                if finished:
-                    st.completed += 1
-                else:
-                    st.cancelled += 1
-            if not finished:
-                log.debug("request %s cancelled by peer, generation stopped", request.request_id)
+        with tracer.start_as_current_span(
+            "worker.Generate", context=parent_ctx,
+            attributes={"request_id": request.request_id, "tenant": request.tenant},
+        ) as span:
+            try:
+                for tok in self.backend.generate(request, active):
+                    if tok.index == 0:
+                        span.set_attributes({
+                            "prefill_ms": tok.prefill_ms,
+                            "prefix_cache_hit": tok.prefix_cache_hit,
+                            "cached_prefix_chars": tok.cached_prefix_chars,
+                        })
+                        if tok.prefix_cache_hit:
+                            with st.lock:
+                                st.prefix_hits += 1
+                    yield tok
+                    if tok.done:
+                        finished = True
+            finally:
+                span.set_attribute("cancelled", not finished)
+                with st.lock:
+                    st.inflight -= 1
+                    if finished:
+                        st.completed += 1
+                    else:
+                        st.cancelled += 1
+                if not finished:
+                    log.debug("request %s cancelled by peer, generation stopped", request.request_id)
 
     def Health(self, request, context):
         with self.stats.lock:
@@ -354,12 +394,16 @@ def main() -> None:
     ap.add_argument("--stall-ms", type=float, default=400.0, help="mock: stall duration added to prefill")
     ap.add_argument("--seed", type=int, default=None, help="mock: RNG seed for stalls")
     ap.add_argument("--stats-every", default="10s")
+    ap.add_argument("--otlp-endpoint", default="", help="OTLP/gRPC endpoint for traces, e.g. 127.0.0.1:4317 (empty = tracing disabled)")
     ap.add_argument("-v", "--verbose", action="store_true", help="debug logging (logs each cancel)")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     worker_id = args.worker_id or f"py-{socket.gethostname()}-{os.getpid()}"
+    if args.otlp_endpoint:
+        init_tracing(args.otlp_endpoint, worker_id)
+        log.info("tracing enabled: exporting to %s", args.otlp_endpoint)
     advertise = args.advertise or args.addr
     gateways = [g.strip() for g in args.gateway.split(",") if g.strip()]
     if not gateways:

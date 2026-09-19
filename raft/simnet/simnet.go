@@ -32,23 +32,56 @@ type Net struct {
 	longReordering bool
 	longDelays     bool
 
+	rngMu sync.Mutex
+	rng   *rand.Rand // every fault-injection decision goes through this
+
 	counts []atomic.Int64 // RPCs sent, per source node
 	total  atomic.Int64   // RPCs sent, all nodes
 	nbytes atomic.Int64   // gob-encoded bytes of args sent and replies delivered
 }
 
-// New returns a network for n nodes.
+// New returns a network for n nodes, with fault injection seeded from the
+// current time (the historical behaviour: every run picks different faults).
+// Use NewSeeded for a reproducible sequence of faults.
 func New(n int) *Net {
+	return NewSeeded(n, time.Now().UnixNano())
+}
+
+// NewSeeded returns a network for n nodes whose fault-injection decisions
+// (which RPCs are delayed, dropped, or reordered, and by how long) are a
+// deterministic function of seed: the same seed, replayed against the same
+// sequence of RPCs, makes the same decisions in the same order.
+//
+// This is NOT full determinism in the FoundationDB/TigerBeetle sense. Those
+// simulators also virtualize time and single-thread the whole system, so a
+// seed reproduces the exact interleaving, byte for byte, forever. Here the
+// underlying goroutines still run on the real scheduler with real
+// wall-clock sleeps: two runs of the same seed make the same fault
+// DECISIONS, but a slow CI machine can still deliver them in a different
+// order relative to, say, a Raft election timer that fires on real time.
+// What you get is "the same seed almost always reproduces the same bug",
+// which is enormously more useful than "reproduces never", and honest about
+// where it falls short of the state of the art (see docs/phase6.md).
+func NewSeeded(n int, seed int64) *Net {
 	sn := &Net{
 		n:         n,
 		handlers:  make([]raft.Handler, n),
 		connected: make([]bool, n),
 		counts:    make([]atomic.Int64, n),
+		rng:       rand.New(rand.NewSource(seed)),
 	}
 	for i := range sn.connected {
 		sn.connected[i] = true
 	}
 	return sn
+}
+
+// intn is the one place this package reads randomness, so seeding it in one
+// place (NewSeeded) governs every fault-injection decision.
+func (sn *Net) intn(n int) int {
+	sn.rngMu.Lock()
+	defer sn.rngMu.Unlock()
+	return sn.rng.Intn(n)
 }
 
 // Bind registers h as node id's inbound handler. Binding nil detaches the
@@ -210,16 +243,16 @@ func call[A, R any](p *peer, args *A, handle func(raft.Handler, *A) *R) (*R, boo
 		// Simulate a request that vanishes and a caller that eventually
 		// times out.
 		if longDelays {
-			sleepMs(rand.Intn(7000))
+			sleepMs(sn.intn(7000))
 		} else {
-			sleepMs(rand.Intn(100))
+			sleepMs(sn.intn(100))
 		}
 		return nil, false
 	}
 
 	if unreliable {
-		sleepMs(rand.Intn(27))
-		if rand.Intn(1000) < 100 {
+		sleepMs(sn.intn(27))
+		if sn.intn(1000) < 100 {
 			return nil, false // request lost
 		}
 	}
@@ -248,11 +281,11 @@ waiting:
 		// Handler contract violated ("always return a reply"); treat as lost.
 		return nil, false
 	}
-	if unreliable && rand.Intn(1000) < 100 {
+	if unreliable && sn.intn(1000) < 100 {
 		return nil, false // reply lost
 	}
-	if longReordering && rand.Intn(900) < 600 {
-		sleepMs(200 + rand.Intn(1+rand.Intn(2000)))
+	if longReordering && sn.intn(900) < 600 {
+		sleepMs(200 + sn.intn(1+sn.intn(2000)))
 	}
 	out, size, err := gobCopy(reply)
 	if err != nil {

@@ -54,6 +54,7 @@ import (
 
 	inferv1 "dsys/gen/infer/v1"
 	"dsys/kvapi"
+	"dsys/obs"
 	"dsys/ratelimit"
 	"dsys/router"
 )
@@ -98,6 +99,13 @@ type Options struct {
 
 	// DefaultMaxTokens applies when a request says 0. 0 means 64.
 	DefaultMaxTokens int32
+
+	// Metrics receives Prometheus counters/histograms for the request path.
+	// nil (the zero value from a struct literal that doesn't set it)
+	// disables metrics entirely: every call site nil-checks before use,
+	// exactly like Cache/Limiter above, so existing callers and tests are
+	// unaffected.
+	Metrics *obs.Metrics
 
 	Dial  Dialer
 	Clock func() time.Time

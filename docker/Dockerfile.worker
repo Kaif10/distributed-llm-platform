@@ -1,0 +1,43 @@
+# Python inference worker (py/infer_worker.py), matched against the Go mock
+# backend's latency model so a stack can mix Go and Python workers.
+#
+# Build context is the repo root (see docker-compose.yml), so `COPY py/ .`
+# picks up infer_worker.py, requirements.txt AND the generated gRPC stub
+# packages (py/dsys_gateway, py/dsys_infer, py/dsys_kv, py/dsys_sched) that
+# infer_worker.py imports via a sys.path shim.
+FROM python:3.12-slim
+WORKDIR /app
+COPY py/requirements.txt .
+# requirements.txt's own comment documents a deliberate THREE-phase install:
+# grpcio/grpcio-tools/protobuf first, then the opentelemetry-* packages,
+# then protobuf pinned back again. Verified why each phase is needed:
+#   1. One combined `pip install -r requirements.txt` is a hard
+#      ResolutionImpossible (pip resolves a whole requirements file as one
+#      dependency set): opentelemetry-exporter-otlp-proto-grpc pulls in
+#      opentelemetry-proto, which declares protobuf<6, conflicting with the
+#      protobuf==7.36.1 pin. Split into separate pip invocations instead:
+#      each call only resolves its OWN packages against what is already
+#      installed, so the conflict becomes a non-fatal warning, not an error.
+#   2. But that warning is not "safe to ignore" as-is: installing the otel
+#      packages in their own pip call actually DOWNGRADES the already
+#      installed protobuf (observed: 7.36.1 -> 5.29.6) to satisfy
+#      opentelemetry-proto's <6 bound. py/dsys_gateway's generated
+#      *_pb2.py was compiled with protobuf 7.35.x gencode, and protobuf
+#      enforces runtime >= gencode - so a worker started against a
+#      downgraded runtime crashes at import with a VersionError (verified
+#      against a live container before adding this third phase).
+#   3. Re-pinning protobuf back up (as its own requirements.txt comment
+#      says to) fixes this: --no-deps so pip just installs the pinned
+#      wheel instead of re-litigating the same conflict. This direction
+#      (newer protobuf runtime for OLDER gencode, i.e. otel-proto's own
+#      bundled stubs) is the one protobuf actually guarantees compatible.
+# Split generically (grep on prefixes) instead of hardcoding package
+# names/versions, so this keeps working as requirements.txt's pins change.
+RUN grep -v '^opentelemetry' requirements.txt > /tmp/core.txt && \
+    grep '^opentelemetry' requirements.txt > /tmp/otel.txt ; \
+    grep '^protobuf' requirements.txt > /tmp/protobuf-pin.txt ; \
+    pip install --no-cache-dir -r /tmp/core.txt && \
+    if [ -s /tmp/otel.txt ]; then pip install --no-cache-dir -r /tmp/otel.txt; fi && \
+    if [ -s /tmp/protobuf-pin.txt ]; then pip install --no-cache-dir --no-deps -r /tmp/protobuf-pin.txt; fi
+COPY py/ .
+ENTRYPOINT ["python", "infer_worker.py"]

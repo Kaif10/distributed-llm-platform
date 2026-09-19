@@ -1,6 +1,6 @@
 # Run `. .\env.ps1` (PowerShell) or `source ./env.sh` (Git Bash) first.
 
-.PHONY: all proto build test test-crash test-exercises test-raft test-lin test-shard test-sched e2e-sched test-llm e2e-llm lint tidy clean
+.PHONY: all proto build test test-crash test-exercises test-raft test-lin test-shard test-sched e2e-sched test-llm e2e-llm test-chaos chaos-docker obs-up obs-down lint tidy clean
 
 all: proto build test
 
@@ -60,6 +60,29 @@ test-llm:
 # result, plus rate limiting, semantic cache and cancellation.
 e2e-llm:
 	bash scripts/e2e_llm.sh 240
+
+# Phase 6: the deterministic-ish chaos harness. -short runs the quick control
+# only; the full run is 12 seeds x KV+scheduler(+gateway) chaos.
+test-chaos:
+	go test -race -count=1 -v ./chaos/...
+
+# Phase 6: one seeded chaos run against the in-process harness, verbose.
+simrun:
+	go run ./cmd/simrun -seed 42 -duration 10s -nemesis-interval 30 -gateway
+
+# Phase 6: chaos against REAL containers (Docker Desktop must be running):
+# partitions, crashes, and disk pressure via docker network/kill/exec.
+chaos-docker:
+	bash scripts/chaos_docker.sh
+
+# Phase 6: bring up Prometheus + Grafana + Jaeger for tracing/metrics.
+# See docker-compose.observability.yml's header comment for standalone vs
+# joined-with-docker-compose.yml usage.
+obs-up:
+	docker compose -f docker-compose.observability.yml up -d
+
+obs-down:
+	docker compose -f docker-compose.observability.yml down -v
 
 lint:
 	go vet ./...

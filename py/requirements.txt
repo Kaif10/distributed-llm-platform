@@ -1,3 +1,14 @@
 grpcio==1.83.1
 grpcio-tools==1.83.1
 protobuf==7.36.1
+
+# OTel tracing for infer_worker.py (--otlp-endpoint). Pinned to 1.29.x:
+# opentelemetry-exporter-otlp-proto-grpc pulls in opentelemetry-proto, whose
+# bundled *_pb2.py was generated against protobuf<6; the protobuf 7.36.1
+# runtime above still loads it fine (protobuf's runtime is forward-compatible
+# with older-generated code), so pin protobuf back to 7.36.1 AFTER installing
+# these three (pip's resolver will otherwise downgrade it and print a
+# dependency-conflict warning that is safe to ignore).
+opentelemetry-api==1.29.0
+opentelemetry-sdk==1.29.0
+opentelemetry-exporter-otlp-proto-grpc==1.29.0
