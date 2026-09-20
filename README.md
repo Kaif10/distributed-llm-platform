@@ -2,7 +2,10 @@
 
 A learning project that grows, phase by phase, from a single-node write-ahead
 log into a Raft-replicated, sharded control plane serving LLM inference.
-See [ROADMAP.md](ROADMAP.md) for the plan and `docs/phaseN.md` for each phase.
+Start with **[DESIGN.md](DESIGN.md)** for the architecture, guarantees and trade-offs,
+**[BENCHMARKS.md](BENCHMARKS.md)** for every measured number, and
+**[docs/phase7.md](docs/phase7.md)** for the narrative write-up.
+See [ROADMAP.md](ROADMAP.md) for the plan and `docs/phaseN.md` for each phase in depth.
 
 ## Quickstart
 
@@ -193,4 +196,4 @@ docs/       per-phase notes, exercises, interview prep
 - [x] Phase 4: scheduler: leases, fencing tokens, exactly-once commit, admission control
 - [x] Phase 5: LLM serving layer: distributed rate limiting, semantic cache, prefix-aware routing, hedging
 - [x] Phase 6: chaos + observability: seed-driven simulation, real-container chaos, tracing/metrics
-- [ ] Phase 7: write-up
+- [x] Phase 7: write-up (DESIGN.md, BENCHMARKS.md, docs/phase7.md)
