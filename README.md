@@ -1,33 +1,153 @@
-# dsys — a distributed LLM inference platform, built from the log up
+# dsys — a distributed LLM inference platform, built from the write-ahead log up
 
-A learning project that grows, phase by phase, from a single-node write-ahead
-log into a Raft-replicated, sharded control plane serving LLM inference.
-Start with **[DESIGN.md](DESIGN.md)** for the architecture, guarantees and trade-offs,
-**[BENCHMARKS.md](BENCHMARKS.md)** for every measured number, and
-**[docs/phase7.md](docs/phase7.md)** for the narrative write-up.
-See [ROADMAP.md](ROADMAP.md) for the plan and `docs/phaseN.md` for each phase in depth.
+A Raft-replicated, sharded control plane with a lease-and-fencing job scheduler and a
+stateless serving gateway doing rate limiting, semantic caching, prefix-aware routing and
+hedging — plus a seeded chaos harness that checks the whole thing with a linearizability
+checker. **No consensus libraries: Raft is implemented from the paper.**
+
+Go and Python. 18 test packages, all passing under `go test -race`.
+
+> **Two things stated up front, because they change what this project claims.**
+> The inference backend is a **mock** with a deliberate, written-down latency model — no
+> GPU, no weights, no real tokens. Every serving benchmark here came from it, so the honest
+> framing is *LLM serving infrastructure*, never "served LLMs". And this is built with
+> production **practices** (race-clean tests, chaos engineering, linearizability checking,
+> tracing, metrics) but it is **not production-grade**: no auth, no TLS, no security review,
+> no multi-machine durability, no deployment story. Details in [DESIGN.md](DESIGN.md) §1.
+
+---
+
+## Seeded chaos against a 5-node Raft cluster
+
+One command injects partitions, pauses and crashes on a seeded schedule, then checks the
+resulting history with [Porcupine](https://github.com/anishathalye/porcupine) for
+linearizability and verifies every scheduler job committed exactly once. A failing run
+prints the exact command to reproduce it.
+
+![seeded chaos run](docs/media/chaos.gif)
+
+## A real cluster losing its leader mid-write
+
+Three `raftkv` processes. The leader is killed while the cluster is serving. A majority
+survives, elects a new leader, and no acknowledged write is lost — with no manual
+intervention and no client-visible failure.
+
+![leader failover](docs/media/failover.gif)
+
+*Both GIFs are rendered from real captured runs — `scripts/record_demo.sh` runs the actual
+binaries, timestamps every line of output, and `scripts/make_demo_gif.py` replays that
+timing. Nothing is staged or re-typed.*
+
+---
+
+## Start here
+
+| Document | What's in it |
+|---|---|
+| **[DESIGN.md](DESIGN.md)** | Architecture, per-endpoint consistency guarantees, nine design trade-offs each naming the alternative rejected, two full request traces, failure modes |
+| **[BENCHMARKS.md](BENCHMARKS.md)** | Every measured number with the conditions that produced it |
+| **[docs/phase7.md](docs/phase7.md)** | The narrative write-up, including the parts where the approach was wrong |
+| `docs/phase1.md` … `docs/phase6.md` | Each layer in depth: design reasoning, war stories, exercises, interview Q&A |
+| [ROADMAP.md](ROADMAP.md) | The original seven-phase plan |
+
+## What it does
+
+```
+                      ┌─────────────────────────────────────────────┐
+  clients ──Generate──►  gateway (stateless, N replicas)             │
+                      │   1. rate limit   per-tenant token bucket    │
+                      │   2. cache        semantic, shared index     │
+                      │   3. route        prefix-affinity, load-aware│
+                      │   4. hedge        cancel the loser           │
+                      └───────┬──────────────────────┬───────────────┘
+                              │                      │
+                    inference workers        ┌───────▼────────┐
+                    (mock / HF path)         │  scheduler     │  leases + fencing
+                                             │  exactly-once  │  tokens, CAS-only
+                                             └───────┬────────┘
+                                                     │
+                     ┌───────────────────────────────▼─────────────────────┐
+                     │  sharded, Raft-replicated KV                        │
+                     │  shardctrl (its own Raft group) assigns shards →    │
+                     │  shardkv groups, live migration, dedup sessions     │
+                     │  move with the data                                 │
+                     └─────────────────────────────────────────────────────┘
+                              verified by: chaos/ (seeded, Porcupine)
+                              observed by:  obs/ (OTel → Jaeger, Prometheus)
+```
+
+**Phase by phase:** a write-ahead log with crash recovery and group commit → Raft from the
+paper (elections, replication, persistence, snapshots) → sharding with live migration that
+preserves exactly-once semantics across shard moves → a job scheduler built purely from
+compare-and-swap, where leases give liveness and a fencing token gives safety → an LLM
+serving gateway → chaos testing and observability.
+
+## Selected results
+
+Full context and conditions in [BENCHMARKS.md](BENCHMARKS.md). All on one 8 GB laptop, so
+**ratios travel, absolutes don't.**
+
+| | Result | What it shows |
+|---|---|---|
+| Group commit | 1,082 → **11,312** puts/s | Amortizing fsync across a batch; p50 unchanged, so the win is throughput, not latency |
+| Cost of consensus | 11,312 → **339** puts/s | The same store replicated across 3 processes on the same disk. This ~33x gap is what consensus costs |
+| Exactly-once under chaos | 2,000 jobs, 1,334 lease-expiry pauses, 1,124 crashes, **1,314 zombie writes fenced**, exactly 2,000 commits | No job ever committed twice |
+| Linearizable across shard moves | **3,191 ops, 3 groups, 0 violations** | Porcupine-clean while shards migrate live |
+| Prefix-aware routing | cache hit rate 0.20 → **0.60** | …and throughput got *worse* (20.4 → 13.4 req/s). Affinity balances prefixes, not load — see below |
+| Hedging on top | p99 TTFT 1,515 → **958 ms** | Recovers the tail the affinity hot-spot created |
+| Chaos suite | 12 seeds, **0 violations** | Plus 14/14 checks against real containers |
+
+**The most interesting result is a regression.** Prefix-aware routing tripled the worker
+cache hit rate and simultaneously made throughput and tail latency worse, because hashing
+12 prefixes onto 4 workers handed two of them ~85% of the traffic. Reporting hit rate alone
+would have shipped a throughput regression as a win. Hedging then recovered the tail.
+Written up in [docs/phase5.md](docs/phase5.md).
+
+## Bugs the tests actually caught
+
+The engineering record, not a highlight reel. Each is written up where it happened:
+
+- **Rendezvous hashing put half the keyspace on one worker in five.** FNV-1a's weak
+  avalanche let the worker ID's last byte dominate the score. A loose test bound would have
+  passed it. Fixed with a splitmix64 finalizer → 528/472/500/500.
+- **Load-aware routing was blind**, reading only registry counts refreshed once per worker
+  lease, so concurrent bursts all saw stale zeros and piled onto one worker.
+- **A benchmark that couldn't fail.** The first serving benchmark used 4 prompts, 4 workers
+  and a default-size cache, so every worker cached everything within seconds and the
+  baseline already scored 0.9. Made cache-capacity-bound to mean anything.
+- **The chaos nemesis pushed the cluster below quorum**, then reported Raft correctly
+  refusing to operate as a "violation". Fixed by bounding it to a minority of failures.
+- **Fixing that broke a reproducibility test** — which turned out to be asserting something
+  the design deliberately doesn't guarantee. The test was wrong, not the fix.
+
+---
 
 ## Quickstart
 
-All tooling is project-local under `.tools/` (Go, protoc, make, gcc) and
-`.venv/` (Python). Nothing is installed system-wide.
+All tooling is project-local under `.tools/` (Go, protoc, make, gcc) and `.venv/` (Python).
+Nothing is installed system-wide.
 
 ```powershell
-. .\env.ps1            # PowerShell: activate Go/protoc/make
+. .\env.ps1            # PowerShell: activate Go/protoc/make   (source ./env.sh in bash)
+make build             # all binaries into bin/
 make test              # unit tests
+```
+
+```powershell
 make test-crash        # kill-mid-write durability test, 200 iterations
-make build             # bin/kvserver.exe, bin/raftkv.exe, bin/kvctl.exe
 make test-raft         # Raft suite: elections, replication, persistence, snapshots
-make test-lin          # Porcupine linearizability check under partitions and crashes
-make test-shard        # sharding: rebalancing + migration, linearizability across shard moves
-make test-sched        # scheduler: exactly-once under 1000+ pauses/crashes, plus over real Raft
-make e2e-sched         # scheduler end to end against real processes (crash + zombie worker)
+make test-lin          # Porcupine linearizability under partitions and crashes
+make test-shard        # sharding: rebalancing + migration, linearizable across shard moves
+make test-sched        # scheduler: exactly-once under 1000+ pauses/crashes
 make test-llm          # gateway, rate limiter, prefix router, semantic cache
-make e2e-llm           # LLM serving end to end: prefix routing and hedging measured vs baselines
-make test-chaos        # deterministic-ish simulation: 12 seeds x KV+scheduler(+gateway) chaos
-make simrun            # one seeded chaos run against the in-process harness, verbose
-make chaos-docker      # chaos against REAL containers (Docker Desktop must be running)
-make obs-up            # Prometheus + Grafana + Jaeger for tracing/metrics (make obs-down to stop)
+make test-chaos        # 12 seeds x KV+scheduler(+gateway) chaos
+make simrun            # one seeded chaos run, verbose
+make e2e-sched         # scheduler e2e against real processes (crash + zombie worker)
+make e2e-llm           # serving e2e: prefix routing and hedging measured vs baselines
+make chaos-docker      # chaos against REAL containers (needs Docker Desktop)
+make obs-up            # Prometheus + Grafana + Jaeger   (make obs-down to stop)
+```
+
 ```
 
 ```bash
@@ -119,20 +239,6 @@ is one query away.
 
 Single-node server (Phase 1):
 
-```powershell
-.\bin\kvserver.exe -addr :7001 -data .\data\node1
-.\bin\kvctl.exe put greeting hello
-.\bin\kvctl.exe get greeting
-.\bin\kvctl.exe bench -n 2000 -c 8
-```
-
-Python client (same proto, generated stubs in `py/`):
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-python py\client.py
-```
-
 ## Layout
 
 ```
@@ -140,60 +246,43 @@ proto/      gRPC + log entry definitions (source of truth for Go and Python)
 gen/        generated Go code (make proto)
 kv/wal      append-only write-ahead log with crash recovery
 kv/store    durable KV: log-then-apply state machine
-kv/server   gRPC front end (single node)
 raft/       Raft: election, replication, persistence, snapshots (no libraries)
-raft/simnet simulated network: partitions, drops, delays, reordering
-raft/grpctransport  Raft RPCs over gRPC for real multi-process clusters
-kv/raftkv   replicated KV: Machine driven by Raft, Porcupine linearizability test
+raft/simnet seeded simulated network: partitions, drops, delays, reordering
+kv/raftkv   replicated KV: Machine driven by Raft, Porcupine-checked
 shard/      the shared shard-key mapping (NShards, Key2Shard)
-shardctrl/  shard controller: its own tiny Raft-replicated service assigning
-            shards to groups, with a deterministic rebalancing algorithm
-shardkv/    one shard-owning replica group: Machine driven by Raft, plus a
-            3-kind log (client ops, config changes, migrations) and a poll
-            loop that pulls shards in from their previous owner
-shardkv/grpctransport  cross-group shard migration RPC, and a Controller
-            adapter around the shardctrl client
-kv/client   the reusable KV client: retries with a stable RequestMeta, follows
-            leader hints, resolves shard owners, re-resolves on wrong-group
-sched/      job queue built purely from CAS: leases for liveness, gen (fencing
-            token) for safety, bounded admission, leader-elected reaper
-sched/worker  pull-model worker library: heartbeats, cancel-on-fence, no
-            retry of a fenced Complete
-cmd/        kvserver, raftkv, shardctrl, shardkv, sched, worker, gateway,
-            kvctl, shardctl, schedctl, llmbench, simrun
+shardctrl/  shard controller: its own Raft group, deterministic rebalancing
+shardkv/    shard-owning replica group: 3-kind log (ops, config, migrations)
+kv/client   reusable KV client: stable RequestMeta on retry, leader hints,
+            shard resolution, wrong-group re-resolution
+sched/      job queue built purely from CAS: leases for liveness, a fencing
+            token for safety, bounded admission, leader-elected reaper
+sched/worker  pull-model worker: heartbeats, cancel-on-fence
 kvapi/      the one KV interface every higher layer programs against
 ratelimit/  per-tenant distributed token bucket in the KV (CAS)
-router/     worker registry (lease-based discovery) + rendezvous-hash
-            prefix-affinity placement, load-aware
+router/     lease-based worker registry + rendezvous-hash prefix affinity
 semcache/   semantic cache: exact index shared in the KV, vectors local
-gateway/    the inference front end: rate limit -> cache -> route -> hedge ->
-            stream, with cancellation propagated to the worker
-infer/mock  a GPU-free inference worker with a realistic prefill/prefix-cache
-            /decode latency model, matched by py/infer_worker.py
-chaos/      seed-driven, whole-stack simulation harness: a real Raft KV
-            cluster + scheduler (+ optional gateway/workers) driven by a
-            nemesis of partitions/crashes/pauses, checked with Porcupine
-            and an exactly-once scheduler check
-obs/        OpenTelemetry tracing + Prometheus metrics, wired into the
-            gateway and scheduler
-docker/     Dockerfiles + docker-compose.yml: a real containerized cluster
-            for chaos against actual processes (scripts/chaos_docker.sh)
-docker/observability/  otel-collector, Prometheus, Grafana provisioning
-            (docker-compose.observability.yml)
+gateway/    rate limit -> cache -> route -> hedge -> stream, with cancellation
+            propagated all the way to the worker
+infer/mock  GPU-free inference worker with an explicit latency model,
+            matched exactly by py/infer_worker.py
+chaos/      seed-driven whole-stack simulation harness + nemesis
+obs/        OpenTelemetry tracing + Prometheus metrics
+docker/     Dockerfiles + compose for real-container chaos
 k6/         load test against the gateway's streaming Generate RPC
-scripts/    e2e_sched.sh, e2e_llm.sh, chaos_docker.sh: real-process and
-            real-container end-to-end scenarios
-py/         Python client + generated stubs
-docs/       per-phase notes, exercises, interview prep
+scripts/    e2e + chaos scenarios, and the demo recorder/renderer
+py/         Python client, inference worker, generated stubs
+docs/       per-phase write-ups, exercises, interview prep
 ```
 
 ## Status
+
+All seven phases complete.
 
 - [x] Phase 0: toolchain
 - [x] Phase 1: durable single-node KV (WAL, CAS, idempotent retries, group commit)
 - [x] Phase 2: Raft consensus, replicated KV, linearizability-checked
 - [x] Phase 3: sharding, live migration, deterministic rebalancing
 - [x] Phase 4: scheduler: leases, fencing tokens, exactly-once commit, admission control
-- [x] Phase 5: LLM serving layer: distributed rate limiting, semantic cache, prefix-aware routing, hedging
-- [x] Phase 6: chaos + observability: seed-driven simulation, real-container chaos, tracing/metrics
+- [x] Phase 5: LLM serving layer: rate limiting, semantic cache, prefix-aware routing, hedging
+- [x] Phase 6: chaos + observability: seeded simulation, real-container chaos, tracing/metrics
 - [x] Phase 7: write-up (DESIGN.md, BENCHMARKS.md, docs/phase7.md)
