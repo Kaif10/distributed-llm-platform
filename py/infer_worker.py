@@ -211,55 +211,18 @@ def _sleep_unless_cancelled(seconds: float, active, slice_s: float = 0.02) -> bo
         time.sleep(min(left, slice_s))
 
 
-# -- hf backend (optional, UNTESTED here: no torch/transformers in the venv) --
+# -- hf backend -------------------------------------------------------------
+# The real-model path lives in hf_backend.py: a HuggingFace causal LM with
+# GENUINE prefix KV-cache reuse (the thing vLLM/SGLang do), so a reported
+# prefix_cache_hit means computation actually skipped, not a simulated flag.
+# It is imported lazily so the default mock backend needs neither torch nor
+# transformers installed.
 
-class HFBackend:
-    """Greedy decoding from a HuggingFace causal LM, one token per yield,
-    with a cancel check between steps. Kept deliberately small; real hosts
-    would batch requests and use the model server's own KV cache."""
 
-    def __init__(self, args: argparse.Namespace) -> None:
-        try:
-            import torch  # type: ignore
-            from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore
-        except ImportError:
-            sys.exit("--backend hf needs torch and transformers: "
-                     "run `.venv/Scripts/pip install torch transformers` and retry")
-        self.torch = torch
-        self.model_name = args.model or "sshleifer/tiny-gpt2"
-        self.model = self.model_name
-        log.info("loading %s (this can take a while)", self.model_name)
-        self.tok = AutoTokenizer.from_pretrained(self.model_name)
-        self.lm = AutoModelForCausalLM.from_pretrained(self.model_name)
-        self.lm.eval()
-        self.lock = threading.Lock()  # one forward pass at a time; no batching here
+def make_hf_backend(args):
+    from hf_backend import HFBackend
 
-    def generate(self, req: infer_pb2.GenerateRequest, active) -> Iterator[infer_pb2.Token]:
-        torch = self.torch
-        max_tokens = req.max_tokens if req.max_tokens > 0 else 64
-        eos = self.tok.eos_token_id
-        ids = self.tok(req.prompt, return_tensors="pt").input_ids
-        past = None
-        t0 = time.monotonic()
-        with torch.no_grad():
-            for i in range(max_tokens):
-                if not active():
-                    return
-                with self.lock:
-                    out = self.lm(input_ids=ids if past is None else ids[:, -1:], past_key_values=past, use_cache=True)
-                past = out.past_key_values
-                nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-                ids = torch.cat([ids, nxt], dim=-1)
-                tok = infer_pb2.Token(text=self.tok.decode(nxt[0]), index=i)
-                if i == 0:
-                    tok.prefill_ms = int((time.monotonic() - t0) * 1000)  # no prefix cache in this path
-                stop = int(nxt) == eos or i == max_tokens - 1
-                if stop:
-                    tok.done = True
-                    tok.finish_reason = "stop" if int(nxt) == eos else "length"
-                yield tok
-                if stop:
-                    return
+    return HFBackend(args, infer_pb2)
 
 
 # -- gRPC service ------------------------------------------------------------
@@ -393,6 +356,7 @@ def main() -> None:
     ap.add_argument("--stall-prob", type=float, default=0.0, help="mock: probability of a tail stall")
     ap.add_argument("--stall-ms", type=float, default=400.0, help="mock: stall duration added to prefill")
     ap.add_argument("--seed", type=int, default=None, help="mock: RNG seed for stalls")
+    ap.add_argument("--torch-threads", type=int, default=2, help="hf: CPU threads for inference")
     ap.add_argument("--stats-every", default="10s")
     ap.add_argument("--otlp-endpoint", default="", help="OTLP/gRPC endpoint for traces, e.g. 127.0.0.1:4317 (empty = tracing disabled)")
     ap.add_argument("-v", "--verbose", action="store_true", help="debug logging (logs each cancel)")
@@ -409,7 +373,7 @@ def main() -> None:
     if not gateways:
         sys.exit("--gateway is required")
 
-    backend = MockBackend(args) if args.backend == "mock" else HFBackend(args)
+    backend = MockBackend(args) if args.backend == "mock" else make_hf_backend(args)
     stats = Stats()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=args.concurrency))
     infer_pb2_grpc.add_InferenceServicer_to_server(InferenceServicer(worker_id, backend, stats), server)

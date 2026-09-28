@@ -8,12 +8,16 @@ checker. **No consensus libraries: Raft is implemented from the paper.**
 Go and Python. 18 test packages, all passing under `go test -race`.
 
 > **Two things stated up front, because they change what this project claims.**
-> The inference backend is a **mock** with a deliberate, written-down latency model — no
-> GPU, no weights, no real tokens. Every serving benchmark here came from it, so the honest
-> framing is *LLM serving infrastructure*, never "served LLMs". And this is built with
-> production **practices** (race-clean tests, chaos engineering, linearizability checking,
-> tracing, metrics) but it is **not production-grade**: no auth, no TLS, no security review,
-> no multi-machine durability, no deployment story. Details in [DESIGN.md](DESIGN.md) §1.
+> There are **two inference backends**. The default is a **mock** with a deliberate,
+> written-down latency model — it is what makes the benchmarks reproducible, and every
+> benchmark number below came from it. There is also a **real backend** (`--backend hf`)
+> that runs an actual HuggingFace causal LM with genuine prefix KV-cache reuse; it is
+> tested end to end and measured below, but on CPU with a 135M model, so it demonstrates
+> the mechanism rather than serving at scale. And this is built with production
+> **practices** (race-clean tests, chaos engineering, linearizability checking, tracing,
+> metrics) but it is **not production-grade**: no auth, no TLS, no security review, no
+> batching across requests, no multi-machine durability, no deployment story. Details in
+> [DESIGN.md](DESIGN.md) §1.
 
 ---
 
@@ -96,6 +100,26 @@ Full context and conditions in [BENCHMARKS.md](BENCHMARKS.md). All on one 8 GB l
 | Prefix-aware routing | cache hit rate 0.20 → **0.60** | …and throughput got *worse* (20.4 → 13.4 req/s). Affinity balances prefixes, not load — see below |
 | Hedging on top | p99 TTFT 1,515 → **958 ms** | Recovers the tail the affinity hot-spot created |
 | Chaos suite | 12 seeds, **0 violations** | Plus 14/14 checks against real containers |
+
+### Real model, real prefix cache
+
+`--backend hf` runs an actual HuggingFace causal LM (default SmolLM2-135M-Instruct) with
+genuine KV-cache prefix reuse — the mechanism behind vLLM's automatic prefix caching and
+SGLang's RadixAttention. A request finds the longest cached block-aligned token prefix,
+reuses those `past_key_values`, and prefills only the remaining suffix. Measured through
+the full gateway on CPU:
+
+| Request | Prefill | `prefix_cache_hit` |
+|---|---|---|
+| Cold, first ever | 265 ms | false |
+| Same system prompt, different question | **139 ms** | **true** |
+| Unrelated prompt (warm cache) | 62 ms | false — correctly missed |
+
+So `prefix_cache_hit` means computation genuinely skipped, not a simulated flag, and the
+prefill difference is measured rather than modelled. The mock remains the default because
+it makes benchmarks deterministic and needs no weights; the real path proves the semantics
+the router is built on actually hold. Implementation and its honest limits (no batching,
+no paged KV sharing, greedy decoding) in [`py/hf_backend.py`](py/hf_backend.py).
 
 **The most interesting result is a regression.** Prefix-aware routing tripled the worker
 cache hit rate and simultaneously made throughput and tail latency worse, because hashing

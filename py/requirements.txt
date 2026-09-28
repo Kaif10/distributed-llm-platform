@@ -12,3 +12,11 @@ protobuf==7.36.1
 opentelemetry-api==1.29.0
 opentelemetry-sdk==1.29.0
 opentelemetry-exporter-otlp-proto-grpc==1.29.0
+
+# Optional: the real-model backend (--backend hf). Not needed for the default
+# mock backend. torch is the CPU-only wheel; on a GPU box install the CUDA
+# build instead:
+#   pip install --index-url https://download.pytorch.org/whl/cpu torch
+#   pip install transformers
+# torch==2.14.0+cpu
+# transformers==5.17.0
