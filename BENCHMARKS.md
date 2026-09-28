@@ -4,14 +4,20 @@ Every measured number from Phases 1–6, with the conditions that produced it.
 
 ## Read this before any table
 
-**The inference backend is a mock.** Every Phase 5 and Phase 6 serving number came from
-`py/infer_worker.py --backend mock` (the default) and its Go twin `infer/mock`. That is not a
-language model: it is a written-down latency model — prefill linear in the number of *uncached*
-prompt characters, a prefix cache of 64-character blocks, a fixed per-token decode delay, optional
-injected tail stalls. A `--backend hf` path exists and is explicitly untested; torch and
-transformers are not installed. No GPU, no weights, no real tokens. These numbers support one narrow
-claim: *given a worker whose prefill cost falls when it has already seen your prefix, here is what
-routing, hedging, caching and cancellation do to hit rate, throughput and the tail.*
+**Most serving numbers come from a mock backend; one section does not.** Every Phase 5 and
+Phase 6 serving number came from `py/infer_worker.py --backend mock` (the default) and its Go twin
+`infer/mock`. That is not a language model: it is a written-down latency model — prefill linear in
+the number of *uncached* prompt characters, a prefix cache of 64-character blocks, a fixed per-token
+decode delay, optional injected tail stalls. It is the default precisely because it makes these
+numbers deterministic and reproducible without weights. Those numbers support one narrow claim:
+*given a worker whose prefill cost falls when it has already seen your prefix, here is what routing,
+hedging, caching and cancellation do to hit rate, throughput and the tail.*
+
+**The real-model section is the exception** — see "Real model (`--backend hf`)" below. Those
+numbers came from an actual HuggingFace causal LM (SmolLM2-135M-Instruct) with genuine prefix
+KV-cache reuse, run on CPU. They exist to show the premise the mock encodes is real: that a
+worker which has already seen a prefix genuinely prefills faster. They are small-scale and
+CPU-bound, and are not a throughput claim.
 
 **One laptop.** All of it ran on a single memory-constrained Windows 11 laptop (8 GB RAM). "Three
 replicas" means three processes on loopback; "five nodes" means five Raft instances in one process
@@ -203,6 +209,42 @@ retried after backoff. The 1.44 ms scan is the argument for *not* building an AN
 is 100x that, so the naive scan is noise on the path it protects.
 
 ---
+
+## Real model (`--backend hf`)
+
+Unlike every table above, these came from an actual language model:
+SmolLM2-135M-Instruct via `py/hf_backend.py`, greedy decoding, float32 on CPU, with genuine
+prefix KV-cache reuse (longest cached block-aligned token prefix is reused; only the remaining
+suffix is prefilled). No GPU on this machine.
+
+**Prefix reuse on one worker**, measured end to end through the gateway:
+
+| Request | Prefill | `prefix_cache_hit` |
+|---|---|---|
+| Cold, first ever | 265 ms | false |
+| Same system prompt, different question | **139 ms** | **true** |
+| Unrelated prompt, warm cache | 62 ms | false (correctly missed) |
+
+*What this shows:* the cache matches on real prefix content, not on request count — a warm cache
+still misses for an unrelated prompt. `prefix_cache_hit` means computation genuinely skipped.
+
+**Routing comparison**, 24 requests over 4 distinct system prompts, two real-model workers:
+
+| | least-loaded | prefix routing |
+|---|---|---|
+| prefix-cache hit rate | 0.67 | **1.00** |
+| mean prefill | 906 ms | **316 ms** |
+| prefix spread (distinct workers per prefix) | 2.00 | **1.00** |
+| request split across the two workers | 12 / 12 | 18 / 6 |
+
+*What this shows:* the Phase 5 result reproduces against real weights, tradeoff and all. Affinity
+cuts mean prefill 2.9x by prefilling each system prompt on one worker instead of both — and hands
+one worker three times the traffic of the other, exactly the hot-spot the mock benchmark exposed.
+Affinity balances prefixes, not load.
+
+*What this does not show:* throughput at scale. One request at a time per worker (a lock around the
+forward pass), no batching, no paged KV sharing, a 135M model on CPU. The mechanism is real; the
+numbers are small-scale.
 
 ## Phase 6 — chaos, simulation, observability
 

@@ -23,17 +23,25 @@ be: Porcupine against concurrent histories recorded under fault injection, a see
 exactly-once checks under thousands of injected crashes and pauses, and real-container chaos with
 `tc netem`. The whole repository passes `go test -race` clean.
 
-**Not a model server: the inference backend is a mock.** `py/infer_worker.py` defaults to
-`--backend mock` (`py/infer_worker.py:389`), which generates pseudo-words from a fixed word list
-against a deliberate, written-down latency model: prefill linear in the number of *uncached* prompt
+**Two inference backends, and which one produced a number matters.** The default is a mock
+(`py/infer_worker.py --backend mock`), which generates pseudo-words from a fixed word list against a
+deliberate, written-down latency model: prefill linear in the number of *uncached* prompt
 characters, a prefix cache of 64-character blocks, a fixed per-token decode delay, optional injected
-tail stalls (`py/infer_worker.py:20-32`, `:87-89`, `:172`; the Go twin is `infer/mock/mock.go:8-19`).
-A `--backend hf` path exists and is explicitly marked untested — torch and transformers are not
-installed (`py/infer_worker.py:214-216`). **Every Phase 5 and Phase 6 serving number came from the
-mock.** No GPU, no weights, no real tokens. The honest framing is *LLM serving infrastructure*; this
-has never served an LLM. The claim the benchmarks support is narrow and deliberate: given a worker
-whose prefill cost falls when it has already seen your prefix, here is what routing, hedging,
-caching and cancellation do to hit rate, throughput and the tail.
+tail stalls (the Go twin is `infer/mock/mock.go:8-19`). It is the default because it makes the
+benchmarks deterministic and needs no weights, and **every Phase 5 and Phase 6 serving number came
+from it.**
+
+The second is real: `--backend hf` (`py/hf_backend.py`) runs an actual HuggingFace causal LM,
+default SmolLM2-135M-Instruct, with genuine prefix KV-cache reuse — a request finds the longest
+cached block-aligned token prefix, reuses those `past_key_values`, and prefills only the remaining
+suffix. That is the mechanism behind vLLM's automatic prefix caching and SGLang's RadixAttention,
+and it means a reported `prefix_cache_hit` is computation actually skipped rather than a modelled
+flag. It is tested end to end through the gateway and measured in `BENCHMARKS.md` ("Real model"),
+where the Phase 5 routing result reproduces against real weights, hot-spot tradeoff included.
+
+So the honest framing is still *LLM serving infrastructure* rather than a model server — the real
+path runs one request at a time per worker with no batching and no paged KV sharing, on a 135M model
+on CPU. It demonstrates that the premise the mock encodes is true; it is not a throughput claim.
 
 **Not production-grade.** It is built with production *practices* — race-detector-clean tests, chaos
 engineering, linearizability checking, distributed tracing, Prometheus metrics, failure testing
@@ -442,7 +450,10 @@ TigerBeetle build their core logic to run under either real I/O or a simulator f
    (`infer/mock/mock.go:169`), the longest resident leading run counted (`:181`), and prefill charged
    only on `len(prompt) - cachedChars` (`:252`). A trailing *partial* block is deliberately not
    cached — real paged caches work in whole blocks, and counting a partial one would let a
-   one-character difference at the end of a prompt claim a full block of reuse.
+   one-character difference at the end of a prompt claim a full block of reuse. The real backend
+   does the same thing for real, in 32-*token* blocks: `py/hf_backend.py` looks up the longest
+   cached block-aligned token prefix, reuses those `past_key_values`, and prefills only the
+   remaining suffix, so `prefix_cache_hit` there means computation genuinely skipped.
 
 8. **Store and finish.** After the last token the response is stored (`semcache/semcache.go:313`)
    with a plain `Put`, not a CAS — if two replicas answer the same prompt at once either answer is
@@ -516,8 +527,10 @@ TigerBeetle build their core logic to run under either real I/O or a simulator f
 
 Scope limits, stated as limits rather than as future work quietly excused.
 
-- **No real model.** The measured path is `infer/mock` and `--backend mock`; the `hf` backend is
-  untested. The single most important caveat in this document (§1).
+- **No batched model serving.** A real model backend exists and works (`--backend hf`, §1), but it
+  serves one request at a time per worker on a small CPU model, and every Phase 5/6 benchmark table
+  except the "Real model" section of `BENCHMARKS.md` came from the mock. Which backend produced a
+  number is the single most important caveat in this document (§1).
 - **No continuous batching, no paged attention.** The biggest real-world throughput lever in LLM
   serving, absent. It is orthogonal to routing — batching decides which of the requests *already at a
   worker* run next — but they interact: a worker's effective capacity becomes a function of how

@@ -116,7 +116,22 @@ the full gateway on CPU:
 | Unrelated prompt (warm cache) | 62 ms | false — correctly missed |
 
 So `prefix_cache_hit` means computation genuinely skipped, not a simulated flag, and the
-prefill difference is measured rather than modelled. The mock remains the default because
+prefill difference is measured rather than modelled.
+
+**And the Phase 5 routing result reproduces against the real model**, tradeoff included —
+24 requests over 4 distinct system prompts, two real-model workers:
+
+| | least-loaded | prefix routing |
+|---|---|---|
+| prefix-cache hit rate | 0.67 | **1.00** |
+| mean prefill | 906 ms | **316 ms** |
+| prefix spread (workers per prefix) | 2.00 | **1.00** |
+| request split across workers | 12 / 12 | 18 / 6 |
+
+2.9x less prefill work, because each system prompt is now prefilled on one worker instead
+of both. And the same hot-spot the mock benchmark exposed shows up again: hashing 4 prefixes
+onto 2 workers sends one of them three times the traffic. Affinity balances prefixes, not
+load — now confirmed with real weights, not a latency model. The mock remains the default because
 it makes benchmarks deterministic and needs no weights; the real path proves the semantics
 the router is built on actually hold. Implementation and its honest limits (no batching,
 no paged KV sharing, greedy decoding) in [`py/hf_backend.py`](py/hf_backend.py).
