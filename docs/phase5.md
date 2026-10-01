@@ -365,6 +365,15 @@ spelling variants score ~0.95 ("Summarize" vs "Summarise") and unrelated prompts
 sits between those, and `TestNearHit` (`semcache_test.go:129`) **logs both similarities** so the choice
 is auditable rather than asserted.
 
+> **Update (2026-10-01): a threshold alone was not enough.** Those test prompts are short. With a
+> long shared system prompt, two *different* questions score ~0.93, because n-gram cosine is dominated
+> by the shared text, so the second question was served the first one's answer. Recording the
+> real-model demo exposed it. A near hit is now a two-stage decision: the embedding proposes, and
+> `nearDuplicate` disposes, accepting only if the stored prompt is within a bounded edit distance
+> (5% of length, minimum 3). `TestNearHitRejectsDifferentQuestionSharingSystemPrompt` fails without
+> the check. The general lesson: a similarity threshold tuned on short inputs says nothing about long
+> inputs that share most of their text.
+
 **Brute force, and its measured cost.** `BruteIndex.Nearest` (`index.go:101-120`) is a linear scan of
 at most `MaxLocal` unit vectors, one dot product each, under an `RWMutex` so concurrent lookups scan in
 parallel (`:38-41`). `BenchmarkLookupNear` (`semcache_test.go:385`) measures a full near-path Lookup —

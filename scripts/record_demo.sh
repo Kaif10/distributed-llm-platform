@@ -6,8 +6,11 @@
 # appeared, and scripts/make_demo_gif.py replays that timing. Nothing is
 # staged or re-typed.
 #
-# Usage:  source ./env.sh && bash scripts/record_demo.sh
+# Usage:  source ./env.sh && bash scripts/record_demo.sh [all|chaos|failover|llm]
+#         (llm needs torch + transformers; see py/requirements.txt)
 set -euo pipefail
+WHICH=${1:-all}
+want() { [ "$WHICH" = all ] || [ "$WHICH" = "$1" ]; }
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
@@ -25,6 +28,10 @@ say() { printf '%s|%s\n' "$(date +%s.%N)" "$1"; }
 
 cleanup() {
   taskkill //F //IM raftkv.exe >/dev/null 2>&1 || true
+  taskkill //F //IM gateway.exe >/dev/null 2>&1 || true
+  # .venv/Scripts/python.exe is a launcher; kill the real interpreter (which
+  # holds the model in memory) by its command line.
+  powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { \$_.CommandLine -like '*infer_worker.py --addr 127.0.0.1:7960*' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1 || true
   rm -rf data/demo
 }
 trap cleanup EXIT
@@ -36,14 +43,17 @@ cleanup
 # ---------------------------------------------------------------------------
 # Demo 1: seeded chaos against an in-process 5-node Raft cluster.
 # ---------------------------------------------------------------------------
+if want chaos; then
 echo "recording chaos demo..."
 ./bin/simrun.exe -seed 42 -duration 8s -nemesis-interval 25 -nodes 5 -clients 6 2>&1 \
   | stamp > "$TMP/demo_chaos.txt"
+fi
 
 # ---------------------------------------------------------------------------
 # Demo 2: kill the Raft leader of a real 3-process cluster mid-write and show
 # the cluster elect a new one and keep serving, with no lost writes.
 # ---------------------------------------------------------------------------
+if want failover; then
 echo "recording failover demo..."
 {
   say "\$ raftkv -id 0/1/2 -peers 127.0.0.1:7801,7802,7803    # 3 real processes"
@@ -79,14 +89,56 @@ echo "recording failover demo..."
 } > "$TMP/demo_failover.txt"
 
 cleanup
+fi
+
+# ---------------------------------------------------------------------------
+# Demo 3: a REAL model behind the gateway. One SmolLM2-135M worker on CPU,
+# the gateway (prefix routing + semantic cache) over a 3-node Raft KV, and
+# py/demo_llm.py walking through a cold request, real prefix KV-cache reuse,
+# a semantic-cache hit, and a cancel that reaches the worker.
+# ---------------------------------------------------------------------------
+if want llm; then
+echo "recording llm demo (loads model weights)..."
+LKV=127.0.0.1:7901,127.0.0.1:7902,127.0.0.1:7903
+for i in 0 1 2; do
+  ./bin/raftkv.exe -id $i -peers $LKV -data "data/demo/llm$i" > "$TMP/demo_llmkv$i.log" 2>&1 &
+done
+sleep 2
+./bin/gateway.exe -addr 127.0.0.1:7950 -kv $LKV -prefix-routing=true -cache=true \
+  > "$TMP/demo_gw.log" 2>&1 &
+sleep 1.5
+$PY py/infer_worker.py --addr 127.0.0.1:7960 --gateway 127.0.0.1:7950 --worker-id hf-0 \
+  --backend hf --torch-threads 3 --kv-cache-blocks 32 > "$TMP/demo_worker.log" 2>&1 &
+for t in $(seq 1 180); do
+  grep -q "serving" "$TMP/demo_worker.log" 2>/dev/null && break
+  sleep 1
+done
+grep -q "serving" "$TMP/demo_worker.log" || { echo "worker never came up"; cat "$TMP/demo_worker.log"; exit 1; }
+sleep 3   # let it register with the gateway
+{
+  # plain echo, not say: this block is already piped through stamp
+  echo "\$ python py/demo_llm.py    # gateway -> real model worker, state in a 3-node Raft KV"
+  $PY py/demo_llm.py --gateway 127.0.0.1:7950 --worker 127.0.0.1:7960 2>&1
+} | stamp > "$TMP/demo_llm.txt"
+cleanup
+fi
 
 # ---------------------------------------------------------------------------
 # Render.
 # ---------------------------------------------------------------------------
 echo "rendering gifs..."
+if want chaos; then
 $PY scripts/make_demo_gif.py "$TMP/demo_chaos.txt" "$OUT/chaos.gif" \
   --title "simrun — seeded chaos, 5-node Raft cluster" --speed 1.6 --cols 96 --rows 24
+fi
+if want failover; then
 $PY scripts/make_demo_gif.py "$TMP/demo_failover.txt" "$OUT/failover.gif" \
   --title "raftkv — leader killed mid-write, cluster keeps serving" --speed 1.0 --cols 88 --rows 18
+fi
+if want llm; then
+$PY scripts/make_demo_gif.py "$TMP/demo_llm.txt" "$OUT/llm.gif" \
+  --title "gateway — a real LLM: prefix KV-cache reuse, semantic cache, cancel" \
+  --speed 1.0 --cols 92 --rows 33 --max-frame-ms 2500
+fi
 
-echo "done: $OUT/chaos.gif, $OUT/failover.gif"
+echo "done: $(ls $OUT/*.gif | tr '\n' ' ')"

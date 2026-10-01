@@ -9,11 +9,11 @@ Go and Python. 18 test packages, all passing under `go test -race`.
 
 > **Two things stated up front, because they change what this project claims.**
 > There are **two inference backends**. The default is a **mock** with a deliberate,
-> written-down latency model — it is what makes the benchmarks reproducible, and every
-> benchmark number below came from it. There is also a **real backend** (`--backend hf`)
-> that runs an actual HuggingFace causal LM with genuine prefix KV-cache reuse; it is
-> tested end to end and measured below, but on CPU with a 135M model, so it demonstrates
-> the mechanism rather than serving at scale. And this is built with production
+> written-down latency model — it is what makes the benchmarks reproducible, and most
+> benchmark numbers below came from it. There is also a **real backend** (`--backend hf`)
+> that runs an actual HuggingFace causal LM with genuine prefix KV-cache reuse. The full
+> serving test suite passes against it and its numbers are labelled separately below, but
+> it runs a 135M model on CPU, so it demonstrates the mechanism rather than serving at scale. And this is built with production
 > **practices** (race-clean tests, chaos engineering, linearizability checking, tracing,
 > metrics) but it is **not production-grade**: no auth, no TLS, no security review, no
 > batching across requests, no multi-machine durability, no deployment story. Details in
@@ -38,7 +38,17 @@ intervention and no client-visible failure.
 
 ![leader failover](docs/media/failover.gif)
 
-*Both GIFs are rendered from real captured runs — `scripts/record_demo.sh` runs the actual
+## A real LLM behind the gateway
+
+One SmolLM2-135M worker on CPU, behind the gateway, with routing and cache state in a
+3-node Raft KV. A cold request; a different question sharing the same system prompt, which
+the semantic cache correctly refuses to answer while the worker reuses the prompt's real KV
+cache (`prefix_cache_hit=true`, less prefill time); a typo'd repeat answered by the semantic cache
+with no model call; and a client that hangs up, whose cancel reaches the worker.
+
+![real model demo](docs/media/llm.gif)
+
+*All three GIFs are rendered from real captured runs — `scripts/record_demo.sh` runs the actual
 binaries, timestamps every line of output, and `scripts/make_demo_gif.py` replays that
 timing. Nothing is staged or re-typed.*
 
@@ -164,6 +174,19 @@ The engineering record, not a highlight reel. Each is written up where it happen
   refusing to operate as a "violation". Fixed by bounding it to a minority of failures.
 - **Fixing that broke a reproducibility test** — which turned out to be asserting something
   the design deliberately doesn't guarantee. The test was wrong, not the fix.
+- **The semantic cache could answer a different question.** Two different questions behind
+  the same long system prompt embed at cosine 0.93, above the 0.92 near-hit threshold,
+  because n-gram similarity is dominated by the text they share. The tests only used short
+  prompts, so they never saw it; recording the real-model demo did. Near hits are now
+  confirmed by a bounded edit distance against the stored prompt, and a regression test
+  fails without the fix.
+- **The published hedging win was mostly load-spreading.** It hedged at 250 ms, below the
+  median latency, so 62% of requests were hedged. Running the suite against the real model
+  exposed it. The e2e now fails if hedges reach half the requests;
+  [re-measured](BENCHMARKS.md#correction-2026-10-01-the-original-hedging-result-was-mostly-load-spreading)
+  with the old numbers kept beside the correction.
+- **Real-model "prefill" included queueing**, timed from before the worker's model lock, and
+  the mocks counted injected stalls as prefill. Both now report compute only.
 
 ---
 
@@ -332,3 +355,5 @@ All seven phases complete.
 - [x] Phase 5: LLM serving layer: rate limiting, semantic cache, prefix-aware routing, hedging
 - [x] Phase 6: chaos + observability: seeded simulation, real-container chaos, tracing/metrics
 - [x] Phase 7: write-up (DESIGN.md, BENCHMARKS.md, docs/phase7.md)
+- [x] Real model backend: SmolLM2-135M with real prefix KV-cache reuse; the full serving
+      e2e suite passes against it (`make e2e-llm-hf`)

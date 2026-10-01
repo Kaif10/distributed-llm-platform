@@ -132,10 +132,13 @@ func (o Options) withDefaults() Options {
 // Stats are cumulative counters plus the current local index size.
 // Lookups == ExactHits + NearHits + Misses once all in-flight calls return.
 type Stats struct {
-	Lookups      uint64
-	ExactHits    uint64
-	NearHits     uint64
-	Misses       uint64
+	Lookups   uint64
+	ExactHits uint64
+	NearHits  uint64
+	Misses    uint64
+	// NearRejected counts near candidates that cleared Threshold but failed
+	// the near-duplicate check (also counted in Misses).
+	NearRejected uint64
 	Stores       uint64
 	LocalVectors int
 }
@@ -147,7 +150,7 @@ type Cache struct {
 	emb  Embedder
 	opts Options
 
-	lookups, exactHits, nearHits, misses, stores atomic.Uint64
+	lookups, exactHits, nearHits, misses, stores, nearRejected atomic.Uint64
 }
 
 // New returns a Cache over kv using emb for the near path. Several Caches
@@ -174,22 +177,27 @@ func (c *Cache) keyExact(norm string) string {
 
 func (c *Cache) nowMs() int64 { return c.opts.Clock().UnixMilli() }
 
-// entry is the stored record: the completion and when it was stored.
+// entry is the stored record: the completion, when it was stored, and the
+// normalised prompt it answers. The prompt is what lets a near hit be
+// verified as a genuine near-duplicate rather than trusted on cosine alone.
 type entry struct {
 	text     string
+	prompt   string
 	storedMs int64
 }
 
-// The wire format is 8 bytes of big-endian stored_ms followed by the text.
-// A fixed header and a trailing variable field need no length prefix and no
-// codec; gob would work but drags in reflection and type descriptors for a
-// record with two fields.
-const entryHeader = 8
+// The wire format is 8 bytes of big-endian stored_ms, 4 bytes of big-endian
+// prompt length, the prompt, then the text. Fixed header fields and one
+// trailing variable field need no codec; gob would work but drags in
+// reflection and type descriptors for a record with three fields.
+const entryHeader = 12
 
 func encodeEntry(e entry) []byte {
-	b := make([]byte, entryHeader+len(e.text))
+	b := make([]byte, entryHeader+len(e.prompt)+len(e.text))
 	binary.BigEndian.PutUint64(b, uint64(e.storedMs))
-	copy(b[entryHeader:], e.text)
+	binary.BigEndian.PutUint32(b[8:], uint32(len(e.prompt)))
+	copy(b[entryHeader:], e.prompt)
+	copy(b[entryHeader+len(e.prompt):], e.text)
 	return b
 }
 
@@ -197,10 +205,85 @@ func decodeEntry(b []byte) (entry, bool) {
 	if len(b) < entryHeader {
 		return entry{}, false
 	}
+	n := int(binary.BigEndian.Uint32(b[8:]))
+	if n > len(b)-entryHeader {
+		return entry{}, false
+	}
 	return entry{
 		storedMs: int64(binary.BigEndian.Uint64(b)),
-		text:     string(b[entryHeader:]),
+		prompt:   string(b[entryHeader : entryHeader+n]),
+		text:     string(b[entryHeader+n:]),
 	}, true
+}
+
+// nearDuplicate is the second stage of a near hit: the embedding proposes a
+// candidate, this disposes. Cosine over n-gram counts is dominated by
+// whatever text two prompts SHARE, so two different questions behind the
+// same long system prompt score ~0.93 and would otherwise be served each
+// other's answers. A near-duplicate is a small edit, so the check is a
+// bounded edit distance: at most 5% of the longer prompt, minimum 3, which
+// admits spelling variants and punctuation but not a different question.
+//
+// It is lexical, so it cannot see meaning: "is X safe" and "is X unsafe"
+// are two edits apart and still match. That is the price of a near-dup
+// cache without a semantic model, and why Threshold stays conservative.
+func nearDuplicate(a, b string) bool {
+	k := max(len(a), len(b)) / 20
+	if k < 3 {
+		k = 3
+	}
+	return editDistanceWithin(a, b, k)
+}
+
+// editDistanceWithin reports whether the Levenshtein distance between a and
+// b is at most k, in O(len*k) by only filling the diagonal band |i-j| <= k
+// (any path leaving the band already costs more than k).
+func editDistanceWithin(a, b string, k int) bool {
+	if d := len(a) - len(b); d > k || -d > k {
+		return false
+	}
+	const inf = 1 << 30
+	prev := make([]int, len(b)+1)
+	cur := make([]int, len(b)+1)
+	for j := range prev {
+		if j <= k {
+			prev[j] = j
+		} else {
+			prev[j] = inf
+		}
+	}
+	for i := 1; i <= len(a); i++ {
+		lo, hi := max(1, i-k), min(len(b), i+k)
+		for j := range cur {
+			cur[j] = inf
+		}
+		if i <= k {
+			cur[0] = i
+		}
+		rowMin := cur[0]
+		for j := lo; j <= hi; j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			v := prev[j-1] + cost
+			if prev[j]+1 < v {
+				v = prev[j] + 1
+			}
+			if cur[j-1]+1 < v {
+				v = cur[j-1] + 1
+			}
+			cur[j] = v
+			if v < rowMin {
+				rowMin = v
+			}
+		}
+		if rowMin > k {
+			return false
+		}
+		prev, cur = cur, prev
+	}
+	return prev[len(b)] <= k
 }
 
 // expired reports whether e is past TTL as of now. With TTL unset nothing
@@ -297,6 +380,14 @@ func (c *Cache) Lookup(ctx context.Context, prompt string) (string, bool, error)
 		c.misses.Add(1)
 		return "", false, nil
 	}
+	// Close in embedding space is not the same as the same request; see
+	// nearDuplicate. Without this, a different question that shares a long
+	// system prompt with a cached one gets that one's answer.
+	if !nearDuplicate(norm, ne.prompt) {
+		c.nearRejected.Add(1)
+		c.misses.Add(1)
+		return "", false, nil
+	}
 	c.nearHits.Add(1)
 	return ne.text, true, nil
 }
@@ -313,7 +404,7 @@ func (c *Cache) Lookup(ctx context.Context, prompt string) (string, bool, error)
 func (c *Cache) Store(ctx context.Context, prompt, text string) error {
 	norm := normalise(prompt)
 	key := c.keyExact(norm)
-	if err := c.kv.Put(ctx, key, encodeEntry(entry{text: text, storedMs: c.nowMs()})); err != nil {
+	if err := c.kv.Put(ctx, key, encodeEntry(entry{text: text, prompt: norm, storedMs: c.nowMs()})); err != nil {
 		return err
 	}
 	c.stores.Add(1)
@@ -331,6 +422,7 @@ func (c *Cache) Stats() Stats {
 		Lookups:      c.lookups.Load(),
 		ExactHits:    c.exactHits.Load(),
 		NearHits:     c.nearHits.Load(),
+		NearRejected: c.nearRejected.Load(),
 		Misses:       c.misses.Load(),
 		Stores:       c.stores.Load(),
 		LocalVectors: c.opts.Index.Len(),

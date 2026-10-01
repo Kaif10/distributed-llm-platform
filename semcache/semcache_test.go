@@ -156,6 +156,67 @@ func TestNearHit(t *testing.T) {
 	}
 }
 
+// Regression: two DIFFERENT questions behind the same long system prompt
+// embed at cosine ~0.93, above Threshold, because n-gram cosine is
+// dominated by the shared text. Before the near-duplicate check, the second
+// question was served the first one's answer. A genuine variant of the long
+// prompt (a typo in the question) must still hit.
+func TestNearHitRejectsDifferentQuestionSharingSystemPrompt(t *testing.T) {
+	c, _ := newTestCache(newMemKV(), Options{})
+	sys := "You are a helpful teaching assistant for a university course on distributed systems. " +
+		"You explain consensus, replication, sharding, leases and fault tolerance clearly and " +
+		"accurately, in plain English, in at most two short sentences.\n\n"
+	q1 := sys + "User: What does the leader do in the Raft consensus algorithm?\nAssistant:"
+	q2 := sys + "User: Why does a distributed lock need a fencing token?\nAssistant:"
+	q1typo := sys + "User: What does the leader do in the Raft concensus algorithm?\nAssistant:"
+
+	v1, _ := c.emb.Embed(bg, normalise(q1))
+	v2, _ := c.emb.Embed(bg, normalise(q2))
+	sim := Cosine(v1, v2)
+	t.Logf("cosine(q1, q2) = %.4f, threshold = %.2f", sim, c.Options().Threshold)
+	if sim < c.Options().Threshold {
+		t.Logf("note: embedder no longer puts these above threshold; the check below still guards it")
+	}
+
+	if err := c.Store(bg, q1, "the leader replicates the log"); err != nil {
+		t.Fatal(err)
+	}
+	if text, hit, _ := c.Lookup(bg, q2); hit {
+		t.Fatalf("different question served a cached answer: %q", text)
+	}
+	if text, hit, _ := c.Lookup(bg, q1typo); !hit || text != "the leader replicates the log" {
+		t.Fatalf("typo variant of a long prompt missed: hit=%v text=%q", hit, text)
+	}
+	if s := c.Stats(); s.NearHits != 1 || s.Lookups != s.ExactHits+s.NearHits+s.Misses {
+		t.Fatalf("stats: %+v", s)
+	}
+}
+
+func TestEditDistanceWithin(t *testing.T) {
+	cases := []struct {
+		a, b string
+		k    int
+		want bool
+	}{
+		{"", "", 0, true},
+		{"abc", "abc", 0, true},
+		{"kitten", "sitting", 3, true},
+		{"kitten", "sitting", 2, false},
+		{"summarize", "summarise", 1, true},
+		{"abc", "", 3, true},
+		{"abcd", "", 3, false},
+		{"flaw", "lawn", 2, true},
+	}
+	for _, tc := range cases {
+		if got := editDistanceWithin(tc.a, tc.b, tc.k); got != tc.want {
+			t.Errorf("editDistanceWithin(%q, %q, %d) = %v, want %v", tc.a, tc.b, tc.k, got, tc.want)
+		}
+		if got := editDistanceWithin(tc.b, tc.a, tc.k); got != tc.want {
+			t.Errorf("editDistanceWithin(%q, %q, %d) = %v, want %v (swapped)", tc.b, tc.a, tc.k, got, tc.want)
+		}
+	}
+}
+
 // A near hit whose KV entry has vanished (evicted, GC'd) is a miss, and the
 // dangling index entry is dropped so the scan does not keep finding it.
 func TestNearHitDanglingKeyIsMiss(t *testing.T) {
