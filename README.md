@@ -98,7 +98,7 @@ Full context and conditions in [BENCHMARKS.md](BENCHMARKS.md). All on one 8 GB l
 | Exactly-once under chaos | 2,000 jobs, 1,334 lease-expiry pauses, 1,124 crashes, **1,314 zombie writes fenced**, exactly 2,000 commits | No job ever committed twice |
 | Linearizable across shard moves | **3,191 ops, 3 groups, 0 violations** | Porcupine-clean while shards migrate live |
 | Prefix-aware routing | cache hit rate 0.20 → **0.60** | …and throughput got *worse* (20.4 → 13.4 req/s). Affinity balances prefixes, not load — see below |
-| Hedging on top | p99 TTFT 1,515 → **958 ms** | Recovers the tail the affinity hot-spot created |
+| Hedging on top | p99 TTFT 4,232 → **2,076 ms**, hedging 23% of requests | Recovers the tail the hot-spot created. An earlier 1,515 → 958 ms figure hedged 62% of requests: load-spreading, not tail hedging ([correction](BENCHMARKS.md#correction-2026-10-01-the-original-hedging-result-was-mostly-load-spreading)) |
 | Chaos suite | 12 seeds, **0 violations** | Plus 14/14 checks against real containers |
 
 ### Real model, real prefix cache
@@ -118,20 +118,26 @@ the full gateway on CPU:
 So `prefix_cache_hit` means computation genuinely skipped, not a simulated flag, and the
 prefill difference is measured rather than modelled.
 
-**And the Phase 5 routing result reproduces against the real model**, tradeoff included —
-24 requests over 4 distinct system prompts, two real-model workers:
+**And the whole Phase 5 end-to-end suite passes against the real model.**
+`BACKEND=hf scripts/e2e_llm.sh` runs every check the mock run does (prefix routing, hedging,
+semantic cache, rate limiting, cancellation) against two real-model workers, sized for an 8 GB
+laptop: 80 requests, 6 system prompts, and a prefix cache smaller than the working set.
 
-| | least-loaded | prefix routing |
-|---|---|---|
-| prefix-cache hit rate | 0.67 | **1.00** |
-| mean prefill | 906 ms | **316 ms** |
-| prefix spread (workers per prefix) | 2.00 | **1.00** |
-| request split across workers | 12 / 12 | 18 / 6 |
+| | A: least-loaded | B: prefix routing | C: + hedging |
+|---|---|---|---|
+| prefix-cache hit rate | 0.44 | **0.83** | 0.74 |
+| mean prefill (forward pass only) | 454 ms | **327 ms** | 361 ms |
+| prefix spread (workers per prefix) | 2.00 | **1.00** | 1.67 |
+| TTFT p99 | 10.8 s | 12.3 s | **9.7 s** |
+| request split | 52 / 28 | 25 / 55 | 41 / 39 |
+| hedges launched / won | – | – | 16 / 16 |
 
-2.9x less prefill work, because each system prompt is now prefilled on one worker instead
-of both. And the same hot-spot the mock benchmark exposed shows up again: hashing 4 prefixes
-onto 2 workers sends one of them three times the traffic. Affinity balances prefixes, not
-load — now confirmed with real weights, not a latency model. The mock remains the default because
+The same run also passed the semantic cache (49/50 on repeats), rate limiting and cancellation
+checks. The tradeoff the mock exposed shows up with real weights: affinity nearly doubles cache
+hits and sends 55 of 80 requests to one worker. Hedging, tuned to fire only on the tail (20% of
+requests), recovers the p99 while keeping most of the affinity. Affinity balances prefixes, not
+load — now confirmed with real weights, not a latency model. Absolute latencies come from a
+throttled laptop CPU on battery; read the ratios. The mock remains the default because
 it makes benchmarks deterministic and needs no weights; the real path proves the semantics
 the router is built on actually hold. Implementation and its honest limits (no batching,
 no paged KV sharing, greedy decoding) in [`py/hf_backend.py`](py/hf_backend.py).
@@ -183,6 +189,7 @@ make test-chaos        # 12 seeds x KV+scheduler(+gateway) chaos
 make simrun            # one seeded chaos run, verbose
 make e2e-sched         # scheduler e2e against real processes (crash + zombie worker)
 make e2e-llm           # serving e2e: prefix routing and hedging measured vs baselines
+make e2e-llm-hf        # the same e2e checks against REAL model workers (needs torch)
 make chaos-docker      # chaos against REAL containers (needs Docker Desktop)
 make obs-up            # Prometheus + Grafana + Jaeger   (make obs-down to stop)
 ```
@@ -246,7 +253,7 @@ against real processes, plus a crashed worker, and checks every job.
 LLM serving layer (Phase 5) on top of any KV cluster above:
 
 ```powershell
-.\bin\gateway.exe -addr 127.0.0.1:7500 -kv 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 -hedge-after 250ms
+.\bin\gateway.exe -addr 127.0.0.1:7500 -kv 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 -hedge-after 1s
 .venv\Scripts\python.exe py\infer_worker.py --addr 127.0.0.1:7600 --gateway 127.0.0.1:7500 --worker-id py-0
 .venv\Scripts\python.exe py\infer_worker.py --addr 127.0.0.1:7601 --gateway 127.0.0.1:7500 --worker-id py-1
 .venv\Scripts\python.exe py\gateway_client.py

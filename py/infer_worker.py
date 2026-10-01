@@ -26,10 +26,15 @@ Backends:
                     leading run of blocks already in the LRU is "cached".
                     prefill_ms = 20 + 0.25 * (len(prompt) - cached_prefix_chars)
                     (+ --stall-ms with probability --stall-prob: a GC pause /
-                    batch-queueing stall, i.e. the tail the gateway hedges).
+                    batch-queueing stall, i.e. the tail the gateway hedges;
+                    it delays the first token but is not reported as prefill).
                     Then max_tokens tokens, --token-ms apart.
-  --backend hf    Optional, untested here: a real HuggingFace model, greedy,
-                  streamed. Needs `pip install torch transformers` in .venv.
+  --backend hf    A real HuggingFace causal LM (default SmolLM2-135M-Instruct),
+                  greedy, streamed, with genuine prefix KV-cache reuse; see
+                  py/hf_backend.py. --kv-cache-blocks bounds its cache in
+                  32-token entries and --stall-prob/--stall-ms inject the
+                  same tail stalls as the mock. Needs torch + transformers
+                  (see requirements.txt).
 
 Run:
     .venv/Scripts/python.exe py/infer_worker.py --addr 127.0.0.1:7600 --gateway 127.0.0.1:7500
@@ -172,11 +177,13 @@ class MockBackend:
         prefill_ms = PREFILL_BASE_MS + PREFILL_PER_CHAR_MS * (len(prompt) - cached_chars)
         with self.rng_lock:
             stalled = self.stall_prob > 0 and self.rng.random() < self.stall_prob
-        if stalled:
-            prefill_ms += self.stall_ms
+        # A stall delays the first token but is not reported as prefill (same
+        # as the Go mock and the hf backend): prefill_ms measures the cache's
+        # effect, TTFT measures the tail.
+        wait_ms = prefill_ms + (self.stall_ms if stalled else 0.0)
         # Prefill: nothing streams until it is done. Sleep in slices so a
         # cancel during a long (or stalled) prefill also stops us promptly.
-        if not _sleep_unless_cancelled(prefill_ms / 1000.0, active):
+        if not _sleep_unless_cancelled(wait_ms / 1000.0, active):
             return
         self.cache.insert(hashes)
 
@@ -351,11 +358,11 @@ def main() -> None:
     ap.add_argument("--concurrency", type=int, default=4, help="gRPC thread pool size")
     ap.add_argument("--backend", choices=("mock", "hf"), default="mock")
     ap.add_argument("--model", default="", help="model name (hf) or label (mock)")
-    ap.add_argument("--kv-cache-blocks", type=int, default=512, help="mock: LRU capacity in 64-char blocks")
+    ap.add_argument("--kv-cache-blocks", type=int, default=512, help="prefix-cache capacity: mock = 64-char blocks, hf = 32-token entries")
     ap.add_argument("--token-ms", type=float, default=12.0, help="mock: inter-token interval")
-    ap.add_argument("--stall-prob", type=float, default=0.0, help="mock: probability of a tail stall")
-    ap.add_argument("--stall-ms", type=float, default=400.0, help="mock: stall duration added to prefill")
-    ap.add_argument("--seed", type=int, default=None, help="mock: RNG seed for stalls")
+    ap.add_argument("--stall-prob", type=float, default=0.0, help="probability of an injected tail stall (mock and hf)")
+    ap.add_argument("--stall-ms", type=float, default=400.0, help="injected stall duration (mock and hf)")
+    ap.add_argument("--seed", type=int, default=None, help="RNG seed for stalls")
     ap.add_argument("--torch-threads", type=int, default=2, help="hf: CPU threads for inference")
     ap.add_argument("--stats-every", default="10s")
     ap.add_argument("--otlp-endpoint", default="", help="OTLP/gRPC endpoint for traces, e.g. 127.0.0.1:4317 (empty = tracing disabled)")

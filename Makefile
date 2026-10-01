@@ -1,6 +1,6 @@
 # Run `. .\env.ps1` (PowerShell) or `source ./env.sh` (Git Bash) first.
 
-.PHONY: all proto build test test-crash test-exercises test-raft test-lin test-shard test-sched e2e-sched test-llm e2e-llm test-chaos chaos-docker obs-up obs-down lint tidy clean
+.PHONY: all proto build test test-crash test-exercises test-raft test-lin test-shard test-sched e2e-sched test-llm e2e-llm e2e-llm-hf test-chaos chaos-docker obs-up obs-down lint tidy clean
 
 all: proto build test
 
@@ -60,6 +60,11 @@ test-llm:
 # result, plus rate limiting, semantic cache and cancellation.
 e2e-llm:
 	bash scripts/e2e_llm.sh 240
+
+# The same checks against REAL model workers (py/hf_backend.py, SmolLM2-135M on
+# CPU), sized for an 8GB laptop. Needs torch + transformers (py/requirements.txt).
+e2e-llm-hf:
+	BACKEND=hf bash scripts/e2e_llm.sh 80
 
 # Phase 6: the deterministic-ish chaos harness. -short runs the quick control
 # only; the full run is 12 seeds x KV+scheduler(+gateway) chaos.

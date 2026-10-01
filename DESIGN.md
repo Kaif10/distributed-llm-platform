@@ -615,6 +615,8 @@ ms, below baseline) *and* improved mean prefill to 96 ms, because the hedge targ
 the same ranking, so the fleet converged on a replication factor of 2 for hot prefixes. Full numbers:
 `BENCHMARKS.md` and `docs/phase5.md` §10.
 
+> **Correction (2026-10-01).** The hedging result above hedged at 250 ms, under the median TTFT, so it hedged ~62% of requests: its p99 gain was mostly load-spreading. Re-measured with tail-only hedging (1 s delay, 23% of requests hedged): p99 4,232 → 2,076 ms, with the median getting *worse*. See [BENCHMARKS.md](BENCHMARKS.md#correction-2026-10-01-the-original-hedging-result-was-mostly-load-spreading).
+
 **The lesson.** Measure mechanism and outcome separately and be ready for them to disagree. Reporting
 only the hit rate would have shipped this as a success and a throughput regression.
 

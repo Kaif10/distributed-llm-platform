@@ -48,8 +48,10 @@ type Options struct {
 	TokenMs float64 // default 12
 	// CacheBlocks bounds the prefix cache (LRU over block-prefix hashes).
 	CacheBlocks int // default 512
-	// StallProb / StallMs inject a tail: with probability StallProb, add
-	// StallMs to prefill. This is what hedging is measured against.
+	// StallProb / StallMs inject a tail: with probability StallProb, the
+	// request waits an extra StallMs before its first token. It is NOT
+	// counted in the reported PrefillMs. This is what hedging is measured
+	// against.
 	StallProb float64
 	StallMs   float64 // default 400
 	// Seed makes stalls reproducible. 0 uses a fixed seed.
@@ -250,6 +252,12 @@ func (w *Worker) Generate(req *inferv1.GenerateRequest, stream inferv1.Inference
 	}
 
 	prefill := w.opts.BasePrefillMs + w.opts.PrefillPerChar*float64(len(req.Prompt)-cachedChars)
+	// The reported PrefillMs is the modelled compute only. A stall still
+	// delays the request (and so shows up in TTFT, which is what hedging is
+	// judged on), but folding it into PrefillMs made a stalling worker look
+	// like a worker with a cold prefix cache and blurred the prefix-routing
+	// measurement. The real backend (py/hf_backend.py) reports it the same way.
+	computeMs := prefill
 	w.mu.Lock()
 	stalled := w.opts.StallProb > 0 && w.rng.Float64() < w.opts.StallProb
 	w.mu.Unlock()
@@ -277,7 +285,7 @@ func (w *Worker) Generate(req *inferv1.GenerateRequest, stream inferv1.Inference
 		}
 		tok := &inferv1.Token{Text: token(promptHash, i), Index: int32(i)}
 		if i == 0 {
-			tok.PrefillMs = int64(math.Round(prefill))
+			tok.PrefillMs = int64(math.Round(computeMs))
 			tok.PrefixCacheHit = cachedChars > 0
 			tok.CachedPrefixChars = int32(cachedChars)
 		}

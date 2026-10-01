@@ -197,6 +197,32 @@ fleet converged on a replication factor of 2 for hot prefixes. The cost is sprea
 **Reported prominently because had only the hit rate been reported, this would have shipped as a
 success and been a throughput regression in production.**
 
+### Correction (2026-10-01): the original hedging result was mostly load-spreading
+
+Run C above hedged at 250 ms, which sat *below* run B's median TTFT (651 ms, inflated by hot-spot
+queueing). So it hedged most requests, not the tail: a re-run of that configuration launched
+**150 hedges for 240 requests (62%)**. Its p99 "recovery" was mostly load-spreading at roughly double
+the work, and the spread rising 1.08 → 1.83 was the symptom. Nothing checked the hedge *rate*, so the
+benchmark could not catch it.
+
+There are two fixes. `e2e_llm.sh` now **fails** if hedges fire on half the requests or more. And the
+hedge delay sits above normal latency (1 s, against run A's TTFT p95 of ~0.66 s), with injected stalls
+long enough to be unmistakably tail (2.5 s, previously 500 ms). The mocks also stopped counting an
+injected stall as prefill. A stall still delays the first token, but it no longer makes a stalling
+worker look like one with a cold cache. Re-measured, same setup otherwise:
+
+| Run | Routing | Hedging | Hit rate | Mean prefill | TTFT p50 | TTFT p99 | req/s | Prefix spread | Per-worker |
+|---|---|---|---|---|---|---|---|---|---|
+| A | least-loaded | off | 0.22 | 159 ms | 221 ms | 2733 ms | **19.4** | 4.00 | 70/70/67/33 |
+| B | prefix | off | **0.57** | 108 ms | 405 ms | 4232 ms | 10.1 | **1.42** | 16/22/111/91 |
+| C | prefix | on (1 s) | **0.60** | **103 ms** | 657 ms | **2076 ms** | 13.2 | 1.75 | 21/28/110/81 |
+
+Hedges: **55 launched (23% of requests), 24 won.** The Phase 5 conclusion stands, now more honestly
+supported. Affinity balances prefixes, not load (A → B is the same regression), and tail hedging
+halves the p99 the hot spot created. What no longer stands is "hedging recovered the tail *and
+more*". The median got worse (405 → 657 ms), because every hedge adds load to an already-hot fleet.
+Hedging buys tail latency with work; it does not create capacity.
+
 | Also measured, same run | Result |
 |---|---|
 | Semantic cache on repeated identical prompts | **49/50 (0.98)** |
@@ -228,19 +254,36 @@ suffix is prefilled). No GPU on this machine.
 *What this shows:* the cache matches on real prefix content, not on request count — a warm cache
 still misses for an unrelated prompt. `prefix_cache_hit` means computation genuinely skipped.
 
-**Routing comparison**, 24 requests over 4 distinct system prompts, two real-model workers:
+**The full Phase 5 end-to-end suite against the real model** (`BACKEND=hf scripts/e2e_llm.sh`,
+measured 2026-10-01). It runs the same checks as the mock run, scaled to an 8 GB laptop: 2 real-model
+workers (~0.7 GB each), 80 requests, 4 concurrent, 6 distinct ~94-token system prompts, 16 tokens per
+reply, and a prefix cache of 9 entries of 32 tokens per worker, so each worker holds about 3 of the 6
+prefixes. One worker injects stalls (probability 0.2, 8 s) and the gateway hedges at 5 s, about run
+A's TTFT p95.
 
-| | least-loaded | prefix routing |
-|---|---|---|
-| prefix-cache hit rate | 0.67 | **1.00** |
-| mean prefill | 906 ms | **316 ms** |
-| prefix spread (distinct workers per prefix) | 2.00 | **1.00** |
-| request split across the two workers | 12 / 12 | 18 / 6 |
+| Run | Routing | Hedging | Hit rate | Mean prefill | TTFT p50 | TTFT p99 | req/s | Prefix spread | Per-worker |
+|---|---|---|---|---|---|---|---|---|---|
+| A | least-loaded | off | 0.44 | 454 ms | 1631 ms | 10778 ms | **1.04** | 2.00 | 52/28 |
+| B | prefix | off | **0.83** | **327 ms** | 2218 ms | 12299 ms | 0.83 | **1.00** | 25/55 |
+| C | prefix | on (5 s) | 0.74 | 361 ms | 2651 ms | **9650 ms** | 0.90 | 1.67 | 41/39 |
+
+Hedges: **16 launched (20%), 16 won.** The same run also passed the remaining checks: semantic cache
+49/50 on repeated prompts, rate limiting shed 3 requests at `-rate 2 -burst 3`, and a client cancelling
+after 3 tokens stopped generation on the worker.
+
+*Measurement notes.* Mean prefill is the forward pass only. An earlier version of this table (906 →
+316 ms over 24 requests) timed from before the worker's model lock, so it mixed queueing into
+"prefill". That is fixed and the table replaced. These runs were on battery with the CPU throttled
+(one prefill hit 8 s), so the absolutes are pessimistic. The comparisons within one run are the
+result.
 
 *What this shows:* the Phase 5 result reproduces against real weights, tradeoff and all. Affinity
-cuts mean prefill 2.9x by prefilling each system prompt on one worker instead of both — and hands
-one worker three times the traffic of the other, exactly the hot-spot the mock benchmark exposed.
-Affinity balances prefixes, not load.
+nearly doubles the hit rate and cuts prefill 28%, because each system prompt lives on one worker.
+It also hands the stalling worker 55 of 80 requests, so p99 gets worse, which is exactly the hot
+spot the mock benchmark exposed. Hedging, tuned to fire only on the tail, brings p99 below the
+baseline while keeping most of the affinity. Least-loaded routing also steered traffic away from
+the stalling worker by itself (52/28), which is correct behaviour. Affinity balances prefixes, not
+load.
 
 *What this does not show:* throughput at scale. One request at a time per worker (a lock around the
 forward pass), no batching, no paged KV sharing, a 135M model on CPU. The mechanism is real; the

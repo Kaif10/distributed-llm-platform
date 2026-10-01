@@ -47,6 +47,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import logging
+import random
 import threading
 import time
 from collections import OrderedDict
@@ -58,6 +59,18 @@ log = logging.getLogger("infer.hf")
 # per completed block, so this bounds per-request cache growth. 32 tokens is
 # roughly 100-130 characters of English.
 BLOCK_TOKENS = 32
+
+
+def _sleep_unless_cancelled(seconds: float, active) -> bool:
+    """Sleep in short slices; return False as soon as the peer cancels."""
+    deadline = time.monotonic() + seconds
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return True
+        if not active():
+            return False
+        time.sleep(min(0.02, left))
 
 
 class PrefixCache:
@@ -158,6 +171,17 @@ class HFBackend:
         self.cache = PrefixCache(max_entries=getattr(args, "kv_cache_blocks", 32))
         self.lock = threading.Lock()
 
+        # Optional injected tail stalls, same flags and meaning as the mock.
+        # A real model on an idle CPU has almost no tail, so without this the
+        # hedging check has nothing to cut. The stall is added on top of real
+        # compute and happens BEFORE the forward-pass lock: it models one
+        # request being delayed (a GC pause, a batch-queue wait), not the
+        # whole worker freezing.
+        self.stall_prob = getattr(args, "stall_prob", 0.0)
+        self.stall_ms = getattr(args, "stall_ms", 0.0)
+        self.rng = random.Random(getattr(args, "seed", None))
+        self.rng_lock = threading.Lock()
+
     # -- KV cache plumbing ---------------------------------------------------
     # transformers has moved from tuple-of-tuples to Cache objects; support
     # both, and fail loudly rather than silently skipping reuse.
@@ -219,9 +243,25 @@ class HFBackend:
         eos = self.tok.eos_token_id
 
         token_ids: list[int] = self.tok(req.prompt).input_ids
-        t0 = time.monotonic()
 
+        with self.rng_lock:
+            stalled = self.stall_prob > 0 and self.rng.random() < self.stall_prob
+        if stalled and not _sleep_unless_cancelled(self.stall_ms / 1000.0, active):
+            return
+
+        t_wait = time.monotonic()
         with self.lock:
+            # A request can be cancelled while it queues for the lock (a
+            # hedge loser, a client that gave up). Checking here means a
+            # cancelled request never burns a prefill it has no use for.
+            if not active():
+                return
+            queued_ms = int((time.monotonic() - t_wait) * 1000)
+            # prefill_ms measures the forward pass only, NOT the time spent
+            # waiting for the lock. Mixing the two would make a busy worker
+            # look like a slow prefill and credit (or blame) the prefix cache
+            # for what is really queueing. Queueing shows up in TTFT instead.
+            t0 = time.monotonic()
             with torch.no_grad():
                 cached_past, n_cached = self.cache.longest_prefix(token_ids)
                 past = self._clone(cached_past) if cached_past is not None else None
@@ -234,6 +274,8 @@ class HFBackend:
                 out = self.lm(input_ids=ids, past_key_values=past, use_cache=True)
                 past = out.past_key_values
                 prefill_ms = int((time.monotonic() - t0) * 1000)
+                log.debug("prefill %dms (queued %dms, %d/%d tokens cached)",
+                          prefill_ms, queued_ms, n_cached, len(token_ids))
 
                 # Remember this prompt's KV for later requests that share a
                 # prefix with it, storing an entry at EVERY block boundary —

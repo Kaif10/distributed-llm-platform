@@ -500,6 +500,8 @@ Measured 2026-09-13. Three `raftkv` replicas, one `gateway`, four `py/infer_work
 **separate OS processes** over real gRPC; workers capped at 32 prefix-cache blocks (~3.5 system
 prompts); 240 requests, 16 concurrent, 12 distinct ~600-char system prompts.
 
+> **Correction (2026-10-01).** The hedging run below hedged at 250 ms, under the median TTFT, so it hedged ~62% of requests: its p99 gain was mostly load-spreading. Re-measured with tail-only hedging (1 s delay, 23% of requests hedged): p99 4,232 → 2,076 ms, with the median getting *worse*. See [BENCHMARKS.md](../BENCHMARKS.md#correction-2026-10-01-the-original-hedging-result-was-mostly-load-spreading).
+
 | run | routing | hedging | prefix-cache hit rate | mean prefill | TTFT p50 | TTFT p99 | req/s | prefix spread | per-worker |
 |---|---|---|---|---|---|---|---|---|---|
 | A | least-loaded | off | 0.20 | 167 ms | 247 ms | 967 ms | 20.4 | 3.92 | 61/59/61/59 |
