@@ -33,6 +33,7 @@ import (
 	gatewayv1 "dsys/gen/gateway/v1"
 	inferv1 "dsys/gen/infer/v1"
 	"dsys/obs"
+	"dsys/ratelimit"
 	"dsys/router"
 )
 
@@ -45,13 +46,14 @@ type Server struct {
 	conns map[string]inferv1.InferenceClient // addr -> client, lazily dialled
 	cc    map[string]*grpc.ClientConn
 
-	requests       atomic.Uint64
-	rateLimited    atomic.Uint64
-	cacheHits      atomic.Uint64
-	hedgesLaunched atomic.Uint64
-	hedgesWon      atomic.Uint64
-	cancelled      atomic.Uint64
-	workerErrors   atomic.Uint64
+	requests          atomic.Uint64
+	rateLimited       atomic.Uint64
+	cacheHits         atomic.Uint64
+	hedgesLaunched    atomic.Uint64
+	hedgesWon         atomic.Uint64
+	cancelled         atomic.Uint64
+	workerErrors      atomic.Uint64
+	rateLimitFailOpen atomic.Uint64
 
 	routedMu sync.Mutex
 	routedTo map[string]uint64
@@ -158,14 +160,15 @@ func (s *Server) Close() {
 // the in-process accessor binaries and tests use.)
 func (s *Server) Snapshot() Stats {
 	st := Stats{
-		Requests:       s.requests.Load(),
-		RateLimited:    s.rateLimited.Load(),
-		CacheHits:      s.cacheHits.Load(),
-		HedgesLaunched: s.hedgesLaunched.Load(),
-		HedgesWon:      s.hedgesWon.Load(),
-		Cancelled:      s.cancelled.Load(),
-		WorkerErrors:   s.workerErrors.Load(),
-		RoutedTo:       map[string]uint64{},
+		Requests:          s.requests.Load(),
+		RateLimited:       s.rateLimited.Load(),
+		CacheHits:         s.cacheHits.Load(),
+		HedgesLaunched:    s.hedgesLaunched.Load(),
+		HedgesWon:         s.hedgesWon.Load(),
+		Cancelled:         s.cancelled.Load(),
+		WorkerErrors:      s.workerErrors.Load(),
+		RateLimitFailOpen: s.rateLimitFailOpen.Load(),
+		RoutedTo:          map[string]uint64{},
 	}
 	s.routedMu.Lock()
 	for k, v := range s.routedTo {
@@ -313,8 +316,15 @@ func (s *Server) Generate(req *gatewayv1.GenerateRequest, stream grpc.ServerStre
 		rlCtx, rlSpan := obs.Tracer("gateway").Start(ctx, "gateway.ratelimit")
 		ok, retryAfter, err := s.opts.Limiter.Take(rlCtx, tenant, 1)
 		if err != nil {
-			rlSpan.End()
-			return status.Errorf(codes.Unavailable, "rate limiter: %v", err)
+			// Fail open on a KV failure, never on contention; see
+			// Options.RateLimitFailOpen for the reasoning.
+			if !s.opts.RateLimitFailOpen || errors.Is(err, ratelimit.ErrContended) || ctx.Err() != nil {
+				rlSpan.End()
+				return status.Errorf(codes.Unavailable, "rate limiter: %v", err)
+			}
+			s.rateLimitFailOpen.Add(1)
+			rlSpan.SetAttributes(attribute.Bool("fail_open", true))
+			ok = true
 		}
 		if !ok {
 			s.rateLimited.Add(1)

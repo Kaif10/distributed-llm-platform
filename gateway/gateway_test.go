@@ -861,3 +861,112 @@ func TestOwnStreamsAreNotCountedTwice(t *testing.T) {
 		t.Fatalf("our 5 streams closed since a report of 7: estimate %d, want 2", got)
 	}
 }
+
+// failingKV fails every operation while fail is set: a KV mid-election or
+// behind a partition.
+type failingKV struct {
+	*memKV
+	fail atomic.Bool
+}
+
+func (k *failingKV) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	if k.fail.Load() {
+		return nil, false, fmt.Errorf("kv unavailable: no leader")
+	}
+	return k.memKV.Get(ctx, key)
+}
+
+func (k *failingKV) Put(ctx context.Context, key string, value []byte) error {
+	if k.fail.Load() {
+		return fmt.Errorf("kv unavailable: no leader")
+	}
+	return k.memKV.Put(ctx, key, value)
+}
+
+func (k *failingKV) CAS(ctx context.Context, key string, expected []byte, expectAbsent bool, value []byte) (bool, []byte, error) {
+	if k.fail.Load() {
+		return false, nil, fmt.Errorf("kv unavailable: no leader")
+	}
+	return k.memKV.CAS(ctx, key, expected, expectAbsent, value)
+}
+
+// startMockWorker serves one mock worker on loopback and returns its addr.
+func startMockWorker(t *testing.T, id string) string {
+	t.Helper()
+	w := mock.New(mock.Options{ID: id, BasePrefillMs: 1, PrefillPerChar: 0, TokenMs: 1})
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gs := grpc.NewServer()
+	inferv1.RegisterInferenceServer(gs, w)
+	go func() { _ = gs.Serve(lis) }()
+	t.Cleanup(gs.Stop)
+	return lis.Addr().String()
+}
+
+// A control-plane outage (the KV unavailable) must not take inference down
+// while the workers are healthy: rate limiting fails open, the registry
+// serves its last known live set, the cache is skipped. With fail-open off
+// the limiter's error still fails the request, as before.
+func TestKVOutageDoesNotStopInference(t *testing.T) {
+	kv := &failingKV{memKV: newMemKV()}
+	reg := router.NewRegistry(kv, router.Options{CacheTTL: time.Millisecond})
+	if _, err := reg.Register(bg, router.Worker{ID: "w0", Addr: startMockWorker(t, "w0")}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	lim := ratelimit.New(kv, ratelimit.Options{Rate: 100, Burst: 100})
+	cache := semcache.New(kv, semcache.NewNGramEmbedder(0), semcache.Options{})
+	mk := func(failOpen bool) *Server {
+		return New(Options{KV: kv, Registry: reg, Limiter: lim, Cache: cache, PrefixRouting: true, RateLimitFailOpen: failOpen})
+	}
+	open, closed := mk(true), mk(false)
+	defer open.Close()
+	defer closed.Close()
+	req := &gatewayv1.GenerateRequest{Tenant: "t", Prompt: "p", MaxTokens: 2}
+	if err := open.Generate(req, &nopStream{ctx: bg}); err != nil {
+		t.Fatalf("KV healthy: %v", err)
+	}
+
+	kv.fail.Store(true)
+	time.Sleep(5 * time.Millisecond) // past the registry's CacheTTL
+	for i := 0; i < 3; i++ {
+		if err := open.Generate(req, &nopStream{ctx: bg}); err != nil {
+			t.Fatalf("KV down, fail-open: request %d failed: %v", i, err)
+		}
+	}
+	if n := open.Snapshot().RateLimitFailOpen; n != 3 {
+		t.Fatalf("RateLimitFailOpen=%d, want 3", n)
+	}
+	if err := closed.Generate(req, &nopStream{ctx: bg}); status.Code(err) != codes.Unavailable {
+		t.Fatalf("KV down, fail-closed: want Unavailable, got %v", err)
+	}
+}
+
+// contendedKV loses every CAS, so the limiter gives up with ErrContended.
+type contendedKV struct{ *memKV }
+
+func (k contendedKV) CAS(context.Context, string, []byte, bool, []byte) (bool, []byte, error) {
+	return false, nil, nil
+}
+
+// Contention is not an outage: the KV is up and many gateways are hammering
+// one tenant's bucket. Failing open there would admit exactly the tenant
+// causing it, so it still fails the request.
+func TestRateLimitContentionDoesNotFailOpen(t *testing.T) {
+	kv := newMemKV()
+	reg := router.NewRegistry(kv, router.Options{CacheTTL: time.Millisecond})
+	if _, err := reg.Register(bg, router.Worker{ID: "w0", Addr: startMockWorker(t, "w0")}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	lim := ratelimit.New(contendedKV{newMemKV()}, ratelimit.Options{Rate: 100, Burst: 100, MaxAttempts: 2})
+	s := New(Options{KV: kv, Registry: reg, Limiter: lim, PrefixRouting: true, RateLimitFailOpen: true})
+	defer s.Close()
+	err := s.Generate(&gatewayv1.GenerateRequest{Tenant: "t", Prompt: "p", MaxTokens: 2, NoCache: true}, &nopStream{ctx: bg})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("contended limiter with fail-open: want Unavailable, got %v", err)
+	}
+	if n := s.Snapshot().RateLimitFailOpen; n != 0 {
+		t.Fatalf("RateLimitFailOpen=%d, want 0", n)
+	}
+}

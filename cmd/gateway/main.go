@@ -57,6 +57,7 @@ func main() {
 	burst := flag.Float64("burst", 20, "rate-limit burst per tenant")
 	leaseFraction := flag.Float64("rl-lease-fraction", 0.1, "lease up to this fraction of a tenant's burst per KV CAS and spend it locally (0 = exact, one CAS per request); see ratelimit.Options")
 	leaseTTL := flag.Duration("rl-lease-ttl", time.Second, "drop unused leased tokens after this long")
+	rlFailOpen := flag.Bool("rl-fail-open", true, "admit requests when the rate limiter's KV is unavailable instead of failing them (contention still fails); see gateway.Options.RateLimitFailOpen")
 	cache := flag.Bool("cache", true, "enable the semantic cache")
 	cacheNear := flag.Bool("cache-near", false, "also serve near-duplicate prompts (cosine >= -cache-threshold and <= 3 char edits); off = exact match only. Lexical, cannot see meaning; see semcache")
 	cacheThreshold := flag.Float64("cache-threshold", 0.92, "cosine similarity for a near-duplicate cache hit (with -cache-near)")
@@ -133,6 +134,7 @@ func main() {
 	srv := gateway.New(gateway.Options{
 		KV:                   kv,
 		Limiter:              limiter,
+		RateLimitFailOpen:    *rlFailOpen,
 		Cache:                semantic,
 		Registry:             registry,
 		PrefixRouting:        *prefixRouting,
@@ -215,6 +217,7 @@ func formatStats(s gateway.Stats) string {
 	b.WriteString("requests=")
 	b.WriteString(u(s.Requests))
 	b.WriteString(" rate_limited=" + u(s.RateLimited))
+	b.WriteString(" rl_fail_open=" + u(s.RateLimitFailOpen))
 	b.WriteString(" cache_hits=" + u(s.CacheHits))
 	b.WriteString(" hedges=" + u(s.HedgesLaunched) + "/" + u(s.HedgesWon))
 	b.WriteString(" cancelled=" + u(s.Cancelled))

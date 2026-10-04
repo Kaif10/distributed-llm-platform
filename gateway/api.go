@@ -82,6 +82,19 @@ type Options struct {
 	Cache    Cache              // nil disables caching
 	Registry *router.Registry   // required
 
+	// RateLimitFailOpen admits a request when the rate limiter cannot reach
+	// the KV (an election, a partition) instead of failing it. The limiter
+	// protects workers from one tenant's excess; failing closed turns a
+	// control-plane blip into a full inference outage while the workers are
+	// healthy, which is the worse trade for a serving path. Admissions made
+	// this way are counted in Stats.RateLimitFailOpen. ratelimit.ErrContended
+	// is NOT a KV failure (the KV is up, many gateways are hammering one
+	// tenant's bucket), so it still fails the request even with this set:
+	// failing open there would wave through exactly the tenant causing it.
+	// false (the zero value) keeps the old fail-closed behaviour;
+	// cmd/gateway defaults its -rl-fail-open flag to true.
+	RateLimitFailOpen bool
+
 	// PrefixRouting picks the worker by rendezvous-hashing the prompt prefix
 	// (see router). false picks the least-loaded live worker instead; the
 	// benchmark toggles this to show the effect on prefix-cache hit rate.
@@ -126,6 +139,10 @@ type Stats struct {
 	HedgesWon      uint64
 	Cancelled      uint64
 	WorkerErrors   uint64
-	RoutedTo       map[string]uint64
-	LiveWorkers    int
+	// RateLimitFailOpen counts requests admitted without a rate-limit
+	// decision because the limiter's KV was unavailable (see
+	// Options.RateLimitFailOpen).
+	RateLimitFailOpen uint64
+	RoutedTo          map[string]uint64
+	LiveWorkers       int
 }
