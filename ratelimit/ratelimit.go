@@ -249,16 +249,20 @@ func (l *Limiter) takeShared(ctx context.Context, tenant string, lim Limit, need
 		}
 		nowMs := l.opts.Clock().UnixMilli()
 		var b bucket
+		fresh := !found
 		if found {
 			var okDecode bool
 			b, okDecode = decodeBucket(raw)
 			if !okDecode {
 				// Corrupt or foreign record; start fresh rather than fail
-				// every request for this tenant forever.
-				found = false
+				// every request for this tenant forever. Only the BUCKET is
+				// fresh: the key still exists, so the CAS below must expect
+				// the bytes that are there (found stays true). Expecting
+				// absence can never succeed and wedged the tenant.
+				fresh = true
 			}
 		}
-		if !found {
+		if fresh {
 			b = bucket{tokens: lim.Burst, lastMs: nowMs}
 		}
 		b = refill(b, lim, nowMs)

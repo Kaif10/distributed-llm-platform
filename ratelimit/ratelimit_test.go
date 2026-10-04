@@ -351,3 +351,22 @@ func TestClockSkewDoesNotMultiplyRate(t *testing.T) {
 		}
 	}
 }
+
+// A corrupt or foreign bucket record must be replaced, not wedge the tenant.
+// The reset CAS has to expect the bytes that ARE there; expecting the key to
+// be absent can never succeed while the corrupt record exists, so every Take
+// for that tenant failed with ErrContended forever.
+func TestCorruptBucketIsReplaced(t *testing.T) {
+	clk := &fakeClock{}
+	clk.ms.Store(1_700_000_000_000)
+	kv := newMemKV()
+	_ = kv.Put(bg, "ratelimit/t", []byte("not a bucket"))
+	l := New(kv, Options{Rate: 1, Burst: 5, Clock: clk.now})
+	ok, _, err := l.Take(bg, "t", 1)
+	if err != nil || !ok {
+		t.Fatalf("take on a corrupt bucket: ok=%v err=%v, want a fresh full bucket", ok, err)
+	}
+	if left, _ := l.Peek(bg, "t"); left != 4 {
+		t.Fatalf("after reset and one take, bucket has %v, want 4", left)
+	}
+}
