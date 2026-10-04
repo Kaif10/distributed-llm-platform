@@ -12,6 +12,7 @@ package sched
 //	/head        uint64  lowest id that may still be non-terminal
 //	/job/<id>    Job     the record; <id> is zero-padded so keys sort
 //	/idem/<key>  id or placeholder, for Submit idempotency keys
+//	/cursor      uint64  where Claim's second scan window resumes (a hint)
 //	/leader      leader lease for the reaper (leader.go)
 //
 // # The scan
@@ -23,7 +24,9 @@ package sched
 // notices, which keeps the scan short in steady state: a healthy queue's
 // prefix is DONE jobs (skipped by head) followed by RUNNING ones (skipped by
 // the scan) followed by PENDING ones (claimed). ScanLimit bounds the worst
-// case. The indexed alternative (a per-state list, or a pending counter
+// case per window; because one long-running job pins head, Claim also scans
+// a second window from a rotating cursor so the queue behind a pinned head
+// stays reachable (see Claim). The indexed alternative (a per-state list, or a pending counter
 // per worker pool) is the natural exercise; it trades this simplicity for a
 // second key that must be kept consistent with the record.
 
@@ -87,6 +90,7 @@ func (q *Queue) keyHead() string         { return q.opts.Prefix + "/head" }
 func (q *Queue) keyJob(id uint64) string { return fmt.Sprintf("%s/job/%020d", q.opts.Prefix, id) }
 func (q *Queue) keyIdem(k string) string { return q.opts.Prefix + "/idem/" + k }
 func (q *Queue) keyLeader() string       { return q.opts.Prefix + "/leader" }
+func (q *Queue) keyCursor() string       { return q.opts.Prefix + "/cursor" }
 func (q *Queue) nowMs() int64            { return q.opts.Clock().UnixMilli() }
 func (q *Queue) leaseOrDefault(d time.Duration) time.Duration {
 	if d <= 0 {
@@ -313,9 +317,41 @@ func (q *Queue) claimIdem(ctx context.Context, key string) (uint64, func(uint64)
 // Claim
 // ---------------------------------------------------------------------------
 
-// Claim hands the caller the oldest runnable job under a fresh lease, or
-// ErrNoJob. Runnable means PENDING, or RUNNING with an expired lease (the
-// claimer reaps it in passing; it does not have to wait for the reaper).
+// Claim hands the caller a runnable job under a fresh lease, or ErrNoJob.
+// Runnable means PENDING, or RUNNING with an expired lease (the claimer
+// reaps it in passing; it does not have to wait for the reaper).
+//
+// # Two windows, and why one is not enough
+//
+// head only moves past a terminal PREFIX, so a single long-running job
+// (heartbeating, perfectly healthy) pins head for as long as it runs. Every
+// job submitted behind it completes, but stays inside [head, tail] as a DONE
+// record. A scan that only ever started at head would spend its whole
+// ScanLimit budget re-reading the pinned job and those DONE records, and
+// once more than ScanLimit of them pile up, every job past head+ScanLimit is
+// unreachable: Claim returns ErrNoJob forever with runnable work queued. The
+// same happens with ScanLimit live leases at the front of the queue.
+//
+// So Claim scans two windows of at most ScanLimit ids each:
+//
+//  1. [head, head+ScanLimit): oldest first, exactly as before. This is
+//     where requeued jobs (Fail, an expired lease) and the oldest PENDING
+//     work are, and it is the only place head is advanced.
+//  2. Only if window 1 found nothing and did not reach tail: a window
+//     starting at the cursor (/cursor), a shared hint that sweeps the rest
+//     of [head, tail] ScanLimit ids per Claim and wraps back to the end of
+//     window 1 when it passes tail.
+//
+// The invariant that gives liveness: every id in [head, tail] is examined
+// either by every Claim (window 1) or by the sweep, which advances on every
+// Claim that reaches window 2 and wraps, so a runnable job anywhere in the
+// queue is found within ceil((tail-head)/ScanLimit)+1 consecutive Claims that
+// come back empty from window 1. The cursor is ONLY a hint: it is clamped
+// into the window on read, updated with a best-effort CAS whose loss is
+// ignored, and nothing is ever claimed because of it, only because of the
+// record's own CAS. So a stale, lost, or concurrently overwritten cursor can
+// cost an extra Claim's worth of latency, never a lost job, a double claim,
+// or a fencing violation: exactly-once still rests entirely on casJob.
 func (q *Queue) Claim(ctx context.Context, worker string, lease time.Duration) (job *schedv1.Job, err error) {
 	ctx, span := tracer.Start(ctx, "sched.Claim", trace.WithAttributes(attribute.String("worker", worker)))
 	defer func() {
@@ -339,15 +375,59 @@ func (q *Queue) Claim(ctx context.Context, worker string, lease time.Duration) (
 		return nil, err
 	}
 
+	// Window 1: from head.
+	job, next, err := q.claimFrom(ctx, worker, lease, head, tail, true, head, headRaw)
+	if job != nil || err != nil {
+		return job, err
+	}
+	if next > tail {
+		return nil, ErrNoJob // window 1 already covered the whole queue
+	}
+	windowEnd := next
+
+	// Window 2: from the cursor, clamped into (window 1, tail].
+	cursor, cursorRaw, err := q.readCounter(ctx, q.keyCursor(), 0)
+	if err != nil {
+		return nil, err
+	}
+	start := cursor
+	if start < windowEnd || start > tail {
+		start = windowEnd
+	}
+	job, next, err = q.claimFrom(ctx, worker, lease, start, tail, false, 0, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Persist where the sweep got to; 0 (past tail) means "wrap", which the
+	// clamp above turns into "start right after window 1" next time.
+	if next > tail {
+		next = 0
+	}
+	if next != cursor {
+		_, _ = q.casCounter(ctx, q.keyCursor(), cursorRaw, next)
+	}
+	if job != nil {
+		return job, nil
+	}
+	return nil, ErrNoJob
+}
+
+// claimFrom scans at most ScanLimit ids starting at from (and not past tail)
+// and claims the first runnable one. next is the first id it did not
+// examine. With advanceHead, head/headRaw are the head counter as read by
+// the caller (headRaw nil if absent) and the scan advances head past a
+// terminal record found exactly at head; window 2 never touches head.
+func (q *Queue) claimFrom(ctx context.Context, worker string, lease time.Duration, from, tail uint64, advanceHead bool, head uint64, headRaw []byte) (job *schedv1.Job, next uint64, err error) {
 	scanned := 0
-	for id := head; id <= tail && scanned < q.opts.ScanLimit; id++ {
+	id := from
+	for ; id <= tail && scanned < q.opts.ScanLimit; id++ {
 		scanned++
 		job, raw, err := q.readJob(ctx, id)
 		if errors.Is(err, ErrNotFound) {
 			continue // written-but-not-yet-covered gap, or repaired-over id
 		}
 		if err != nil {
-			return nil, err
+			return nil, id, err
 		}
 		now := q.nowMs()
 
@@ -356,7 +436,7 @@ func (q *Queue) Claim(ctx context.Context, worker string, lease time.Duration) (
 			// Advance head past a terminal prefix, best effort. Only the
 			// exact head may move: id == head with headRaw the bytes we
 			// read, otherwise someone else already moved it.
-			if id == head {
+			if advanceHead && id == head {
 				if ok, _ := q.casCounter(ctx, q.keyHead(), headRaw, id+1); ok {
 					head = id + 1
 					headRaw = encU64(head)
@@ -384,10 +464,10 @@ func (q *Queue) Claim(ctx context.Context, worker string, lease time.Duration) (
 			next.LeaseUntilMs = now + lease.Milliseconds()
 			swapped, err := q.casJob(ctx, id, raw, next)
 			if err != nil {
-				return nil, err
+				return nil, id, err
 			}
 			if swapped {
-				return next, nil
+				return next, id + 1, nil
 			}
 			// Lost the race for this id to another claimer. Move on; it
 			// is theirs now and the next PENDING one may be free.
@@ -397,7 +477,7 @@ func (q *Queue) Claim(ctx context.Context, worker string, lease time.Duration) (
 			continue // RUNNING under a live lease
 		}
 	}
-	return nil, ErrNoJob
+	return nil, id, nil
 }
 
 // ---------------------------------------------------------------------------

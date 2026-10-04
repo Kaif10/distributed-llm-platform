@@ -379,12 +379,20 @@ func TestLeaderLease(t *testing.T) {
 // crashes, thousands of them, and every job is completed exactly once.
 // ---------------------------------------------------------------------------
 
-func TestExactlyOnceUnderChaos(t *testing.T) {
+func TestExactlyOnceUnderChaos(t *testing.T) { runExactlyOnceChaos(t, 4096) }
+
+// TestExactlyOnceUnderChaosSmallScanLimit reruns the chaos scenario with a
+// ScanLimit far smaller than the queue, so most claims come from Claim's
+// second, cursor-driven window rather than the scan from head: the cursor
+// must not cost exactly-once or fencing, and must not strand any job.
+func TestExactlyOnceUnderChaosSmallScanLimit(t *testing.T) { runExactlyOnceChaos(t, 64) }
+
+func runExactlyOnceChaos(t *testing.T, scanLimit int) {
 	const (
 		workers = 8
 		lease   = 100 * time.Millisecond
 	)
-	q, _, clk := newTestQueue(t, Options{DefaultLease: lease, MaxAttempts: 1_000_000, MaxQueue: 1 << 20, ScanLimit: 4096})
+	q, _, clk := newTestQueue(t, Options{DefaultLease: lease, MaxAttempts: 1_000_000, MaxQueue: 1 << 20, ScanLimit: scanLimit})
 
 	// Enough jobs that, at the event rates below, we comfortably exceed the
 	// requested number of pauses+crashes.
