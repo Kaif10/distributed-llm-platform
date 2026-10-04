@@ -62,11 +62,21 @@ type Server struct {
 	// stale to steer routing: a burst of concurrent requests would all read
 	// the same zeros and pile onto the same worker. What a gateway knows
 	// exactly, and instantly, is its own outstanding requests, so routing
-	// decisions use registry-reported load PLUS this. It is the same reason
-	// real load balancers count outstanding requests locally rather than
-	// trusting a periodic health report.
+	// decisions combine the two; see withLocalLoad for how. It is the same
+	// reason real load balancers count outstanding requests locally rather
+	// than trusting a periodic health report.
 	inflightMu    sync.Mutex
 	localInflight map[string]int32
+	// reportSeen remembers, per worker, the last load report (identified by
+	// its LeaseUntilMs, which changes on every renewal) and what
+	// localInflight was when this gateway first saw it. Guarded by
+	// inflightMu.
+	reportSeen map[string]loadReport
+}
+
+type loadReport struct {
+	leaseUntilMs int64
+	localAt      int32
 }
 
 // New returns a gateway Server.
@@ -89,6 +99,7 @@ func New(opts Options) *Server {
 		cc:            map[string]*grpc.ClientConn{},
 		routedTo:      map[string]uint64{},
 		localInflight: map[string]int32{},
+		reportSeen:    map[string]loadReport{},
 	}
 	if s.opts.Dial == nil {
 		s.opts.Dial = s.dialGRPC
@@ -185,18 +196,50 @@ func (s *Server) addInflight(id string, delta int32) {
 	s.inflightMu.Unlock()
 }
 
-// withLocalLoad returns live workers with this gateway's own outstanding
-// request count folded into Inflight.
+// withLocalLoad returns live workers with Inflight replaced by this
+// gateway's best estimate of each worker's current load:
+//
+//	estimate = reported - localAtReport + localNow
+//
+// i.e. the worker's last report plus OUR net change since that report.
+// The report already counts the streams this gateway had open when it was
+// made, so adding localNow on top (as this once did) counted them twice and
+// made the workers this gateway uses look up to twice as loaded as they
+// are. max(reported, localNow) would avoid that but drop either the other
+// gateways' load or our own fresh streams; the delta form keeps both:
+// reported - localAtReport estimates everyone else's streams (clamped at 0),
+// localNow is ours, exact.
+//
+// localAtReport is our count when we first SEE a report (a new
+// LeaseUntilMs), not when the worker made it; streams we opened or closed
+// in that gap (at most the registry cache TTL plus one renewal RPC) skew
+// the others-estimate by that many, and it self-corrects at the next report.
 func (s *Server) withLocalLoad(live []router.Worker) []router.Worker {
 	s.inflightMu.Lock()
 	defer s.inflightMu.Unlock()
-	if len(s.localInflight) == 0 {
-		return live
-	}
 	out := make([]router.Worker, len(live))
 	copy(out, live)
 	for i := range out {
-		out[i].Inflight += s.localInflight[out[i].ID]
+		w := &out[i]
+		local := s.localInflight[w.ID]
+		seen, ok := s.reportSeen[w.ID]
+		if !ok || seen.leaseUntilMs != w.LeaseUntilMs {
+			seen = loadReport{leaseUntilMs: w.LeaseUntilMs, localAt: local}
+			s.reportSeen[w.ID] = seen
+		}
+		w.Inflight = max(0, w.Inflight-seen.localAt) + local
+	}
+	// Forget workers that left, so the map is bounded by the live set.
+	if len(s.reportSeen) > len(live) {
+		present := make(map[string]bool, len(live))
+		for _, w := range live {
+			present[w.ID] = true
+		}
+		for id := range s.reportSeen {
+			if !present[id] {
+				delete(s.reportSeen, id)
+			}
+		}
 	}
 	return out
 }

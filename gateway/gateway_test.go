@@ -822,3 +822,42 @@ func TestIncompleteWorkerStreamIsNotCached(t *testing.T) {
 		})
 	}
 }
+
+// A worker's reported Inflight (sent at lease renewal) already includes the
+// streams this gateway has open to it. Adding this gateway's local count on
+// top counted them twice, making a worker this gateway is using look twice
+// as loaded as it is.
+func TestOwnStreamsAreNotCountedTwice(t *testing.T) {
+	s := New(Options{})
+	load := func(reported int32, leaseUntilMs int64) int32 {
+		t.Helper()
+		out := s.withLocalLoad([]router.Worker{{ID: "w", Inflight: reported, LeaseUntilMs: leaseUntilMs}})
+		return out[0].Inflight
+	}
+	// The worker's report predates our streams: it says 0.
+	if got := load(0, 1000); got != 0 {
+		t.Fatalf("idle: estimate %d, want 0", got)
+	}
+	s.addInflight("w", 3) // we open 3 streams
+	if got := load(0, 1000); got != 3 {
+		t.Fatalf("3 local streams, stale report of 0: estimate %d, want 3", got)
+	}
+	// The worker renews its lease and now reports our 3 streams.
+	if got := load(3, 2000); got != 3 {
+		t.Fatalf("worker reports our own 3 streams: estimate %d, want 3 (not 6)", got)
+	}
+	// We open 2 more before the next report: they count immediately.
+	s.addInflight("w", 2)
+	if got := load(3, 2000); got != 5 {
+		t.Fatalf("5 local streams, report of 3 (which were ours): estimate %d, want 5", got)
+	}
+	// Next report: our 5 plus 2 from another gateway.
+	if got := load(7, 3000); got != 7 {
+		t.Fatalf("report of 7 = our 5 + 2 elsewhere: estimate %d, want 7", got)
+	}
+	// Our streams finish; the stale report still shows them.
+	s.addInflight("w", -5)
+	if got := load(7, 3000); got != 2 {
+		t.Fatalf("our 5 streams closed since a report of 7: estimate %d, want 2", got)
+	}
+}
