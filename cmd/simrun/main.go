@@ -18,6 +18,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"syscall"
 	"time"
 
 	"dsys/chaos"
@@ -58,7 +59,9 @@ func main() {
 	fmt.Printf("simrun: seed=%d duration=%s nodes=%d clients=%d nemesis-interval=%d gateway=%v\n",
 		s, *duration, *nodes, *clients, interval, *gatewayMix)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	// SIGTERM too: it is what `docker stop` (and systemd, k8s) sends, and
+	// without it the graceful path below never runs in a container.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	start := time.Now()

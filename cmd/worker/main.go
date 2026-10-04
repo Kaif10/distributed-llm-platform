@@ -43,6 +43,7 @@ import (
 	"os"
 	"os/signal"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	schedv1 "dsys/gen/sched/v1"
@@ -104,7 +105,9 @@ func main() {
 		SuppressHeartbeat: *suppressHB,
 	})
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	// SIGTERM too: it is what `docker stop` (and systemd, k8s) sends, and
+	// without it the graceful path below never runs in a container.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	log.Info("worker running", "sched", *addr, "concurrency", *concurrency, "lease", *lease, "suppress_heartbeat", *suppressHB)
 	if err := w.Run(ctx); err != nil {
