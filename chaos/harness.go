@@ -18,7 +18,6 @@ import (
 	"dsys/kv/raftkv"
 	"dsys/raft"
 	"dsys/raft/simnet"
-	"dsys/sched"
 )
 
 // panicLog collects panics recovered in ANY goroutine the harness starts.
@@ -227,17 +226,9 @@ func Run(ctx context.Context, sc Scenario) (*Report, error) {
 	// ---- Scheduler workload, sharing the same disrupted KV. -------------
 	var sw *schedWorkload
 	if sc.IncludeScheduler {
-		sw = newSchedWorkload(cluster.newAdapter())
-		reaperCtx, reaperCancel := context.WithCancel(ctx)
-		defer reaperCancel()
-		go func() {
-			<-runCtx.Done()
-			time.Sleep(2 * time.Second) // let in-flight jobs settle before the reaper stops
-			reaperCancel()
-		}()
-		sw.runProducers(runCtx, sc.Seed+2, max(1, sc.NumClients/2), &wg)
-		sw.runWorkers(runCtx, sc.Seed+3, sc.NumClients, &wg)
-		go sched.RunReaper(reaperCtx, sw.q, "chaos-reaper", 200*time.Millisecond)
+		sw = newSchedWorkload(cluster.newAdapter(), sc.faults, sc.schedDrain, pl)
+		sw.start(ctx, runCtx, sc.Seed+2, max(1, sc.NumClients/2), sc.NumClients, &wg)
+		defer sw.reaperStop() // normally already stopped by check()
 	}
 
 	// ---- Optional gateway + inference workers. ---------------------------
@@ -352,11 +343,17 @@ func Run(ctx context.Context, sc Scenario) (*Report, error) {
 		len(history), rep.KVCheck, rep.KVRetries, cluster.stats.mutations.Load(), rep.KVRedeliveries, rep.KVRepliesLost, rep.KVIdentities)
 
 	if sw != nil {
-		checkCtx, checkCancel := context.WithTimeout(ctx, 30*time.Second)
-		rep.SchedJobs = int(sw.submitted.Load())
-		rep.Violations = append(rep.Violations, sw.check(checkCtx, logf)...)
+		// The liveness drain's own budget, plus room for the record scan.
+		checkCtx, checkCancel := context.WithTimeout(ctx, sw.drainBudget+30*time.Second)
+		rep.Violations = append(rep.Violations, sw.check(checkCtx, sc.NumClients, logf)...)
 		checkCancel()
-		logf("scheduler: submitted=%d completed=%d fenced=%d", sw.submitted.Load(), sw.done.Load(), sw.fenced.Load())
+		rep.SchedJobs = int(sw.submitted.Load())
+		rep.SchedDone = sw.done.Load()
+		rep.SchedFenced = sw.fenced.Load()
+		rep.SchedIdemKeys = sw.idemKeys.Load()
+		rep.SchedIdemDupSubmits = sw.idemDupCalls.Load()
+		logf("scheduler: submitted=%d completed=%d fenced=%d zombieClaims=%d idemKeys=%d idemDupSubmits=%d",
+			rep.SchedJobs, rep.SchedDone, rep.SchedFenced, sw.zombieClaims.Load(), rep.SchedIdemKeys, rep.SchedIdemDupSubmits)
 	}
 	if gwMix != nil {
 		rep.GatewayReq = int(gwMix.requests.Load())

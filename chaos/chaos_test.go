@@ -18,9 +18,10 @@ import (
 
 func report(t *testing.T, rep *Report) {
 	t.Helper()
-	t.Logf("seed=%d kvOps=%d kvCheck=%s kvRetries=%d redeliveries=%d repliesLost=%d identities=%d schedJobs=%d gatewayReq=%d events=%d elapsed=%s",
+	t.Logf("seed=%d kvOps=%d kvCheck=%s kvRetries=%d redeliveries=%d repliesLost=%d identities=%d schedJobs=%d schedDone=%d fenced=%d idemKeys=%d idemDups=%d gatewayReq=%d events=%d elapsed=%s",
 		rep.Seed, rep.KVOps, rep.KVCheck, rep.KVRetries, rep.KVRedeliveries, rep.KVRepliesLost, rep.KVIdentities,
-		rep.SchedJobs, rep.GatewayReq, len(rep.Events), rep.Elapsed.Round(time.Millisecond))
+		rep.SchedJobs, rep.SchedDone, rep.SchedFenced, rep.SchedIdemKeys, rep.SchedIdemDupSubmits,
+		rep.GatewayReq, len(rep.Events), rep.Elapsed.Round(time.Millisecond))
 	for _, v := range rep.Violations {
 		t.Errorf("violation: %s", v)
 	}
@@ -91,6 +92,26 @@ func TestCheckerCatchesDuplicateApply(t *testing.T) {
 	})
 }
 
+// TestCheckerCatchesLostJobs proves the scheduler liveness check can fail:
+// workers that silently drop every fifth job (claim it, never complete or
+// fail it) leave those jobs cycling through lease expiry forever, and the
+// post-run drain must report them as not DONE. The pre-hardening check
+// only logged unfinished jobs as "not a violation".
+func TestCheckerCatchesLostJobs(t *testing.T) {
+	sc := Scenario{Seed: 11, Duration: 2 * time.Second, NumKVNodes: 3, NumClients: 4, IncludeScheduler: true, schedDrain: 4 * time.Second}
+	sc.faults.schedLoseEveryFifthJob = true
+	runExpectingViolation(t, sc, "not DONE within")
+}
+
+// TestCheckerCatchesIdempotencyBreak proves the idempotency check can fail:
+// a client that drops the key when it retries a Submit creates a second
+// job for the same key, which must be reported.
+func TestCheckerCatchesIdempotencyBreak(t *testing.T) {
+	sc := Scenario{Seed: 12, Duration: 2 * time.Second, NumKVNodes: 3, NumClients: 4, IncludeScheduler: true}
+	sc.faults.schedForgetIdemKeyOnRetry = true
+	runExpectingViolation(t, sc, "idempotency key")
+}
+
 // TestCheckerCatchesSharedIdentity proves the harness notices when the
 // one-outstanding-mutation-per-identity rule is broken: every KV workload
 // goroutine shares ONE kv/client Session, so a later request id overtakes
@@ -135,7 +156,7 @@ func TestManySeeds(t *testing.T) {
 	if testing.Short() {
 		t.Skip("long")
 	}
-	var redelivered, unknown int64
+	var redelivered, unknown, fenced, idemDups, schedDone int64
 	for seed := int64(1); seed <= 12; seed++ {
 		t.Run(seedName(seed), func(t *testing.T) {
 			rep, err := Run(context.Background(), Scenario{
@@ -148,10 +169,21 @@ func TestManySeeds(t *testing.T) {
 			}
 			report(t, rep)
 			redelivered += rep.KVRedeliveries
+			fenced += rep.SchedFenced
+			idemDups += rep.SchedIdemDupSubmits
+			schedDone += rep.SchedDone
 			if rep.KVCheck == "unknown" {
 				unknown++
 			}
 		})
+	}
+	// Scheduler non-vacuity: jobs were completed, zombies were really
+	// fenced (the exactly-once check had something to refuse), and
+	// idempotency keys were really submitted more than once.
+	t.Logf("battery: redeliveries=%d schedDone=%d fenced=%d idemDupSubmits=%d porcupineUnknown=%d",
+		redelivered, schedDone, fenced, idemDups, unknown)
+	if schedDone == 0 || fenced == 0 || idemDups == 0 {
+		t.Errorf("scheduler checks were vacuous: done=%d fenced=%d idemDupSubmits=%d (all must be > 0)", schedDone, fenced, idemDups)
 	}
 	// Non-vacuity across the battery: the production client really did
 	// resend applied mutations (dedup path exercised), and Porcupine

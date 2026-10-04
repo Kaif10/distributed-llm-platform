@@ -76,8 +76,14 @@
 //     caller is still waiting. Report.KVRedeliveries counts mutations
 //     resent with an already-delivered (client_id, request_id), i.e. how
 //     often the store's dedup path actually ran.
-//   - Scheduler exactly-once: every submitted job reaches DONE and is
-//     completed by exactly one accepted Complete call.
+//   - Scheduler (production ScanLimit, ~30% of submits idempotent, each key
+//     submitted three times, twice concurrently): after the run heals,
+//     every id a Submit returned reaches DONE within 30s (DONE is the only
+//     allowed terminal state; see schedworkload.go); no job has more than
+//     one accepted Complete, and a DONE job holds its accepted Complete's
+//     result; every Submit of one key returned the same id and at most one
+//     record per key ever became runnable. TestManySeeds additionally
+//     requires fenced zombie commits and duplicate submits to have happened.
 //   - No panics in any goroutine the harness starts: each one recovers and
 //     records its own panic as a violation (a recover only works on its own
 //     goroutine). Panics in library-owned goroutines crash the process. A
@@ -137,7 +143,8 @@ type Scenario struct {
 	PauseDuration time.Duration
 
 	// IncludeScheduler runs a sched.Queue workload over the same KV
-	// concurrently with the raw KV workload. Default true.
+	// concurrently with the raw KV workload. false (the zero value) skips
+	// it; simrun's -scheduler flag defaults it to true.
 	IncludeScheduler bool
 	// IncludeGateway additionally wires a gateway.Server and mock inference
 	// workers, and sends it concurrent traffic. It is checked more lightly
@@ -161,6 +168,9 @@ type Scenario struct {
 	// code). Only this package's tests set it, to prove each check can
 	// fail; a zero value means a clean run.
 	faults injectedFaults
+	// schedDrain overrides the scheduler's post-run liveness budget (30s by
+	// default) so the liveness-check test does not wait the full bound.
+	schedDrain time.Duration
 }
 
 // injectedFaults are deliberate bugs planted in harness-owned code paths,
@@ -175,6 +185,13 @@ type injectedFaults struct {
 	// Session, breaking the one-outstanding-mutation-per-identity rule, so
 	// a later request id can overtake an earlier one.
 	kvSharedSession bool
+	// schedForgetIdemKeyOnRetry: a Submit retry drops its idempotency key,
+	// so a retried submit creates a second job.
+	schedForgetIdemKeyOnRetry bool
+	// schedLoseEveryFifthJob: workers silently drop every job whose id is a
+	// multiple of 5 (claim it, never complete or fail it), so those jobs
+	// never reach DONE.
+	schedLoseEveryFifthJob bool
 }
 
 func (s Scenario) withDefaults() Scenario {
@@ -227,7 +244,15 @@ type Report struct {
 	// workload client plus each kvadapter pool's sessions, NOT one per
 	// mutation.
 	KVIdentities int
-	SchedJobs    int
+	// SchedJobs is how many Submit calls returned an id. SchedDone counts
+	// accepted Completes, SchedFenced zombie Completes the queue refused,
+	// SchedIdemKeys distinct idempotency keys and SchedIdemDupSubmits the
+	// Submit calls that repeated an already-used key.
+	SchedJobs           int
+	SchedDone           int64
+	SchedFenced         int64
+	SchedIdemKeys       int64
+	SchedIdemDupSubmits int64
 	GatewayReq int
 	Violations []string // empty means the run passed
 	Elapsed    time.Duration

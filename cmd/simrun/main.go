@@ -78,6 +78,10 @@ func main() {
 		rep.KVOps, rep.SchedJobs, rep.GatewayReq, len(rep.Events))
 	fmt.Printf("kv check: %s   kv/client retries: %d   mutation redeliveries (dedup path): %d   replies dropped: %d   client identities: %d\n",
 		rep.KVCheck, rep.KVRetries, rep.KVRedeliveries, rep.KVRepliesLost, rep.KVIdentities)
+	if sc.IncludeScheduler {
+		fmt.Printf("scheduler: completes accepted: %d   zombie completes fenced: %d   idempotency keys: %d   duplicate submits: %d\n",
+			rep.SchedDone, rep.SchedFenced, rep.SchedIdemKeys, rep.SchedIdemDupSubmits)
+	}
 	for _, e := range rep.Events {
 		fmt.Printf("  op#%-5d %-10s node %d\n", e.Index, e.Kind, e.Node)
 	}
