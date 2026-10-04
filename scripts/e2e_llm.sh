@@ -159,15 +159,23 @@ echo "$A"
 A_HIT=$(num prefix_hit_rate "$A"); A_P99=$(num ttft_p99_ms "$A"); A_ERR=$(num errors "$A")
 [ "${A_ERR:-0}" = "0" ] || fail "baseline had $A_ERR errors"
 
-step "B: prefix routing ON"
-start_stack "-prefix-routing=true -cache=false"
+step "B: prefix routing ON (pure affinity, no load bound)"
+start_stack "-prefix-routing=true -cache=false -load-factor 0"
 sleep 3   # workers re-register with the new gateway process
 B=$(./bin/llmbench.exe -gateway $GW -n "$N" -c $CONC -prefixes $PREFIXES $BENCH -json) || fail "bench B failed"
 echo "$B"
 B_HIT=$(num prefix_hit_rate "$B"); B_P99=$(num ttft_p99_ms "$B"); B_SPREAD=$(num prefix_spread_avg "$B")
+B_RPS=$(num req_per_s "$B")
+
+step "B2: prefix routing with bounded load (-load-factor 1.25)"
+start_stack "-prefix-routing=true -cache=false -load-factor 1.25"
+sleep 3
+B2=$(./bin/llmbench.exe -gateway $GW -n "$N" -c $CONC -prefixes $PREFIXES $BENCH -json) || fail "bench B2 failed"
+echo "$B2"
+B2_HIT=$(num prefix_hit_rate "$B2"); B2_RPS=$(num req_per_s "$B2"); B2_P99=$(num ttft_p99_ms "$B2")
 
 step "C: prefix routing ON + hedging"
-start_stack "-prefix-routing=true -cache=false -hedge-after $HEDGE_AFTER"
+start_stack "-prefix-routing=true -cache=false -load-factor 0 -hedge-after $HEDGE_AFTER"
 sleep 3
 C=$(./bin/llmbench.exe -gateway $GW -n "$N" -c $CONC -prefixes $PREFIXES $BENCH -json) || fail "bench C failed"
 echo "$C"
@@ -197,6 +205,10 @@ ok "prefix-cache hit rate: $A_HIT (least-loaded) -> $B_HIT (prefix routing)"
 A_PREFILL=$(num prefill_mean_ms "$A"); B_PREFILL=$(num prefill_mean_ms "$B")
 awk_gt "${A_PREFILL:-0}" "${B_PREFILL:-999999}"   || fail "prefix routing did not reduce mean prefill (A=$A_PREFILL B=$B_PREFILL)"
 ok "mean prefill: $A_PREFILL ms -> $B_PREFILL ms"
+
+awk_gt "${B2_HIT:-0}" "${A_HIT:-0}"   || fail "bounded-load routing lost the cache benefit (A=$A_HIT B2=$B2_HIT)"
+awk_gt "${B2_RPS:-0}" "${B_RPS:-999999}"   || fail "bounded-load routing did not recover throughput over pure affinity (B=$B_RPS B2=$B2_RPS)"
+ok "bounded load: hit rate $B2_HIT (vs $A_HIT least-loaded, $B_HIT pure affinity), throughput $B_RPS -> $B2_RPS req/s, p99 TTFT $B_P99 -> $B2_P99 ms"
 
 awk -v s="${B_SPREAD:-9}" 'BEGIN{exit !(s<2.0)}' \
   || fail "prefix spread $B_SPREAD too high: prefixes are not sticking to one worker"

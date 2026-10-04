@@ -41,6 +41,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"hash/fnv"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -323,6 +324,57 @@ func Pick(workers []Worker, prefix string, maxInflight int, exclude string) (Wor
 		return *fallback, true
 	}
 	return Worker{}, false
+}
+
+// PickBounded is rendezvous hashing with bounded loads (Mirrokni, Thorup and
+// Zadimoghaddam, "Consistent Hashing with Bounded Loads", 2018). It walks the
+// same ranking as Pick but skips any worker already carrying at least
+//
+//	ceil(factor * (totalInflight + 1) / n)
+//
+// streams, i.e. more than factor times the fleet average counting this
+// request. This fixes the regression Phase 5 measured: pure affinity
+// balances PREFIXES, not load, so 12 prefixes hashed onto 4 workers put
+// ~85% of traffic on two of them. With a bound, a hot worker's overflow
+// goes to that prefix's NEXT-ranked worker. That is still deterministic
+// per prefix, so the overflow builds a warm cache too, instead of being
+// sprayed at random. When load is even, nothing is skipped and routing is
+// exactly Pick's.
+//
+// MaxInflight is an absolute cap a hot spot rarely reaches; the bound here is
+// relative to the fleet, which is what makes it trip on imbalance itself.
+// factor must be > 1; 1.25 is the value the paper's analysis and common
+// production use settle on.
+func PickBounded(workers []Worker, prefix string, factor float64, exclude string) (Worker, bool) {
+	n, total := 0, 0
+	for _, w := range workers {
+		if w.ID == exclude {
+			continue
+		}
+		n++
+		total += int(w.Inflight)
+	}
+	if n == 0 {
+		return Worker{}, false
+	}
+	bound := int(math.Ceil(factor * float64(total+1) / float64(n)))
+	ranked := Ranked(workers, prefix)
+	var first *Worker
+	for i := range ranked {
+		w := &ranked[i]
+		if w.ID == exclude {
+			continue
+		}
+		if first == nil {
+			first = w
+		}
+		if int(w.Inflight) < bound {
+			return *w, true
+		}
+	}
+	// Unreachable while factor >= 1 (some worker is at or below average),
+	// but never fail a request over it.
+	return *first, true
 }
 
 // PickLeastLoaded ignores the prefix: the baseline the benchmark compares

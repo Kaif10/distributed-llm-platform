@@ -176,3 +176,140 @@ func TestConcurrentGatewaysShareOneBudget(t *testing.T) {
 		t.Fatalf("after 200ms refill admitted %d, want exactly 20", admitted.Load())
 	}
 }
+
+// countingKV counts CAS calls, to measure how much KV traffic leasing saves.
+type countingKV struct {
+	*memKV
+	cas atomic.Int64
+}
+
+func (k *countingKV) CAS(ctx context.Context, key string, expected []byte, expectAbsent bool, value []byte) (bool, []byte, error) {
+	k.cas.Add(1)
+	return k.memKV.CAS(ctx, key, expected, expectAbsent, value)
+}
+
+// Leasing must never over-admit: leased tokens have left the shared bucket,
+// so however many gateways lease concurrently, the fleet admits at most the
+// budget. It may under-admit by tokens stranded in other gateways' leases,
+// bounded by gateways x (lease size - 1).
+func TestLeasingConservesTheBudget(t *testing.T) {
+	const gateways, perGateway = 16, 50
+	const burst, fraction = 400.0, 0.05 // lease size 20
+	kv := newMemKV()
+	clk := &fakeClock{}
+	clk.ms.Store(1_700_000_000_000)
+	var admitted atomic.Int64
+	var wg sync.WaitGroup
+	for g := 0; g < gateways; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			l := New(kv, Options{Rate: 100, Burst: burst, Clock: clk.now, LeaseFraction: fraction})
+			for i := 0; i < perGateway; i++ {
+				ok, _, err := l.Take(bg, "shared", 1)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if ok {
+					admitted.Add(1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	got := admitted.Load()
+	if got > int64(burst) {
+		t.Fatalf("leasing over-admitted: %d > budget %v", got, burst)
+	}
+	if minOK := int64(burst) - gateways*(20-1); got < minOK {
+		t.Fatalf("leasing under-admitted beyond its bound: %d < %d", got, minOK)
+	}
+	t.Logf("%d gateways, budget %v, lease 20: admitted %d (stranded in leases: %d)", gateways, burst, got, int64(burst)-got)
+}
+
+// The point of leasing: most Takes never touch the KV.
+func TestLeasingCutsKVTraffic(t *testing.T) {
+	clk := &fakeClock{}
+	clk.ms.Store(1_700_000_000_000)
+	exact := &countingKV{memKV: newMemKV()}
+	leased := &countingKV{memKV: newMemKV()}
+	le := New(exact, Options{Rate: 1000, Burst: 1000, Clock: clk.now})
+	ll := New(leased, Options{Rate: 1000, Burst: 1000, Clock: clk.now, LeaseFraction: 0.1})
+	for i := 0; i < 500; i++ {
+		if ok, _, err := le.Take(bg, "t", 1); !ok || err != nil {
+			t.Fatalf("exact take %d: ok=%v err=%v", i, ok, err)
+		}
+		if ok, _, err := ll.Take(bg, "t", 1); !ok || err != nil {
+			t.Fatalf("leased take %d: ok=%v err=%v", i, ok, err)
+		}
+	}
+	t.Logf("500 takes: %d CAS exact, %d CAS leased", exact.cas.Load(), leased.cas.Load())
+	if exact.cas.Load() != 500 {
+		t.Fatalf("exact limiter did %d CAS for 500 takes, want 500", exact.cas.Load())
+	}
+	if leased.cas.Load() > 5 {
+		t.Fatalf("leased limiter did %d CAS for 500 takes with lease 100, want 5", leased.cas.Load())
+	}
+}
+
+// Unused leased tokens expire and are dropped, never handed back: after
+// LeaseTTL the next Take must go back to the shared bucket.
+func TestLeaseExpires(t *testing.T) {
+	clk := &fakeClock{}
+	clk.ms.Store(1_700_000_000_000)
+	kv := &countingKV{memKV: newMemKV()}
+	l := New(kv, Options{Rate: 1, Burst: 100, Clock: clk.now, LeaseFraction: 0.1, LeaseTTL: time.Second})
+	if ok, _, _ := l.Take(bg, "t", 1); !ok {
+		t.Fatal("first take refused")
+	}
+	if ok, _, _ := l.Take(bg, "t", 1); !ok || kv.cas.Load() != 1 {
+		t.Fatalf("second take should be served from the lease: ok=%v cas=%d", ok, kv.cas.Load())
+	}
+	clk.advance(1500 * time.Millisecond)
+	if ok, _, _ := l.Take(bg, "t", 1); !ok || kv.cas.Load() != 2 {
+		t.Fatalf("after expiry the take should lease again: ok=%v cas=%d", ok, kv.cas.Load())
+	}
+	// Shared bucket: 100 - 10 (first lease) - 10 (second) + ~1.5 refill.
+	if left, _ := l.Peek(bg, "t"); left < 81 || left > 82 {
+		t.Fatalf("expired lease tokens were returned or double-counted: shared bucket has %.1f", left)
+	}
+}
+
+// Tiny budgets keep exact semantics: a lease under 2 tokens is not worth
+// the stranding, so the limiter falls back to one CAS per Take.
+func TestTinyBudgetStaysExact(t *testing.T) {
+	clk := &fakeClock{}
+	clk.ms.Store(1_700_000_000_000)
+	l := New(newMemKV(), Options{Rate: 2, Burst: 3, Clock: clk.now, LeaseFraction: 0.1})
+	n := 0
+	for i := 0; i < 10; i++ {
+		if ok, _, _ := l.Take(bg, "t", 1); ok {
+			n++
+		}
+	}
+	if n != 3 {
+		t.Fatalf("burst 3 admitted %d with leasing configured, want exactly 3", n)
+	}
+}
+
+// With one gateway nothing can be stranded elsewhere, so leasing must admit
+// EXACTLY the budget: any token double-counted between the lease and the
+// shared bucket shows up here. (The multi-gateway test above cannot catch a
+// small over-admission: tokens stranded in other leases mask it.)
+func TestLeasingSingleGatewayIsExact(t *testing.T) {
+	clk := &fakeClock{}
+	clk.ms.Store(1_700_000_000_000)
+	l := New(newMemKV(), Options{Rate: 100, Burst: 400, Clock: clk.now, LeaseFraction: 0.05})
+	n := 0
+	for i := 0; i < 1000; i++ {
+		if ok, _, err := l.Take(bg, "t", 1); err != nil {
+			t.Fatal(err)
+		} else if ok {
+			n++
+		}
+	}
+	if n != 400 {
+		t.Fatalf("one leasing gateway admitted %d of a 400 budget, want exactly 400", n)
+	}
+}

@@ -41,6 +41,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"sync"
 	"time"
 
 	"dsys/kvapi"
@@ -66,6 +67,24 @@ type Options struct {
 	// MaxAttempts bounds CAS retries under contention before giving up
 	// with ErrContended. Default 32.
 	MaxAttempts int
+	// LeaseFraction turns on leased token batches: when this limiter runs
+	// out of local tokens for a tenant it takes up to LeaseFraction*Burst
+	// tokens from the shared bucket in ONE CAS and spends them locally, so
+	// most requests cost no KV round trip at all. 0 (the default) disables
+	// leasing: every Take is a Get+CAS, and enforcement is exact. Leasing
+	// is also off for any tenant whose lease would be under 2 tokens.
+	//
+	// What it costs. Leased tokens have already left the shared bucket, so
+	// the fleet can never admit more than the budget (tokens are conserved).
+	// But tokens leased by one gateway are invisible to the others, so a
+	// tenant can be refused while another gateway holds unused tokens for
+	// it: under-admission bounded by (gateways x lease size), for at most
+	// LeaseTTL. That is the trade: exactness for a hot path off consensus.
+	LeaseFraction float64
+	// LeaseTTL is how long leased tokens stay usable locally. Unused tokens
+	// are then dropped, never returned: returning them would need another
+	// CAS, and dropping can only under-admit. Default 1s.
+	LeaseTTL time.Duration
 }
 
 // ErrContended is returned when the bucket kept changing under us for
@@ -77,6 +96,18 @@ var ErrContended = errors.New("ratelimit: bucket contended, retry")
 type Limiter struct {
 	kv   kvapi.KV
 	opts Options
+
+	localMu sync.Mutex
+	local   map[string]*lease // per-tenant leased tokens; only used when leasing
+}
+
+// lease is one tenant's locally held tokens. Its mutex is held across a
+// refill from the KV, so a burst of requests that all find the lease empty
+// triggers one CAS and then shares its tokens, instead of stampeding.
+type lease struct {
+	mu      sync.Mutex
+	tokens  float64
+	expires time.Time
 }
 
 // New returns a Limiter. Buckets are created on first use, full.
@@ -96,7 +127,21 @@ func New(kv kvapi.KV, opts Options) *Limiter {
 	if opts.Burst <= 0 {
 		opts.Burst = opts.Rate * 2
 	}
-	return &Limiter{kv: kv, opts: opts}
+	if opts.LeaseTTL <= 0 {
+		opts.LeaseTTL = time.Second
+	}
+	return &Limiter{kv: kv, opts: opts, local: map[string]*lease{}}
+}
+
+func (l *Limiter) leaseFor(tenant string) *lease {
+	l.localMu.Lock()
+	defer l.localMu.Unlock()
+	ls, ok := l.local[tenant]
+	if !ok {
+		ls = &lease{}
+		l.local[tenant] = ls
+	}
+	return ls
 }
 
 // LimitFor returns the effective limit for tenant.
@@ -153,12 +198,43 @@ func (l *Limiter) Take(ctx context.Context, tenant string, n float64) (ok bool, 
 		// Can never be satisfied; say so with a finite hint.
 		return false, time.Duration(float64(time.Second) * (n / lim.Rate)), nil
 	}
+	size := math.Floor(lim.Burst * l.opts.LeaseFraction)
+	if size < 2 || size <= n {
+		_, ok, retryAfter, err = l.takeShared(ctx, tenant, lim, n, n)
+		return ok, retryAfter, err
+	}
+
+	ls := l.leaseFor(tenant)
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	now := l.opts.Clock()
+	if !now.Before(ls.expires) {
+		ls.tokens = 0 // expired: drop, never return (see LeaseTTL)
+	}
+	if ls.tokens >= n {
+		ls.tokens -= n
+		return true, 0, nil
+	}
+	// Lease a batch: at least n, up to size, whatever the bucket can spare.
+	got, ok, retryAfter, err := l.takeShared(ctx, tenant, lim, n, size)
+	if err != nil || !ok {
+		return ok, retryAfter, err
+	}
+	ls.tokens += got - n
+	ls.expires = now.Add(l.opts.LeaseTTL)
+	return true, 0, nil
+}
+
+// takeShared removes between need and want tokens from tenant's shared
+// bucket in one successful CAS: want if available, otherwise everything the
+// bucket holds as long as that is at least need. It returns how many it took.
+func (l *Limiter) takeShared(ctx context.Context, tenant string, lim Limit, need, want float64) (taken float64, ok bool, retryAfter time.Duration, err error) {
 	key := l.opts.Prefix + "/" + tenant
 
 	for attempt := 0; attempt < l.opts.MaxAttempts; attempt++ {
 		raw, found, err := l.kv.Get(ctx, key)
 		if err != nil {
-			return false, 0, err
+			return 0, false, 0, err
 		}
 		nowMs := l.opts.Clock().UnixMilli()
 		var b bucket
@@ -176,27 +252,31 @@ func (l *Limiter) Take(ctx context.Context, tenant string, n float64) (ok bool, 
 		}
 		b = refill(b, lim, nowMs)
 
-		if b.tokens < n {
+		if b.tokens < need {
 			// Refused. Do not write: nothing changed that others need to
 			// see, and skipping the write keeps a refused tenant from
 			// generating KV traffic. The hint is exact given the rate.
-			deficit := n - b.tokens
-			return false, time.Duration(float64(time.Second) * (deficit / lim.Rate)), nil
+			deficit := need - b.tokens
+			return 0, false, time.Duration(float64(time.Second) * (deficit / lim.Rate)), nil
 		}
-		b.tokens -= n
+		take := math.Min(want, math.Floor(b.tokens))
+		if take < need {
+			take = need
+		}
+		b.tokens -= take
 
 		// The CAS is the whole point: if another gateway consumed tokens
 		// between our Get and now, expected no longer matches, we lose, and
 		// we re-read. Two gateways can never both take the same token.
 		swapped, _, err := l.kv.CAS(ctx, key, raw, !found, encodeBucket(b))
 		if err != nil {
-			return false, 0, err
+			return 0, false, 0, err
 		}
 		if swapped {
-			return true, 0, nil
+			return take, true, 0, nil
 		}
 	}
-	return false, 0, ErrContended
+	return 0, false, 0, ErrContended
 }
 
 // Peek returns the bucket's current token count without taking any.

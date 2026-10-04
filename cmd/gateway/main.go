@@ -55,10 +55,13 @@ func main() {
 	hedgeAfter := flag.Duration("hedge-after", 0, "launch a second attempt if no first token within this long (0 = off)")
 	rate := flag.Float64("rate", 10, "rate-limit tokens per second per tenant")
 	burst := flag.Float64("burst", 20, "rate-limit burst per tenant")
+	leaseFraction := flag.Float64("rl-lease-fraction", 0.1, "lease up to this fraction of a tenant's burst per KV CAS and spend it locally (0 = exact, one CAS per request); see ratelimit.Options")
+	leaseTTL := flag.Duration("rl-lease-ttl", time.Second, "drop unused leased tokens after this long")
 	cache := flag.Bool("cache", true, "enable the semantic cache")
 	cacheThreshold := flag.Float64("cache-threshold", 0.92, "cosine similarity for a near-duplicate cache hit")
 	cacheTTL := flag.Duration("cache-ttl", 0, "expire cache entries after this long (0 = never)")
-	maxInflight := flag.Int("max-inflight", 8, "routing skips a worker at or above this many streams")
+	maxInflight := flag.Int("max-inflight", 8, "routing skips a worker at or above this many streams (ignored with -load-factor)")
+	loadFactor := flag.Float64("load-factor", 1.25, "bounded-load prefix routing: skip workers above this multiple of the fleet's average load (0 = plain affinity)")
 	defaultMaxTokens := flag.Int("default-max-tokens", 0, "max_tokens when a request says 0 (0 = 64)")
 	statsEvery := flag.Duration("stats-every", 10*time.Second, "how often to log Stats() (0 = never)")
 	sessions := flag.Int("kv-sessions", kvadapter.DefaultSessions, "KV client identities kept for concurrent mutations")
@@ -110,7 +113,7 @@ func main() {
 	// the cache's Puts all go through it.
 	kv := kvadapter.New(kvc, kvadapter.WithSessions(*sessions))
 
-	limiter := ratelimit.New(kv, ratelimit.Options{Rate: *rate, Burst: *burst})
+	limiter := ratelimit.New(kv, ratelimit.Options{Rate: *rate, Burst: *burst, LeaseFraction: *leaseFraction, LeaseTTL: *leaseTTL})
 	registry := router.NewRegistry(kv, router.Options{})
 	var semantic gateway.Cache
 	cacheDesc := "off"
@@ -130,6 +133,7 @@ func main() {
 		PrefixRouting:        *prefixRouting,
 		PrefixChars:          *prefixChars,
 		MaxInflightPerWorker: *maxInflight,
+		LoadFactor:           *loadFactor,
 		HedgeAfter:           *hedgeAfter,
 		DefaultMaxTokens:     int32(*defaultMaxTokens),
 		Metrics:              metrics,

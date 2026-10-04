@@ -228,3 +228,97 @@ func TestPrefixIsRuneSafe(t *testing.T) {
 		t.Fatalf("%q", got)
 	}
 }
+
+func fleet(n int) []Worker {
+	ws := make([]Worker, n)
+	for i := range ws {
+		ws[i] = Worker{ID: fmt.Sprintf("w%d", i)}
+	}
+	return ws
+}
+
+// With even load the bound never trips, so bounded-load routing must be
+// exactly plain affinity: the cache benefit is untouched when nothing is hot.
+func TestPickBoundedEqualsPickWhenBalanced(t *testing.T) {
+	ws := fleet(4)
+	for i := range ws {
+		ws[i].Inflight = 3
+	}
+	for p := 0; p < 200; p++ {
+		prefix := fmt.Sprintf("system prompt %d", p)
+		a, _ := Pick(ws, prefix, 0, "")
+		b, _ := PickBounded(ws, prefix, 1.25, "")
+		if a.ID != b.ID {
+			t.Fatalf("prefix %q: Pick=%s PickBounded=%s with even load", prefix, a.ID, b.ID)
+		}
+	}
+}
+
+// A hot preferred worker is skipped in favour of the prefix's NEXT-ranked
+// worker (not a random or least-loaded one), so the overflow is sticky too.
+func TestPickBoundedSpillsToNextRanked(t *testing.T) {
+	ws := fleet(4)
+	prefix := "a hot system prompt"
+	ranked := Ranked(ws, prefix)
+	for i := range ws {
+		if ws[i].ID == ranked[0].ID {
+			ws[i].Inflight = 10 // far above 1.25 x average
+		}
+	}
+	got, _ := PickBounded(ws, prefix, 1.25, "")
+	if got.ID != ranked[1].ID {
+		t.Fatalf("spilled to %s, want the next-ranked worker %s", got.ID, ranked[1].ID)
+	}
+}
+
+// The regression this exists to fix: a skewed prefix mix piles onto a few
+// workers under pure affinity. Place requests one at a time (no completions)
+// and compare the busiest worker under each policy.
+func TestPickBoundedCapsTheHotSpot(t *testing.T) {
+	const n, requests, factor = 4, 400, 1.25
+	// 12 prefixes with Zipf-ish popularity: prefix k gets weight 12-k.
+	var arrivals []string
+	for k := 0; k < 12; k++ {
+		for j := 0; j < 12-k; j++ {
+			arrivals = append(arrivals, fmt.Sprintf("system prompt #%d", k))
+		}
+	}
+	place := func(bounded bool) []int32 {
+		ws := fleet(n)
+		for i := 0; i < requests; i++ {
+			prefix := arrivals[i%len(arrivals)]
+			var w Worker
+			if bounded {
+				w, _ = PickBounded(ws, prefix, factor, "")
+			} else {
+				w, _ = Pick(ws, prefix, 0, "")
+			}
+			for j := range ws {
+				if ws[j].ID == w.ID {
+					ws[j].Inflight++
+				}
+			}
+		}
+		loads := make([]int32, n)
+		for i := range ws {
+			loads[i] = ws[i].Inflight
+		}
+		return loads
+	}
+	maxOf := func(xs []int32) int32 {
+		m := xs[0]
+		for _, x := range xs {
+			m = max(m, x)
+		}
+		return m
+	}
+	plain, bounded := place(false), place(true)
+	t.Logf("pure affinity loads %v (max %d); bounded %v (max %d); bound %d",
+		plain, maxOf(plain), bounded, maxOf(bounded), int32(factor*requests/n)+1)
+	if limit := int32(factor*requests/n) + 1; maxOf(bounded) > limit {
+		t.Fatalf("bounded-load max %d exceeds %d", maxOf(bounded), limit)
+	}
+	if maxOf(bounded) >= maxOf(plain) {
+		t.Fatalf("bounded-load did not reduce the hot spot: %d vs %d", maxOf(bounded), maxOf(plain))
+	}
+}

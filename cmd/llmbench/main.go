@@ -70,34 +70,37 @@ type result struct {
 
 // report is the machine-readable summary (-json), one line per run.
 type report struct {
-	N                int                      `json:"n"`
-	Concurrency      int                      `json:"c"`
-	Tenants          int                      `json:"tenants"`
-	Prefixes         int                      `json:"prefixes"`
-	MaxTokens        int                      `json:"max_tokens"`
-	NoCache          bool                     `json:"no_cache"`
-	ElapsedMs        int64                    `json:"elapsed_ms"`
-	Throughput       float64                  `json:"req_per_s"`
-	TokensPerS       float64                  `json:"tokens_per_s"`
-	Errors           int                      `json:"errors"`
-	TTFTp50Ms        float64                  `json:"ttft_p50_ms"`
-	TTFTp95Ms        float64                  `json:"ttft_p95_ms"`
-	TTFTp99Ms        float64                  `json:"ttft_p99_ms"`
-	Totalp50Ms       float64                  `json:"total_p50_ms"`
-	Totalp99Ms       float64                  `json:"total_p99_ms"`
-	PrefixHitRate    float64                  `json:"prefix_hit_rate"`
-	PrefillMeanMs    float64                  `json:"prefill_mean_ms"`
-	HedgesLaunched   int                      `json:"hedges_launched"`
-	HedgesWon        int                      `json:"hedges_won"`
-	RateLimited      int64                    `json:"rate_limited"`
-	Cached           int                      `json:"cached"`
-	PerWorker        map[string]int           `json:"per_worker"`
-	PrefixSpread     float64                  `json:"prefix_spread_avg"`
-	PrefixWorkers    map[string][]string      `json:"prefix_workers,omitempty"`
-	CacheTestHits    int                      `json:"cache_test_hits,omitempty"`
-	CacheTestN       int                      `json:"cache_test_n,omitempty"`
-	CacheTestHitRate float64                  `json:"cache_test_hit_rate,omitempty"`
-	Gateway          *gatewayv1.StatsResponse `json:"-"`
+	N                int                 `json:"n"`
+	Concurrency      int                 `json:"c"`
+	Tenants          int                 `json:"tenants"`
+	Prefixes         int                 `json:"prefixes"`
+	MaxTokens        int                 `json:"max_tokens"`
+	NoCache          bool                `json:"no_cache"`
+	ElapsedMs        int64               `json:"elapsed_ms"`
+	Throughput       float64             `json:"req_per_s"`
+	TokensPerS       float64             `json:"tokens_per_s"`
+	Errors           int                 `json:"errors"`
+	TTFTp50Ms        float64             `json:"ttft_p50_ms"`
+	TTFTp95Ms        float64             `json:"ttft_p95_ms"`
+	TTFTp99Ms        float64             `json:"ttft_p99_ms"`
+	Totalp50Ms       float64             `json:"total_p50_ms"`
+	Totalp99Ms       float64             `json:"total_p99_ms"`
+	PrefixHitRate    float64             `json:"prefix_hit_rate"`
+	PrefillMeanMs    float64             `json:"prefill_mean_ms"`
+	HedgesLaunched   int                 `json:"hedges_launched"`
+	HedgesWon        int                 `json:"hedges_won"`
+	RateLimited      int64               `json:"rate_limited"`
+	Cached           int                 `json:"cached"`
+	PerWorker        map[string]int      `json:"per_worker"`
+	PrefixSpread     float64             `json:"prefix_spread_avg"`
+	PrefixWorkers    map[string][]string `json:"prefix_workers,omitempty"`
+	CacheTestHits    int                 `json:"cache_test_hits,omitempty"`
+	CacheTestN       int                 `json:"cache_test_n,omitempty"`
+	CacheTestHitRate float64             `json:"cache_test_hit_rate,omitempty"`
+	// ErrorKinds counts failed requests by error text, so a run with errors
+	// says what failed instead of only how many.
+	ErrorKinds map[string]int           `json:"error_kinds,omitempty"`
+	Gateway    *gatewayv1.StatsResponse `json:"-"`
 }
 
 func main() {
@@ -343,6 +346,10 @@ func summarise(results []result, errs []error, elapsed time.Duration) report {
 	for i, r := range results {
 		if errs[i] != nil {
 			rep.Errors++
+			if rep.ErrorKinds == nil {
+				rep.ErrorKinds = map[string]int{}
+			}
+			rep.ErrorKinds[errs[i].Error()]++
 			continue
 		}
 		ttft = append(ttft, r.ttft)

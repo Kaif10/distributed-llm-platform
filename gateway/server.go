@@ -319,7 +319,11 @@ func (s *Server) Generate(req *gatewayv1.GenerateRequest, stream grpc.ServerStre
 	var primary router.Worker
 	var ok bool
 	if s.opts.PrefixRouting {
-		primary, ok = router.Pick(live, prefix, s.opts.MaxInflightPerWorker, "")
+		if s.opts.LoadFactor > 1 {
+			primary, ok = router.PickBounded(live, prefix, s.opts.LoadFactor, "")
+		} else {
+			primary, ok = router.Pick(live, prefix, s.opts.MaxInflightPerWorker, "")
+		}
 	} else {
 		primary, ok = router.PickLeastLoaded(live, "")
 	}

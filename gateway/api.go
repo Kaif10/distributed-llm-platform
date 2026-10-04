@@ -90,8 +90,14 @@ type Options struct {
 	// routing. 0 means 256.
 	PrefixChars int
 	// MaxInflightPerWorker makes routing skip a worker at or above this
-	// load. 0 means 8.
+	// load. 0 means 8. Ignored when LoadFactor is set.
 	MaxInflightPerWorker int
+	// LoadFactor turns on bounded-load prefix routing (router.PickBounded):
+	// skip any worker above LoadFactor times the fleet's average load and
+	// fall through to the prefix's next-ranked worker. 0 keeps plain
+	// affinity (router.Pick with MaxInflightPerWorker). Must be > 1 when
+	// set; 1.25 is the usual choice.
+	LoadFactor float64
 
 	// HedgeAfter launches a second attempt on a different worker if the
 	// first has not produced its first token within this long. 0 disables.
