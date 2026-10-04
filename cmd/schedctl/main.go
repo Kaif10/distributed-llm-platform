@@ -306,6 +306,11 @@ func stateName(s schedv1.State) string {
 		return "DONE"
 	case schedv1.State_STATE_FAILED:
 		return "FAILED"
+	case schedv1.State_STATE_UNSPECIFIED:
+		// An idempotent Submit writes the record before binding its key
+		// and publishes it afterwards (sched/queue.go); until then it is
+		// staged and can never be claimed.
+		return "STAGED"
 	}
 	return s.String()
 }

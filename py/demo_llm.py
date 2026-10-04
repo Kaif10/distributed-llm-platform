@@ -9,7 +9,10 @@ worker behind it. Every number it prints comes from the live system:
      not answer it (it is a different question), and the worker reuses the
      prompt's KV cache, prefilling only the new suffix
   3. the same question with a typo: a near-duplicate, so the gateway's
-     semantic cache answers with no model call at all
+     semantic cache answers with no model call at all. Near-duplicate
+     matching is OFF by default (exact matches only, because lexical
+     similarity cannot see meaning); the recording runs the gateway with
+     -cache-near to show it, and step 2 shows the guard that matters
   4. a client that hangs up after a few tokens: the cancel reaches the
      worker, which stops generating (checked on the worker itself)
 

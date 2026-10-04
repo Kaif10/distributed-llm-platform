@@ -72,6 +72,8 @@ func main() {
 	electMin := flag.Duration("election-min", 500*time.Millisecond, "minimum election timeout")
 	electMax := flag.Duration("election-max", 1000*time.Millisecond, "maximum election timeout")
 	pollInterval := flag.Duration("poll-interval", 100*time.Millisecond, "how often to poll the controller for a new config and retry pending shard pulls")
+	ctrlTimeout := flag.Duration("ctrl-timeout", time.Second, "deadline for one controller Query (backs off up to 8x on repeated failure); deliberately NOT tied to -poll-interval")
+	pullTimeout := flag.Duration("pull-timeout", 2*time.Second, "deadline for one shard pull from another group (a large shard needs more than a poll interval)")
 	verbose := flag.Bool("v", false, "log Raft state transitions")
 	flag.Parse()
 
@@ -120,10 +122,14 @@ func main() {
 		rcfg.Logf = raft.StdLogger
 	}
 
-	ctrl := shardkvgrpctransport.NewController(ctrlAddrs, shardkvgrpctransport.WithControllerTimeout(*pollInterval))
+	// The controller deadline used to be the poll interval (100ms). Every
+	// Query is a Raft-logged operation on the controller, so once its
+	// latency crept past 100ms every poll timed out and groups never saw a
+	// new config again. Polling often and waiting long are independent.
+	ctrl := shardkvgrpctransport.NewController(ctrlAddrs, shardkvgrpctransport.WithControllerTimeout(*ctrlTimeout))
 	defer ctrl.Close()
 	fetcher := shardkvgrpctransport.NewFetcher(
-		shardkvgrpctransport.WithTimeout(*pollInterval),
+		shardkvgrpctransport.WithTimeout(*pullTimeout),
 		shardkvgrpctransport.WithPeerAddrs(peerMap),
 	)
 	defer fetcher.Close()
@@ -134,6 +140,7 @@ func main() {
 		Ctrl:         ctrl,
 		Fetcher:      fetcher,
 		PollInterval: *pollInterval,
+		QueryTimeout: *ctrlTimeout,
 		MaxRaftState: *maxRaftState,
 		Raft:         rcfg,
 	})

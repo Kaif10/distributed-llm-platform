@@ -106,7 +106,7 @@ for i in 0 1 2; do
   ./bin/raftkv.exe -id $i -peers $LKVPEERS -client-addrs $LKV -data "data/demo/llm$i" > "$TMP/demo_llmkv$i.log" 2>&1 &
 done
 sleep 2
-./bin/gateway.exe -addr 127.0.0.1:7950 -kv $LKV -prefix-routing=true -cache=true \
+./bin/gateway.exe -addr 127.0.0.1:7950 -kv $LKV -prefix-routing=true -cache=true -cache-near \
   > "$TMP/demo_gw.log" 2>&1 &
 sleep 1.5
 $PY py/infer_worker.py --addr 127.0.0.1:7960 --gateway 127.0.0.1:7950 --worker-id hf-0 \

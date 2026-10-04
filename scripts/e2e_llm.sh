@@ -230,23 +230,47 @@ awk_gt "${E_LIMITED:-0}" "0" || fail "rate limiting never triggered at -rate 2 -
 ok "rate limiting: $E_LIMITED requests shed with a retry hint"
 
 step "cancellation reaches the worker"
-$PY - <<'PYEOF' > "$LOGDIR/cancel.txt" 2>&1 || fail "cancellation check failed"
-import sys, grpc
-sys.path.insert(0, "py"); sys.path.insert(0, "py/dsys_gateway")
+# This used to grep worker logs for "cancel", which also matched hedge
+# losers from earlier phases, so it could not fail. Now it asks the workers
+# directly (Inference.Health reports in-flight streams): while the stream is
+# open some worker must be generating it (so the check is not vacuous), and
+# shortly after the client cancels, no worker may still be generating.
+WORKERS=$(for i in $(seq 0 $((NW-1))); do printf '127.0.0.1:%d,' $((W_BASE+i)); done)
+WORKERS=$WORKERS GW=$GW $PY - <<'PYEOF' > "$LOGDIR/cancel.txt" 2>&1 || fail "cancellation check failed: $(tail -1 "$LOGDIR/cancel.txt")"
+import os, sys, time, grpc
+sys.path.insert(0, "py"); sys.path.insert(0, "py/dsys_gateway"); sys.path.insert(0, "py/dsys_infer")
 from dsys_gateway.gateway.v1 import gateway_pb2 as gw, gateway_pb2_grpc as gwg
-ch = grpc.insecure_channel("127.0.0.1:7650")
-st = gwg.GatewayStub(ch).Generate(gw.GenerateRequest(
+from dsys_infer.infer.v1 import infer_pb2, infer_pb2_grpc
+
+workers = [infer_pb2_grpc.InferenceStub(grpc.insecure_channel(a))
+           for a in os.environ["WORKERS"].split(",") if a]
+def inflight():
+    return sum(w.Health(infer_pb2.HealthRequest(), timeout=5).inflight for w in workers)
+
+if inflight() != 0:
+    sys.exit("workers busy before the check started; cannot attribute in-flight streams")
+st = gwg.GatewayStub(grpc.insecure_channel(os.environ["GW"])).Generate(gw.GenerateRequest(
     tenant="cancel", prompt="cancel me " * 40, max_tokens=500, no_cache=True))
 n = 0
 for _ in st:
     n += 1
     if n == 3:
-        st.cancel(); break
-print("cancelled after", n, "tokens")
+        break
+during = inflight()
+if during < 1:
+    sys.exit(f"no worker reported the open stream in flight (inflight={during}); the check would be vacuous")
+st.cancel()
+deadline = time.monotonic() + 1.0
+after = inflight()
+while after and time.monotonic() < deadline:
+    time.sleep(0.1)
+    after = inflight()
+print(f"read {n} of 500 tokens; in flight while open: {during}; after cancel: {after}")
+if after != 0:
+    sys.exit(f"worker still generating 1s after the client cancelled (inflight={after})")
 PYEOF
 cat "$LOGDIR/cancel.txt"
-grep -qi "cancel" "$LOGDIR"/w*.log || fail "no worker logged a cancellation"
-ok "a cancelled client stream stopped generation on the worker"
+ok "a cancelled client stream stopped generation on the worker (checked via worker Health, not logs)"
 
 echo
 echo "E2E PASS (backend=$BACKEND): prefix routing, hedging, semantic cache, rate limiting and cancellation all verified against real processes."

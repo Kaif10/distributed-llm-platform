@@ -72,6 +72,8 @@ type result struct {
 type report struct {
 	N                int                 `json:"n"`
 	Concurrency      int                 `json:"c"`
+	Mode             string              `json:"mode"`        // "closed" (-c clients) or "open" (-rate arrivals)
+	OfferedRPS       float64             `json:"offered_rps"` // open loop: the arrival rate requested
 	Tenants          int                 `json:"tenants"`
 	Prefixes         int                 `json:"prefixes"`
 	MaxTokens        int                 `json:"max_tokens"`
@@ -106,7 +108,9 @@ type report struct {
 func main() {
 	gwFlag := flag.String("gateway", "127.0.0.1:7500", "comma-separated gateway addresses (round-robin per client goroutine)")
 	n := flag.Int("n", 300, "total requests")
-	c := flag.Int("c", 16, "concurrent client goroutines, one request at a time each")
+	c := flag.Int("c", 16, "concurrent client goroutines, one request at a time each (closed loop; ignored with -rate)")
+	rate := flag.Float64("rate", 0, "OPEN-loop mode: send requests at this many per second (Poisson arrivals) regardless of how fast they complete; 0 = closed loop with -c clients")
+	maxOutstanding := flag.Int("max-outstanding", 10000, "open loop: cap on requests in flight (a request that waits for a slot still has its latency measured from its scheduled send time)")
 	tenants := flag.Int("tenants", 4, "distinct tenants (t0..), round-robin")
 	prefixes := flag.Int("prefixes", 8, "distinct ~600-char system prompts, one per request at random")
 	maxTokens := flag.Int("max-tokens", 32, "max_tokens per request")
@@ -158,7 +162,47 @@ func main() {
 	var rateLimited atomic.Int64
 	var wg sync.WaitGroup
 	start := time.Now()
-	for w := 0; w < *c; w++ {
+	makeReq := func(i int) *gatewayv1.GenerateRequest {
+		prompt := sysPrompts[reqPrefix[i]] + fmt.Sprintf("\n\nUser: question %d: %s", i, question(*seed, i))
+		return &gatewayv1.GenerateRequest{
+			Tenant:    fmt.Sprintf("t%d", i%*tenants),
+			Prompt:    prompt,
+			MaxTokens: int32(*maxTokens),
+			NoCache:   *noCache,
+		}
+	}
+	if *rate > 0 {
+		// Open loop. A closed loop (-c clients, each waiting for its last
+		// reply) slows its own sending when the system slows, so the slow
+		// period is under-sampled and the tail looks better than it is
+		// (coordinated omission). Here arrivals follow a Poisson process
+		// fixed in advance, and every latency is measured from the
+		// request's SCHEDULED send time, so any time spent waiting to be
+		// sent counts against the system, not for it.
+		arrivals := rand.New(rand.NewSource(*seed + 7))
+		sem := make(chan struct{}, *maxOutstanding)
+		at := start
+		for i := 0; i < *n; i++ {
+			at = at.Add(time.Duration(arrivals.ExpFloat64() / *rate * float64(time.Second)))
+			if d := time.Until(at); d > 0 {
+				time.Sleep(d)
+			}
+			scheduled := at
+			sem <- struct{}{}
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				lag := time.Since(scheduled)
+				r, err := one(ctx, clients[i%len(clients)], makeReq(i), *timeout, &rateLimited)
+				r.ttft += lag
+				r.total += lag
+				r.prefix = reqPrefix[i]
+				results[i], errs[i] = r, err
+			}(i)
+		}
+	}
+	for w := 0; w < *c && *rate <= 0; w++ {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
@@ -168,14 +212,7 @@ func main() {
 				if i >= *n {
 					return
 				}
-				prompt := sysPrompts[reqPrefix[i]] + fmt.Sprintf("\n\nUser: question %d: %s", i, question(*seed, i))
-				req := &gatewayv1.GenerateRequest{
-					Tenant:    fmt.Sprintf("t%d", i%*tenants),
-					Prompt:    prompt,
-					MaxTokens: int32(*maxTokens),
-					NoCache:   *noCache,
-				}
-				r, err := one(ctx, gw, req, *timeout, &rateLimited)
+				r, err := one(ctx, gw, makeReq(i), *timeout, &rateLimited)
 				r.prefix = reqPrefix[i]
 				results[i], errs[i] = r, err
 			}
@@ -188,6 +225,10 @@ func main() {
 
 	rep := summarise(results, errs, elapsed)
 	rep.N, rep.Concurrency, rep.Tenants, rep.Prefixes, rep.MaxTokens, rep.NoCache = *n, *c, *tenants, *prefixes, *maxTokens, *noCache
+	rep.Mode, rep.OfferedRPS = "closed", 0
+	if *rate > 0 {
+		rep.Mode, rep.OfferedRPS, rep.Concurrency = "open", *rate, 0
+	}
 	rep.RateLimited = rateLimited.Load()
 	if after != nil {
 		rep.Gateway = diffStats(before, after)
