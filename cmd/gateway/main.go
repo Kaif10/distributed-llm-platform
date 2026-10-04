@@ -32,6 +32,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -167,7 +168,10 @@ func main() {
 		}
 	}()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	// SIGTERM as well as SIGINT: SIGTERM is what docker stop, Kubernetes
+	// and systemd send, and without it the process skipped the graceful
+	// path below and was SIGKILLed mid-stream after the grace period.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if *statsEvery > 0 {
