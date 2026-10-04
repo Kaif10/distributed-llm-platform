@@ -7,20 +7,134 @@ package chaos
 import (
 	"context"
 	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
 	"dsys/kv/raftkv"
 	"dsys/raft/simnet"
+	"dsys/sched/kvadapter"
 )
 
 func report(t *testing.T, rep *Report) {
 	t.Helper()
-	t.Logf("seed=%d kvOps=%d schedJobs=%d gatewayReq=%d events=%d elapsed=%s",
-		rep.Seed, rep.KVOps, rep.SchedJobs, rep.GatewayReq, len(rep.Events), rep.Elapsed.Round(time.Millisecond))
+	t.Logf("seed=%d kvOps=%d kvCheck=%s kvRetries=%d redeliveries=%d repliesLost=%d identities=%d schedJobs=%d schedDone=%d fenced=%d idemKeys=%d idemDups=%d gatewayReq=%d events=%d elapsed=%s",
+		rep.Seed, rep.KVOps, rep.KVCheck, rep.KVRetries, rep.KVRedeliveries, rep.KVRepliesLost, rep.KVIdentities,
+		rep.SchedJobs, rep.SchedDone, rep.SchedFenced, rep.SchedIdemKeys, rep.SchedIdemDupSubmits,
+		rep.GatewayReq, len(rep.Events), rep.Elapsed.Round(time.Millisecond))
 	for _, v := range rep.Violations {
 		t.Errorf("violation: %s", v)
 	}
+	// One identity per logical caller, never one per mutation: the KV
+	// workload's sessions plus at most two kvadapter pools.
+	if max := rep.Scenario.NumClients + 2*kvadapter.DefaultSessions; rep.KVIdentities > max {
+		t.Errorf("%d distinct client ids sent mutations (> %d): identities are being minted per operation", rep.KVIdentities, max)
+	}
+}
+
+// runExpectingViolation runs sc and fails unless at least one violation
+// contains one of wants. It is how each "checker catches X" test proves a
+// check can actually fail, against a deliberately injected bug.
+func runExpectingViolation(t *testing.T, sc Scenario, wants ...string) *Report {
+	t.Helper()
+	rep, err := Run(context.Background(), sc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range rep.Violations {
+		for _, want := range wants {
+			if strings.Contains(v, want) {
+				t.Logf("caught as expected: %s", firstLine(v))
+				return rep
+			}
+		}
+	}
+	t.Fatalf("injected bug NOT detected: want a violation containing one of %q, got %q", wants, rep.Violations)
+	return rep
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// TestCheckerCatchesDuplicateApply proves the KV linearizability check can
+// see a broken dedup path. The injected bug rewrites every delivered
+// mutation's RequestMeta to a fresh identity (a client that rebuilds its
+// request per retry); with reply loss forcing retries of already-applied
+// writes, one logical Put/CAS is applied several times, which Porcupine
+// must flag. The control (same reply loss, no bug) must pass, which is what
+// shows the dedup path of the real kv/client + store is what saves it.
+func TestCheckerCatchesDuplicateApply(t *testing.T) {
+	sc := Scenario{
+		Seed: 3, Duration: 3 * time.Second, NumKVNodes: 3, NumClients: 6,
+		ClientReplyLoss: 0.3,
+	}
+	t.Run("control", func(t *testing.T) {
+		rep, err := Run(context.Background(), sc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		report(t, rep)
+		if rep.KVCheck != "ok" {
+			t.Fatalf("control run: kv check %q, want ok", rep.KVCheck)
+		}
+		if rep.KVRedeliveries == 0 {
+			t.Fatal("control run: no mutation was ever redelivered; the dedup path did not run")
+		}
+	})
+	t.Run("injected", func(t *testing.T) {
+		bad := sc
+		bad.faults.kvFreshMeta = true
+		runExpectingViolation(t, bad, "NOT linearizable")
+	})
+}
+
+// TestCheckerCatchesLostJobs proves the scheduler liveness check can fail:
+// workers that silently drop every fifth job (claim it, never complete or
+// fail it) leave those jobs cycling through lease expiry forever, and the
+// post-run drain must report them as not DONE. The pre-hardening check
+// only logged unfinished jobs as "not a violation".
+func TestCheckerCatchesLostJobs(t *testing.T) {
+	sc := Scenario{Seed: 11, Duration: 2 * time.Second, NumKVNodes: 3, NumClients: 4, IncludeScheduler: true, schedDrain: 4 * time.Second}
+	sc.faults.schedLoseEveryFifthJob = true
+	runExpectingViolation(t, sc, "not DONE within")
+}
+
+// TestCheckerCatchesIdempotencyBreak proves the idempotency check can fail:
+// a client that drops the key when it retries a Submit creates a second
+// job for the same key, which must be reported.
+func TestCheckerCatchesIdempotencyBreak(t *testing.T) {
+	sc := Scenario{Seed: 12, Duration: 2 * time.Second, NumKVNodes: 3, NumClients: 4, IncludeScheduler: true}
+	sc.faults.schedForgetIdemKeyOnRetry = true
+	runExpectingViolation(t, sc, "idempotency key")
+}
+
+// TestCheckerCatchesSharedIdentity proves the harness notices when the
+// one-outstanding-mutation-per-identity rule is broken: every KV workload
+// goroutine shares ONE kv/client Session, so a later request id overtakes
+// an earlier outstanding one. Two outcomes are possible and both must be
+// reported:
+//
+//   - the earlier request reaches a replica after the later one applied and
+//     is refused up front as stale (FailedPrecondition): the "stale"
+//     violation;
+//   - both were already in the Raft log, so the store SKIPS the earlier one
+//     at apply time (store.Machine.Apply) and raftkv acknowledges that
+//     skipped entry to its waiting caller as a success with a zero result.
+//     The caller then believes a write happened that never did, which only
+//     the linearizability check can see.
+//
+// The second path is the one this test hits in practice; it is reachable
+// only by a client that breaks kv/client's documented rule, which is why
+// production code is safe, but it is also why the harness must never run
+// two concurrent callers on one identity.
+func TestCheckerCatchesSharedIdentity(t *testing.T) {
+	sc := Scenario{Seed: 5, Duration: 2 * time.Second, NumKVNodes: 3, NumClients: 6}
+	sc.faults.kvSharedSession = true
+	runExpectingViolation(t, sc, "stale", "NOT linearizable")
 }
 
 // TestQuietRun is the control: no nemesis at all. If this ever fails, the
@@ -42,19 +156,43 @@ func TestManySeeds(t *testing.T) {
 	if testing.Short() {
 		t.Skip("long")
 	}
+	var redelivered, unknown, fenced, idemDups, schedDone int64
 	for seed := int64(1); seed <= 12; seed++ {
-		seed := seed
 		t.Run(seedName(seed), func(t *testing.T) {
 			rep, err := Run(context.Background(), Scenario{
 				Seed: seed, Duration: 4 * time.Second, NumKVNodes: 5, NumClients: 6,
 				NemesisInterval: 25, PauseDuration: 150 * time.Millisecond,
-				IncludeScheduler: true,
+				IncludeScheduler: true, ClientReplyLoss: 0.05,
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
 			report(t, rep)
+			redelivered += rep.KVRedeliveries
+			fenced += rep.SchedFenced
+			idemDups += rep.SchedIdemDupSubmits
+			schedDone += rep.SchedDone
+			if rep.KVCheck == "unknown" {
+				unknown++
+			}
 		})
+	}
+	// Scheduler non-vacuity: jobs were completed, zombies were really
+	// fenced (the exactly-once check had something to refuse), and
+	// idempotency keys were really submitted more than once.
+	t.Logf("battery: redeliveries=%d schedDone=%d fenced=%d idemDupSubmits=%d porcupineUnknown=%d",
+		redelivered, schedDone, fenced, idemDups, unknown)
+	if schedDone == 0 || fenced == 0 || idemDups == 0 {
+		t.Errorf("scheduler checks were vacuous: done=%d fenced=%d idemDupSubmits=%d (all must be > 0)", schedDone, fenced, idemDups)
+	}
+	// Non-vacuity across the battery: the production client really did
+	// resend applied mutations (dedup path exercised), and Porcupine
+	// reached a verdict on most seeds rather than timing out.
+	if redelivered == 0 {
+		t.Error("no KV mutation was redelivered in any seed: the dedup path never ran")
+	}
+	if unknown > 2 {
+		t.Errorf("Porcupine was inconclusive on %d/12 seeds: the KV check is mostly vacuous", unknown)
 	}
 }
 
@@ -73,9 +211,92 @@ func TestGatewayMixSurvivesChaos(t *testing.T) {
 		t.Fatal(err)
 	}
 	report(t, rep)
-	if rep.GatewayReq == 0 {
-		t.Fatal("gateway mix issued zero requests; it did not actually run")
+	gatewayNonVacuous(t, rep)
+}
+
+// gatewayNonVacuous fails a gateway run whose checks had nothing to check.
+func gatewayNonVacuous(t *testing.T, rep *Report) {
+	t.Helper()
+	t.Logf("gateway: requests=%d errors=%d cacheHits=%d stalled=%d final=%d/%d",
+		rep.GatewayReq, rep.GatewayErrors, rep.GatewayCacheHits, rep.GatewayStalled, rep.GatewayFinalOK, rep.GatewayFinalTotal)
+	if rep.GatewayReq == 0 || rep.GatewayFinalTotal == 0 {
+		t.Fatal("gateway mix issued no requests (or no final batch); it did not actually run")
 	}
+	if rep.GatewayCacheHits == 0 {
+		t.Error("no response was served from the cache: the cached-answer check was vacuous")
+	}
+	if rep.GatewayStalled == 0 {
+		t.Error("no stalled-reader request was issued: the backpressure path was not exercised")
+	}
+}
+
+// gatewayDemo is the scenario the gateway "checker catches X" tests share:
+// no nemesis and no scheduler, so the only thing that can fail is the
+// injected fault.
+func gatewayDemo(f injectedFaults) Scenario {
+	return Scenario{Seed: 21, Duration: 2 * time.Second, NumKVNodes: 3, NumClients: 6,
+		IncludeGateway: true, NumWorkers: 3, faults: f}
+}
+
+// TestGatewayQuietControl is the control for the gateway checker tests:
+// the same scenario with no injected fault passes, with real cache hits
+// and stalled readers.
+func TestGatewayQuietControl(t *testing.T) {
+	if testing.Short() {
+		t.Skip("long")
+	}
+	rep, err := Run(context.Background(), gatewayDemo(injectedFaults{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	report(t, rep)
+	gatewayNonVacuous(t, rep)
+}
+
+// TestCheckerCatchesGatewayWorkerErrors: workers that fail every generation
+// with Internal. The gateway maps that to Unavailable (a retryable code), so
+// only the post-heal availability bound can see it, and must. The
+// pre-hardening mix passed this with 193/193 requests failed.
+func TestCheckerCatchesGatewayWorkerErrors(t *testing.T) {
+	if testing.Short() {
+		t.Skip("long")
+	}
+	runExpectingViolation(t, gatewayDemo(injectedFaults{gwWorkerInternal: 1}), "succeeded after the cluster healed")
+}
+
+// TestCheckerCatchesGatewayTruncation: workers that end each stream one
+// token early but mark it done. The gateway cannot know; the content check
+// against the full answer must.
+func TestCheckerCatchesGatewayTruncation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("long")
+	}
+	runExpectingViolation(t, gatewayDemo(injectedFaults{gwWorkerTruncate: true}), "wrong answer")
+}
+
+// TestCheckerCatchesGatewayCacheCorruption: a cache that stores half the
+// answer, and a cache that ignores the tenant. Both are served to later
+// callers as cache hits, and both must differ from the uncached answer.
+func TestCheckerCatchesGatewayCacheCorruption(t *testing.T) {
+	if testing.Short() {
+		t.Skip("long")
+	}
+	t.Run("truncated-store", func(t *testing.T) {
+		runExpectingViolation(t, gatewayDemo(injectedFaults{gwCacheTruncate: true}), "wrong answer")
+	})
+	t.Run("cross-tenant", func(t *testing.T) {
+		runExpectingViolation(t, gatewayDemo(injectedFaults{gwCacheIgnoreTenant: true}), "wrong answer")
+	})
+}
+
+// TestCheckerCatchesGatewayBadCode: a request that fails with a
+// non-status error (surfacing as Unknown) must be reported, even though the
+// final batch is healthy.
+func TestCheckerCatchesGatewayBadCode(t *testing.T) {
+	if testing.Short() {
+		t.Skip("long")
+	}
+	runExpectingViolation(t, gatewayDemo(injectedFaults{gwPlainSendError: true}), "non-retryable error code")
 }
 
 // TestChooseEventDeterministicGivenFixedState is the real proof of
@@ -100,7 +321,10 @@ func TestGatewayMixSurvivesChaos(t *testing.T) {
 // is guaranteed: the decision FUNCTION, not the live schedule it is fed.
 func TestChooseEventDeterministicGivenFixedState(t *testing.T) {
 	net := simnet.New(5)
-	c := newKVCluster(5, net, raftkv.Config{}, 1)
+	c, err := newKVCluster(5, net, raftkv.Config{}, kvClusterOptions{seed: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer c.killAll()
 	// Hold a fixed, hand-picked mix of down nodes for the whole test: one
 	// partitioned, one crashed, three free. chooseEvent must never observe
