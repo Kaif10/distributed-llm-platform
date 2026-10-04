@@ -178,48 +178,71 @@ func terminal(s schedv1.State) bool {
 // repairs tail past it, and moves on. The reverse order (bump tail, then
 // write) would instead leave a permanent hole that every scan has to step
 // over, with no way to tell "not written yet" from "never will be".
+//
+// # Idempotent submits: stage, bind, publish
+//
+// With a key, "write the record" and "bind the key to its id" are two CAS
+// on two keys, and any step can fail after the previous one committed. If
+// the record were written PENDING and the bind then failed (or the tail
+// bump after it did, before the key was bound), the client's retry would
+// find no binding, allocate a second job, and both would run. So an
+// idempotent Submit writes its record STAGED (state UNSPECIFIED: never
+// claimable, never reaped), then binds the key to that id, and only then
+// publishes it (STAGED -> PENDING) and bumps tail. The invariant:
+//
+//	a record is made runnable only by finishIdem(id), and finishIdem is
+//	only ever called with the id the key is bound to. A key is bound at
+//	most once (a CAS from our own placeholder; a bound key never changes),
+//	so at most one job per key ever runs.
+//
+// Every failure is then recoverable by simply retrying with the same key:
+// a retry that finds the key bound finishes the publish and tail bump
+// itself; a retry that finds no binding allocates afresh, and whatever
+// staged record the failed attempt left behind can never become runnable.
+// Claim and Reap turn such orphans FAILED once they are older than
+// stagedTTL, so they do not pin head forever.
 func (q *Queue) Submit(ctx context.Context, payload []byte, idempotencyKey string) (id uint64, err error) {
 	ctx, span := tracer.Start(ctx, "sched.Submit", trace.WithAttributes(
 		attribute.Bool("idempotent", idempotencyKey != ""),
 	))
 	defer func() { endSpan(span, err) }()
 
-	var release func(uint64) error
 	if idempotencyKey != "" {
-		id, rel, err := q.claimIdem(ctx, idempotencyKey)
-		if err != nil {
-			return 0, err
-		}
-		if rel == nil {
-			return id, nil // already submitted under this key
-		}
-		release = rel
+		return q.submitIdem(ctx, payload, idempotencyKey)
 	}
+	id, _, err = q.allocate(ctx, payload, schedv1.State_STATE_PENDING)
+	return id, err
+}
 
+// allocate writes a new record in the given state at the first free id and
+// returns that id plus the tail bytes it read. For PENDING records it also
+// bumps tail to cover the id; a staged record's tail bump is left to
+// finishIdem, after the key is bound.
+func (q *Queue) allocate(ctx context.Context, payload []byte, state schedv1.State) (uint64, []byte, error) {
 	for {
 		tail, tailRaw, err := q.readCounter(ctx, q.keyTail(), 0)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 		head, _, err := q.readCounter(ctx, q.keyHead(), 1)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 		// live ids are head..tail; refuse once that window is full.
 		if tail >= head && tail-head+1 >= q.opts.MaxQueue {
-			return 0, ErrQueueFull
+			return 0, nil, ErrQueueFull
 		}
 
 		id := tail + 1
 		job := &schedv1.Job{
 			Id:          id,
 			Payload:     payload,
-			State:       schedv1.State_STATE_PENDING,
+			State:       state,
 			SubmittedMs: q.nowMs(),
 		}
 		swapped, err := q.casJob(ctx, id, nil, job)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 		if !swapped {
 			// Someone already wrote id: a concurrent Submit that won, or a
@@ -228,34 +251,101 @@ func (q *Queue) Submit(ctx context.Context, payload []byte, idempotencyKey strin
 			_, _ = q.casCounter(ctx, q.keyTail(), tailRaw, id)
 			continue
 		}
+		if state != schedv1.State_STATE_PENDING {
+			return id, tailRaw, nil
+		}
 		// Bump tail to cover our id. If this CAS loses, someone else has
 		// already moved tail at least as far (repair path above), so re-read
 		// and only push if it is still behind.
 		if ok, err := q.casCounter(ctx, q.keyTail(), tailRaw, id); err != nil {
-			return 0, err
+			return 0, nil, err
 		} else if !ok {
-			for {
-				t, raw, err := q.readCounter(ctx, q.keyTail(), 0)
-				if err != nil {
-					return 0, err
-				}
-				if t >= id {
-					break
-				}
-				if ok, err := q.casCounter(ctx, q.keyTail(), raw, id); err != nil {
-					return 0, err
-				} else if ok {
-					break
-				}
+			if err := q.coverTail(ctx, id); err != nil {
+				return 0, nil, err
 			}
 		}
-		if release != nil {
-			if err := release(id); err != nil {
-				return 0, err
-			}
-		}
-		return id, nil
+		return id, tailRaw, nil
 	}
+}
+
+// coverTail pushes tail up to at least id.
+func (q *Queue) coverTail(ctx context.Context, id uint64) error {
+	for {
+		t, raw, err := q.readCounter(ctx, q.keyTail(), 0)
+		if err != nil {
+			return err
+		}
+		if t >= id {
+			return nil
+		}
+		if ok, err := q.casCounter(ctx, q.keyTail(), raw, id); err != nil {
+			return err
+		} else if ok {
+			return nil
+		}
+	}
+}
+
+// submitIdem is Submit with a key: reserve the key, stage a record, bind
+// the key to it, publish. See Submit's doc for why in this order.
+func (q *Queue) submitIdem(ctx context.Context, payload []byte, key string) (uint64, error) {
+	for {
+		id, mine, err := q.claimIdem(ctx, key)
+		if err != nil {
+			return 0, err
+		}
+		if mine == nil {
+			// Already bound, by us earlier or by a concurrent Submit. Its
+			// publish or tail bump may not have happened (that attempt
+			// failed or crashed after binding), so finish them; both are
+			// idempotent.
+			return id, q.finishIdem(ctx, id)
+		}
+
+		id, _, err = q.allocate(ctx, payload, schedv1.State_STATE_UNSPECIFIED)
+		if err != nil {
+			q.abandonIdem(ctx, key, mine)
+			return 0, err
+		}
+		bound, err := q.bindIdem(ctx, key, mine, id)
+		if err != nil {
+			q.abandonIdem(ctx, key, mine)
+			return 0, err
+		}
+		if !bound {
+			// Our reservation expired and was stolen while we were slow;
+			// the thief's Submit owns the key now. Our staged record is
+			// never published. Go round again: we will find the thief's
+			// binding (or wait for it).
+			continue
+		}
+		return id, q.finishIdem(ctx, id)
+	}
+}
+
+// finishIdem makes the bound job id runnable: STAGED -> PENDING, then tail
+// covers it. Safe to call any number of times, from any Submit that found
+// the key bound to id.
+func (q *Queue) finishIdem(ctx context.Context, id uint64) error {
+	for {
+		job, raw, err := q.readJob(ctx, id)
+		if err != nil {
+			return err
+		}
+		if job.State != schedv1.State_STATE_UNSPECIFIED {
+			break // already published (or since claimed, finished, or GC'd)
+		}
+		next := proto.Clone(job).(*schedv1.Job)
+		next.State = schedv1.State_STATE_PENDING
+		swapped, err := q.casJob(ctx, id, raw, next)
+		if err != nil {
+			return err
+		}
+		if swapped {
+			break
+		}
+	}
+	return q.coverTail(ctx, id)
 }
 
 // Idempotency keys use the lease trick a second time: the key is first
@@ -263,10 +353,20 @@ func (q *Queue) Submit(ctx context.Context, payload []byte, idempotencyKey strin
 // reserving does not block the key forever, and only then bound to an id.
 const idemPlaceholderTTL = 30 * time.Second
 
+// stagedTTL is how old a STAGED record must be before Claim/Reap declare
+// its Submit abandoned and turn it FAILED. It is well past
+// idemPlaceholderTTL, so by then the Submit that wrote it has either bound
+// and published it, or lost its reservation and will never publish it. A
+// Submit stalled for longer than this between binding and publishing (or a
+// scheduler clock that far ahead) gets its job FAILED with "submit
+// abandoned", never run twice.
+const stagedTTL = 2 * idemPlaceholderTTL
+
 // claimIdem returns (id, nil, nil) if key is already bound, or
-// (0, release, nil) if the caller now holds the reservation and must call
-// release(id) after allocating.
-func (q *Queue) claimIdem(ctx context.Context, key string) (uint64, func(uint64) error, error) {
+// (0, mine, nil) if the caller now holds the reservation, mine being the
+// placeholder bytes it must CAS against to bind (bindIdem) or give it up
+// (abandonIdem).
+func (q *Queue) claimIdem(ctx context.Context, key string) (uint64, []byte, error) {
 	k := q.keyIdem(key)
 	for {
 		raw, found, err := q.kv.Get(ctx, k)
@@ -290,7 +390,8 @@ func (q *Queue) claimIdem(ctx context.Context, key string) (uint64, func(uint64)
 					}
 					continue
 				}
-				// Stale reservation: its owner died. Steal it.
+				// Stale (or abandoned) reservation: its owner died or gave
+				// up. Steal it.
 			}
 		}
 		mine := []byte("pending|" + strconv.FormatInt(q.nowMs()+idemPlaceholderTTL.Milliseconds(), 10))
@@ -301,16 +402,26 @@ func (q *Queue) claimIdem(ctx context.Context, key string) (uint64, func(uint64)
 		if !swapped {
 			continue
 		}
-		release := func(id uint64) error {
-			// Bind the key. If our placeholder was stolen meanwhile (we were
-			// slower than the TTL), the thief's Submit also produced a job;
-			// two jobs for one key is the documented failure mode of an
-			// expired reservation, and preferable to a stuck key.
-			_, _, err := q.kv.CAS(ctx, k, mine, false, []byte("id|"+strconv.FormatUint(id, 10)))
-			return err
-		}
-		return 0, release, nil
+		return 0, mine, nil
 	}
+}
+
+// bindIdem binds key to id, if our placeholder is still there. bound=false
+// means it was stolen (we were slower than the TTL); the thief's Submit
+// owns the key, and since a bound key never changes, ours can never become
+// the job that runs.
+func (q *Queue) bindIdem(ctx context.Context, key string, mine []byte, id uint64) (bool, error) {
+	swapped, _, err := q.kv.CAS(ctx, q.keyIdem(key), mine, false, []byte("id|"+strconv.FormatUint(id, 10)))
+	return swapped, err
+}
+
+// abandonIdem gives up our reservation after a failure, best effort, by
+// replacing it with an already-expired placeholder, so the client's retry
+// can take the key over at once instead of waiting out the TTL. If the
+// failed step was a bind that in fact committed, this CAS simply loses and
+// the retry finds the binding.
+func (q *Queue) abandonIdem(ctx context.Context, key string, mine []byte) {
+	_, _, _ = q.kv.CAS(ctx, q.keyIdem(key), mine, false, []byte("pending|0"))
 }
 
 // ---------------------------------------------------------------------------
@@ -473,11 +584,31 @@ func (q *Queue) claimFrom(ctx context.Context, worker string, lease time.Duratio
 			// is theirs now and the next PENDING one may be free.
 			continue
 
+		case job.State == schedv1.State_STATE_UNSPECIFIED:
+			q.expireStaged(ctx, id, job, raw, now)
+			continue
+
 		default:
 			continue // RUNNING under a live lease
 		}
 	}
 	return nil, id, nil
+}
+
+// expireStaged turns a STAGED record (an idempotent Submit that never got
+// as far as publishing it; see Submit) FAILED once it is older than
+// stagedTTL, so an abandoned attempt cannot pin head forever. Best effort:
+// losing the CAS means its Submit published it (or another scan already
+// expired it) in the meantime, both fine.
+func (q *Queue) expireStaged(ctx context.Context, id uint64, job *schedv1.Job, raw []byte, now int64) {
+	if now-job.SubmittedMs <= stagedTTL.Milliseconds() {
+		return
+	}
+	next := proto.Clone(job).(*schedv1.Job)
+	next.State = schedv1.State_STATE_FAILED
+	next.Gen++
+	next.LastError = "submit abandoned before it was published"
+	_, _ = q.casJob(ctx, id, raw, next)
 }
 
 // ---------------------------------------------------------------------------
@@ -668,6 +799,10 @@ func (q *Queue) Reap(ctx context.Context) (reclaimedOut int, err error) {
 					headRaw = encU64(head)
 				}
 			}
+			continue
+		}
+		if job.State == schedv1.State_STATE_UNSPECIFIED {
+			q.expireStaged(ctx, id, job, raw, q.nowMs())
 			continue
 		}
 		if job.State != schedv1.State_STATE_RUNNING || job.LeaseUntilMs >= q.nowMs() {
