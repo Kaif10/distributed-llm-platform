@@ -64,12 +64,12 @@ type schedWorkload struct {
 	idemIDs     map[string]map[uint64]bool // idempotency key -> ids its Submits returned
 	idemCalls   map[string]int             // Submit calls made per key (for the injected bug)
 
-	submitted     atomic.Int64 // successful Submit calls
-	idemKeys      atomic.Int64 // distinct idempotency keys used
-	idemDupCalls  atomic.Int64 // Submit calls that repeated an already-used key
-	done          atomic.Int64
-	fenced        atomic.Int64
-	zombieClaims  atomic.Int64
+	submitted    atomic.Int64 // successful Submit calls
+	idemKeys     atomic.Int64 // distinct idempotency keys used
+	idemDupCalls atomic.Int64 // Submit calls that repeated an already-used key
+	done         atomic.Int64
+	fenced       atomic.Int64
+	zombieClaims atomic.Int64
 }
 
 func newSchedWorkload(kv sched.KV, faults injectedFaults, drain time.Duration, pl *panicLog) *schedWorkload {

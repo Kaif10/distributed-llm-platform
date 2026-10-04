@@ -248,10 +248,10 @@ type Event struct {
 
 // Report summarizes one run.
 type Report struct {
-	Seed       int64
-	Scenario   Scenario
-	Events     []Event
-	KVOps      int
+	Seed     int64
+	Scenario Scenario
+	Events   []Event
+	KVOps    int
 	// KVCheck is Porcupine's verdict on the KV history: "ok", "illegal",
 	// or "unknown" (its time budget ran out: inconclusive, which is
 	// reported but not counted as a violation).
@@ -289,8 +289,8 @@ type Report struct {
 	GatewayStalled    int
 	GatewayFinalOK    int
 	GatewayFinalTotal int
-	Violations []string // empty means the run passed
-	Elapsed    time.Duration
+	Violations        []string // empty means the run passed
+	Elapsed           time.Duration
 }
 
 // Passed reports whether no invariant was violated.
