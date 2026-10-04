@@ -77,6 +77,17 @@ type neededShard struct {
 	AtConfig  int64 // the config number to ask the source group for
 }
 
+// priorOwner records, for a shard currently assigned to gid 0, the last group
+// that really owned it and the config number under which it went to gid 0.
+// That group froze the shard's state into its outgoing table keyed by
+// LeftAt, so a later owner pulls it "as of LeftAt" exactly as if the shard
+// had moved there directly. GID 0 means the shard has never had an owner.
+type priorOwner struct {
+	GID    int64
+	Addrs  []string // GID's addresses as listed in the config before LeftAt
+	LeftAt int64
+}
+
 type waiter struct {
 	term uint64
 	ch   chan outcome
@@ -102,9 +113,10 @@ type Server struct {
 
 	mu          sync.Mutex
 	cur         Config
-	machines    map[int]*store.Machine   // shards we currently own and hold data for
-	needed      map[int]neededShard      // shards we own under cur but have not received
-	outgoing    map[int]map[int64][]byte // shard -> config num it left us -> frozen snapshot, for PullShard
+	machines    map[int]*store.Machine    // shards we currently own and hold data for
+	needed      map[int]neededShard       // shards we own under cur but have not received
+	outgoing    map[int]map[int64][]byte  // shard -> config num it left us -> frozen snapshot, for PullShard
+	lastOwner   [shard.NShards]priorOwner // for shards unassigned under cur: who holds their frozen data
 	lastApplied uint64
 	waiters     map[uint64]*waiter
 }
@@ -283,17 +295,48 @@ func (s *Server) applyConfig(next Config) {
 			delete(s.machines, i)
 
 		case oldOwner != s.gid && newOwner == s.gid:
-			// Gaining shard i. If nobody owned it before (a fresh shard
-			// under the very first real config), there is nothing to pull;
-			// otherwise it must be fetched from whoever had it, using THAT
-			// group's address as recorded in the OLD config, since the new
-			// config's Groups map is the only thing that might not even
+			// Gaining shard i. It must be fetched from whoever had it, using
+			// THAT group's address as recorded in the OLD config, since the
+			// new config's Groups map is the only thing that might not even
 			// list a departing group any more.
+			//
+			// "Unassigned under cur" (oldOwner == 0) does NOT mean "no data":
+			// if every group left at some point, the shard's last real
+			// owner froze it on the way to gid 0 and is still holding it.
+			// lastOwner remembers who that was and as of which config, so
+			// the shard is pulled from there (or, if it was us, restored
+			// from our own frozen copy). Only a shard that has never had
+			// an owner at all starts empty.
+			from, fromAddrs, atConfig := oldOwner, s.cur.Groups[oldOwner], next.Num
 			if oldOwner == 0 {
-				s.machines[i] = store.NewMachine()
-			} else {
-				s.needed[i] = neededShard{FromGID: oldOwner, FromAddrs: s.cur.Groups[oldOwner], AtConfig: next.Num}
+				prev := s.lastOwner[i]
+				from, fromAddrs, atConfig = prev.GID, prev.Addrs, prev.LeftAt
 			}
+			switch from {
+			case 0:
+				s.machines[i] = store.NewMachine()
+			case s.gid:
+				// Only reachable via lastOwner: we froze it ourselves when
+				// it went to gid 0, so the data is already in outgoing.
+				m := store.NewMachine()
+				if err := m.Restore(s.outgoing[i][atConfig]); err != nil {
+					panic(fmt.Sprintf("shardkv: restore own frozen shard %d@%d: %v", i, atConfig, err))
+				}
+				s.machines[i] = m
+			default:
+				s.needed[i] = neededShard{FromGID: from, FromAddrs: fromAddrs, AtConfig: atConfig}
+			}
+		}
+
+		// Track the last real owner of every shard, owned by us or not.
+		// Every group applies every config in order, so every replica of
+		// every group derives the same lastOwner from the same log, which
+		// is what makes the "gaining from gid 0" branch above deterministic.
+		switch {
+		case oldOwner != 0 && newOwner == 0:
+			s.lastOwner[i] = priorOwner{GID: oldOwner, Addrs: s.cur.Groups[oldOwner], LeftAt: next.Num}
+		case newOwner != 0:
+			s.lastOwner[i] = priorOwner{}
 		}
 	}
 	s.cur = next
@@ -478,8 +521,10 @@ func (s *Server) pullNeeded(needed map[int]neededShard) {
 // HandlePullShard answers another group asking for a shard we used to own.
 // Only a leader that has itself applied the transition can answer: it is
 // the frozen snapshot taken exactly at that transition, keyed by the config
-// number the caller is moving into, that makes this safe to hand out
-// without any further coordination.
+// number under which the shard left us (the config the caller is moving
+// into, or, if the shard sat unassigned in between, the config that sent it
+// to gid 0), that makes this safe to hand out without any further
+// coordination.
 func (s *Server) HandlePullShard(configNum int64, shardID int) (snapshot []byte, ok bool) {
 	if !s.IsLeader() {
 		return nil, false
@@ -505,10 +550,13 @@ type serverSnapshot struct {
 	Machines map[int][]byte
 	Needed   map[int]neededShard
 	Outgoing map[int]map[int64][]byte
+	// LastOwner is absent from snapshots taken before it existed; gob then
+	// leaves it zero, which is exactly the old (pre-fix) behaviour.
+	LastOwner [shard.NShards]priorOwner
 }
 
 func (s *Server) snapshotLocked() ([]byte, error) {
-	ss := serverSnapshot{Cur: s.cur, Needed: s.needed, Outgoing: s.outgoing, Machines: make(map[int][]byte, len(s.machines))}
+	ss := serverSnapshot{Cur: s.cur, Needed: s.needed, Outgoing: s.outgoing, LastOwner: s.lastOwner, Machines: make(map[int][]byte, len(s.machines))}
 	for shardID, m := range s.machines {
 		b, err := m.Snapshot()
 		if err != nil {
@@ -533,6 +581,7 @@ func (s *Server) restoreSnapshot(b []byte) error {
 		machines[shardID] = m
 	}
 	s.cur = ss.Cur
+	s.lastOwner = ss.LastOwner
 	s.machines = machines
 	s.needed = ss.Needed
 	if s.needed == nil {
