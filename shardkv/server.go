@@ -59,12 +59,19 @@ var (
 // Options configures a Server. Not to be confused with Config, which is a
 // shard *assignment* (see api.go) — Options is construction-time plumbing.
 type Options struct {
-	GID           int64
-	Addrs         []string // this group's own replica addresses, for leader hints
-	Ctrl          Controller
-	Fetcher       ShardFetcher
-	PollInterval  time.Duration // default 100ms
-	MaxRaftState  int           // <=0 disables snapshots
+	GID          int64
+	Addrs        []string // this group's own replica addresses, for leader hints
+	Ctrl         Controller
+	Fetcher      ShardFetcher
+	PollInterval time.Duration // default 100ms
+	// QueryTimeout is the deadline for one controller Query, default 1s.
+	// It is deliberately NOT the poll interval: how often we ask and how
+	// long an answer may take are different things, and a controller whose
+	// Query has become slower than the poll interval must still be heard.
+	// While Queries keep failing, the deadline doubles (up to
+	// maxQueryBackoff times this), and resets on the next success.
+	QueryTimeout  time.Duration
+	MaxRaftState  int // <=0 disables snapshots
 	CommitTimeout time.Duration
 	Raft          raft.Config
 }
@@ -128,6 +135,9 @@ func New(peers []raft.Peer, me int, persister raft.Persister, opts Options) *Ser
 	}
 	if opts.CommitTimeout <= 0 {
 		opts.CommitTimeout = 3 * time.Second
+	}
+	if opts.QueryTimeout <= 0 {
+		opts.QueryTimeout = time.Second
 	}
 	s := &Server{
 		me:        me,
@@ -461,9 +471,16 @@ func (s *Server) proposeInternal(cmd *command) {
 // that makes the rest of Raft's log reasoning apply here too.
 // ---------------------------------------------------------------------------
 
+// maxQueryBackoff caps how far the Query deadline grows while the
+// controller keeps timing out: 8x QueryTimeout (8s by default), long enough
+// for a controller that is slow but alive, short enough that a dead one
+// costs the poll loop a bounded stall per attempt.
+const maxQueryBackoff = 8
+
 func (s *Server) pollLoop() {
 	t := time.NewTicker(s.opts.PollInterval)
 	defer t.Stop()
+	queryTimeout := s.opts.QueryTimeout
 	for {
 		select {
 		case <-s.done:
@@ -487,11 +504,19 @@ func (s *Server) pollLoop() {
 			continue
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), s.opts.PollInterval)
+		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 		next, err := s.opts.Ctrl.Query(ctx, curNum+1)
 		cancel()
-		if err != nil || next.Num != curNum+1 {
-			continue // controller unreachable, or no newer config yet
+		if err != nil {
+			// Unreachable, or slower than our deadline. Give the next try
+			// longer, so a controller that has merely become slow is not
+			// starved by a deadline it can never meet.
+			queryTimeout = min(2*queryTimeout, maxQueryBackoff*s.opts.QueryTimeout)
+			continue
+		}
+		queryTimeout = s.opts.QueryTimeout
+		if next.Num != curNum+1 {
+			continue // no newer config yet
 		}
 		s.proposeInternal(&command{Kind: opConfig, Config: next})
 	}

@@ -97,15 +97,17 @@ type group struct {
 	addrs      []string
 	net        *simnet.Net
 	fetcher    *fakeFetcher
-	ctrl       *fakeCtrl
+	ctrl       Controller
+	tweaks     []func(*Options)
 	mu         sync.Mutex
 	servers    []*Server
 	persisters []*raft.MemPersister
 	lastLeader atomic.Int32
 }
 
-func newGroup(t *testing.T, gid int64, n int, ctrl *fakeCtrl, fetcher *fakeFetcher) *group {
+func newGroup(t *testing.T, gid int64, n int, ctrl Controller, fetcher *fakeFetcher, tweaks ...func(*Options)) *group {
 	g := &group{
+		tweaks:     tweaks,
 		gid:        gid,
 		addrs:      make([]string, n),
 		net:        simnet.New(n),
@@ -138,7 +140,7 @@ func (g *group) start(i int) {
 			peers[j] = g.net.Peer(i, j)
 		}
 	}
-	s := New(peers, i, g.persisters[i], Options{
+	opts := Options{
 		GID:           g.gid,
 		Addrs:         g.addrs,
 		Ctrl:          g.ctrl,
@@ -150,7 +152,11 @@ func (g *group) start(i int) {
 			ElectionTimeoutMin: 250 * time.Millisecond,
 			ElectionTimeoutMax: 500 * time.Millisecond,
 		},
-	})
+	}
+	for _, tw := range g.tweaks {
+		tw(&opts)
+	}
+	s := New(peers, i, g.persisters[i], opts)
 	g.mu.Lock()
 	g.servers[i] = s
 	g.mu.Unlock()
