@@ -47,17 +47,47 @@
 // replayed exactly, because "current state" stops depending on the real
 // scheduler at all.
 //
+// Also NOT pinned by the seed: which KV mutation replies ClientReplyLoss
+// drops. The coin is seeded, but flips are taken in whatever order
+// concurrent replies arrive.
+//
+// # The client path is the production one
+//
+// Every replica is served over a loopback gRPC listener, and every KV
+// caller in the harness goes through kv/client: each raw-KV workload
+// goroutine owns one Session (one client id, increasing request ids across
+// all of its operations and retries), and the scheduler and gateway each
+// use sched/kvadapter's pool of Sessions, exactly as their cmd/ binaries
+// do. kv/client's retry loop, leader-hint jumps and per-attempt timeouts
+// therefore run under every fault, and Gets are served by the replicas'
+// ReadIndex path. Nemesis faults act on Raft peer traffic (simnet); the
+// only client-hop fault is ClientReplyLoss. See kvcluster.go.
+//
 // # Invariants checked
 //
 //   - KV linearizability: every Get/Put/CAS the workload issued is checked
-//     with Porcupine against a single-object key-value model.
+//     with Porcupine against a single-object key-value model. An
+//     inconclusive Porcupine run (time budget exhausted) is reported in
+//     Report.KVCheck, not counted as a violation; TestManySeeds fails if it
+//     happens on more than 2 of its 12 seeds.
+//   - KV client discipline: a workload operation may only fail with a
+//     transient code (Unavailable, DeadlineExceeded, Aborted, Canceled, or
+//     its own deadline), and no mutation may be refused as stale while its
+//     caller is still waiting. Report.KVRedeliveries counts mutations
+//     resent with an already-delivered (client_id, request_id), i.e. how
+//     often the store's dedup path actually ran.
 //   - Scheduler exactly-once: every submitted job reaches DONE and is
 //     completed by exactly one accepted Complete call.
-//   - No panics, no goroutine ever blocks past the run's deadline.
+//   - No panics in any goroutine the harness starts: each one recovers and
+//     records its own panic as a violation (a recover only works on its own
+//     goroutine). Panics in library-owned goroutines crash the process. A
+//     goroutine that blocks forever is NOT detected as a violation; it
+//     hangs Run's final wait, so only `go test`'s own timeout catches it.
 //
-// A failed run's Report names the seed and the operation index nearest the
-// failure; rerunning `simrun -seed <n>` reproduces it (modulo the honesty
-// note above).
+// A failed run's Report names the seed and lists every nemesis event with
+// the workload op count at which it fired; rerunning `simrun -seed <n>`
+// replays the same workload and first nemesis event (see above for why
+// the rest of the schedule is best-effort, not exact).
 package chaos
 
 import (
@@ -116,9 +146,35 @@ type Scenario struct {
 	IncludeGateway bool
 	NumWorkers     int // inference workers when IncludeGateway. Default 3.
 
+	// ClientReplyLoss is the probability that a successful KV mutation's
+	// reply is dropped on its way from the replica back to kv/client (the
+	// client sees Unavailable after the write was applied). It forces the
+	// production retry path to resend the SAME RequestMeta and the store to
+	// answer it from its dedup table. 0 disables it.
+	ClientReplyLoss float64
+
 	// Logf receives a line per nemesis event and per check result. nil
 	// discards it (used by the meta-tests, which run many scenarios).
 	Logf func(format string, args ...any)
+
+	// faults injects KNOWN BUGS into harness-side fakes (never into library
+	// code). Only this package's tests set it, to prove each check can
+	// fail; a zero value means a clean run.
+	faults injectedFaults
+}
+
+// injectedFaults are deliberate bugs planted in harness-owned code paths,
+// used by the "checker catches X" tests. Each one models a real class of
+// bug the corresponding check exists to catch.
+type injectedFaults struct {
+	// kvFreshMeta: every delivered KV mutation gets a brand-new identity,
+	// i.e. a client that rebuilds its RequestMeta per retry. With reply
+	// loss, one logical Put/CAS is applied more than once.
+	kvFreshMeta bool
+	// kvSharedSession: every KV workload goroutine shares ONE kv/client
+	// Session, breaking the one-outstanding-mutation-per-identity rule, so
+	// a later request id can overtake an earlier one.
+	kvSharedSession bool
 }
 
 func (s Scenario) withDefaults() Scenario {
@@ -154,7 +210,24 @@ type Report struct {
 	Scenario   Scenario
 	Events     []Event
 	KVOps      int
-	SchedJobs  int
+	// KVCheck is Porcupine's verdict on the KV history: "ok", "illegal",
+	// or "unknown" (its time budget ran out: inconclusive, which is
+	// reported but not counted as a violation).
+	KVCheck string
+	// KVRetries is kv/client's own retry counter (every client family the
+	// harness built), KVRedeliveries how many mutation deliveries carried a
+	// (client_id, request_id) the replicas had already been sent, and
+	// KVRepliesLost how many applied mutations had their reply dropped by
+	// ClientReplyLoss. KVRedeliveries > 0 is the evidence that the store's
+	// dedup path actually ran in this run.
+	KVRetries      uint64
+	KVRedeliveries int64
+	KVRepliesLost  int64
+	// KVIdentities is how many distinct client ids sent mutations: one per
+	// workload client plus each kvadapter pool's sessions, NOT one per
+	// mutation.
+	KVIdentities int
+	SchedJobs    int
 	GatewayReq int
 	Violations []string // empty means the run passed
 	Elapsed    time.Duration

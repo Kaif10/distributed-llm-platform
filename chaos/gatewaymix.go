@@ -28,6 +28,7 @@ import (
 	gatewayv1 "dsys/gen/gateway/v1"
 	inferv1 "dsys/gen/infer/v1"
 	"dsys/infer/mock"
+	"dsys/kvapi"
 	"dsys/ratelimit"
 	"dsys/router"
 )
@@ -40,10 +41,10 @@ type gatewayMix struct {
 	panics   atomic.Int64
 }
 
-func newGatewayMix(cluster *kvCluster, sc Scenario) (*gatewayMix, error) {
+func newGatewayMix(kv kvapi.KV, sc Scenario) (*gatewayMix, error) {
 	m := &gatewayMix{}
-	reg := router.NewRegistry(cluster, router.Options{Prefix: "chaos-workers", CacheTTL: 50 * time.Millisecond})
-	lim := ratelimit.New(cluster, ratelimit.Options{Prefix: "chaos-rl", Rate: 1000, Burst: 1000})
+	reg := router.NewRegistry(kv, router.Options{Prefix: "chaos-workers", CacheTTL: 50 * time.Millisecond})
+	lim := ratelimit.New(kv, ratelimit.Options{Prefix: "chaos-rl", Rate: 1000, Burst: 1000})
 
 	for i := 0; i < sc.NumWorkers; i++ {
 		w := mock.New(mock.Options{
@@ -66,7 +67,7 @@ func newGatewayMix(cluster *kvCluster, sc Scenario) (*gatewayMix, error) {
 	}
 
 	m.gw = gateway.New(gateway.Options{
-		KV: cluster, Registry: reg, Limiter: lim,
+		KV: kv, Registry: reg, Limiter: lim,
 		PrefixRouting: true, HedgeAfter: 150 * time.Millisecond,
 		Dial: func(addr string) (inferv1.InferenceClient, error) {
 			cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))

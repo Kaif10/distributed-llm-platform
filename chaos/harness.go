@@ -2,35 +2,94 @@ package chaos
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/anishathalye/porcupine"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
+	"dsys/kv/client"
 	"dsys/kv/raftkv"
 	"dsys/raft"
 	"dsys/raft/simnet"
 	"dsys/sched"
 )
 
-// Run wires the stack described by sc, drives it for sc.Duration, and
-// checks every invariant this package knows how to check. See the package
-// doc for exactly what "seed-driven" does and does not guarantee.
-// waitClusterAvailable polls cluster with a trivial Get until it succeeds or
-// budget elapses, so the harness proceeds to checks exactly when the
-// cluster is actually ready rather than after a guessed sleep. ctx is the
-// run's parent context (runCtx, timed to sc.Duration, is already done by
-// the time this is called), used for the poll's own deadline.
+// panicLog collects panics recovered in ANY goroutine the harness starts.
+// recover() only catches a panic on its own goroutine, so every harness
+// goroutine defers guard itself (via goWG); each recovered panic becomes a
+// violation. Panics inside library-owned goroutines (e.g. the gateway's
+// per-attempt stream pumps) cannot be recovered from here: they crash the
+// test binary, which fails the run just as loudly.
+type panicLog struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+// guard must be deferred DIRECTLY (defer pl.guard(name)) so that its
+// recover() is called by the deferred function itself.
+func (p *panicLog) guard(name string) {
+	if r := recover(); r != nil {
+		p.mu.Lock()
+		p.msgs = append(p.msgs, fmt.Sprintf("%s: panic: %v\n%s", name, r, debug.Stack()))
+		p.mu.Unlock()
+	}
+}
+
+// goWG runs fn on a new goroutine under guard, tracked by wg if non-nil.
+func (p *panicLog) goWG(wg *sync.WaitGroup, name string, fn func()) {
+	if wg != nil {
+		wg.Add(1)
+	}
+	go func() {
+		if wg != nil {
+			defer wg.Done()
+		}
+		defer p.guard(name)
+		fn()
+	}()
+}
+
+func (p *panicLog) violations() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.msgs...)
+}
+
+// retryableKVErr reports whether err is a failure a KV client may
+// legitimately see under faults: its own deadline, or a transient gRPC
+// status kv/client gave up retrying. Anything else (FailedPrecondition from
+// a stale request id, InvalidArgument, Internal, Unknown) is a bug.
+func retryableKVErr(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	switch status.Code(err) {
+	case codes.Unavailable, codes.DeadlineExceeded, codes.Aborted, codes.Canceled:
+		return true
+	}
+	return false
+}
+
+// waitClusterAvailable polls cluster with a trivial Get (through the
+// production client) until it succeeds or budget elapses, so the harness
+// proceeds to checks exactly when the cluster is actually ready rather than
+// after a guessed sleep. ctx is the run's parent context (runCtx, timed to
+// sc.Duration, is already done by the time this is called), used for the
+// poll's own deadline.
 func waitClusterAvailable(ctx context.Context, cluster *kvCluster, budget time.Duration, logf func(string, ...any)) {
 	deadline := time.Now().Add(budget)
 	attempt := 0
 	for time.Now().Before(deadline) {
 		attempt++
 		pctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-		_, _, err := cluster.Get(pctx, "__chaos_availability_probe__")
+		_, _, err := cluster.client.Get(pctx, "__chaos_availability_probe__")
 		cancel()
 		if err == nil {
 			if attempt > 1 {
@@ -43,6 +102,9 @@ func waitClusterAvailable(ctx context.Context, cluster *kvCluster, budget time.D
 	logf("cluster did not answer within %s after the run ended; checks proceed anyway and may report it", budget)
 }
 
+// Run wires the stack described by sc, drives it for sc.Duration, and
+// checks every invariant this package knows how to check. See the package
+// doc for exactly what "seed-driven" does and does not guarantee.
 func Run(ctx context.Context, sc Scenario) (*Report, error) {
 	sc = sc.withDefaults()
 	rep := &Report{Seed: sc.Seed, Scenario: sc}
@@ -61,8 +123,17 @@ func Run(ctx context.Context, sc Scenario) (*Report, error) {
 			ElectionTimeoutMax: 500 * time.Millisecond,
 		},
 	}
-	cluster := newKVCluster(sc.NumKVNodes, net, kvcfg, sc.Seed^0x5EED1)
+	cluster, err := newKVCluster(sc.NumKVNodes, net, kvcfg, kvClusterOptions{
+		seed:                 sc.Seed ^ 0x5EED1,
+		replyLoss:            sc.ClientReplyLoss,
+		attemptTimeout:       time.Second,
+		freshMetaPerDelivery: sc.faults.kvFreshMeta,
+	})
+	if err != nil {
+		return nil, err
+	}
 	defer cluster.killAll()
+	pl := &panicLog{}
 
 	runCtx, cancel := context.WithTimeout(ctx, sc.Duration)
 	defer cancel()
@@ -71,14 +142,30 @@ func Run(ctx context.Context, sc Scenario) (*Report, error) {
 	var opCount atomic.Int64
 
 	// ---- Raw KV workload: builds a Porcupine operation history. --------
+	// Each logical client owns ONE kv/client Session for the whole run: one
+	// client id, request ids 1, 2, 3, ... across all of its operations, and
+	// kv/client's own retry loop (same RequestMeta on every attempt, leader
+	// hints, per-attempt timeouts) underneath each one. That is how a
+	// production caller holds an identity, and it is what makes the store's
+	// dedup table see a real per-identity sequence, including an abandoned
+	// request whose log entry commits after its caller has moved on (the
+	// store skips it as stale; Porcupine allows it because a failed op is
+	// pending forever).
 	var histMu sync.Mutex
 	var history []porcupine.Operation
+	var kvBadErrs []string
 	opStart := time.Now()
 
+	var shared *client.Client
+	if sc.faults.kvSharedSession {
+		shared = cluster.client.Session() // injected bug: one identity, many concurrent callers
+	}
 	for cid := 0; cid < sc.NumClients; cid++ {
-		wg.Add(1)
-		go func(cid int) {
-			defer wg.Done()
+		sess := shared
+		if sess == nil {
+			sess = cluster.client.Session()
+		}
+		pl.goWG(&wg, fmt.Sprintf("kv-client-%d", cid), func() {
 			r := rand.New(rand.NewSource(sc.Seed + int64(cid) + 1))
 			keys := []string{"a", "b", "c", "d", "e"}
 			for {
@@ -105,22 +192,28 @@ func Run(ctx context.Context, sc Scenario) (*Report, error) {
 				switch in.op {
 				case "get":
 					var v []byte
-					v, out.found, err = cluster.Get(octx, in.key)
+					v, out.found, err = sess.Get(octx, in.key)
 					out.value = string(v)
 				case "put":
-					err = cluster.Put(octx, in.key, []byte(in.value))
+					err = sess.Put(octx, in.key, []byte(in.value))
 				case "cas":
 					var cur []byte
-					out.swapped, cur, err = cluster.CAS(octx, in.key, []byte(in.expected), false, []byte(in.value))
+					out.swapped, cur, err = sess.CAS(octx, in.key, []byte(in.expected), false, []byte(in.value))
 					out.current = string(cur)
 				}
 				ocancel()
 				ret := time.Now()
 				if err != nil {
+					// Outcome unknown: the mutation may or may not have
+					// taken effect, so Porcupine sees it as pending
+					// "forever" (and a failed get constrains nothing).
 					out = kvOutput{failed: true}
-					ret = opStart.Add(sc.Duration + 10*time.Second) // pending "forever" for Porcupine
+					ret = opStart.Add(sc.Duration + 10*time.Second)
 				}
 				histMu.Lock()
+				if err != nil && !retryableKVErr(err) && len(kvBadErrs) < 5 {
+					kvBadErrs = append(kvBadErrs, fmt.Sprintf("kv: client %d %s(%s) got a non-retryable error: %v", cid, in.op, in.key, err))
+				}
 				history = append(history, porcupine.Operation{
 					ClientId: cid, Input: in, Output: out,
 					Call: call.Sub(opStart).Nanoseconds(), Return: ret.Sub(opStart).Nanoseconds(),
@@ -128,13 +221,13 @@ func Run(ctx context.Context, sc Scenario) (*Report, error) {
 				histMu.Unlock()
 				opCount.Add(1)
 			}
-		}(cid)
+		})
 	}
 
 	// ---- Scheduler workload, sharing the same disrupted KV. -------------
 	var sw *schedWorkload
 	if sc.IncludeScheduler {
-		sw = newSchedWorkload(cluster)
+		sw = newSchedWorkload(cluster.newAdapter())
 		reaperCtx, reaperCancel := context.WithCancel(ctx)
 		defer reaperCancel()
 		go func() {
@@ -151,7 +244,7 @@ func Run(ctx context.Context, sc Scenario) (*Report, error) {
 	var gwMix *gatewayMix
 	if sc.IncludeGateway {
 		var err error
-		gwMix, err = newGatewayMix(cluster, sc)
+		gwMix, err = newGatewayMix(cluster.newAdapter(), sc)
 		if err != nil {
 			return nil, fmt.Errorf("chaos: wiring gateway: %w", err)
 		}
@@ -166,9 +259,7 @@ func Run(ctx context.Context, sc Scenario) (*Report, error) {
 	// is fair to check invariants.
 	var pending sync.WaitGroup
 	if sc.NemesisInterval > 0 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		pl.goWG(&wg, "nemesis", func() {
 			nr := rand.New(rand.NewSource(sc.Seed ^ 0x7E3E515))
 			next := int64(sc.NemesisInterval/2 + nr.Intn(sc.NemesisInterval+1))
 			for {
@@ -192,7 +283,7 @@ func Run(ctx context.Context, sc Scenario) (*Report, error) {
 				histMu.Unlock()
 				logf("t+%s op#%d: %s node %d", time.Since(wallStart).Round(10*time.Millisecond), idx, ev.kind, ev.node)
 			}
-		}()
+		})
 	}
 
 	<-runCtx.Done()
@@ -235,12 +326,30 @@ func Run(ctx context.Context, sc Scenario) (*Report, error) {
 	// out on a cluster that was actually fine, not on a real bug. Budgets
 	// for unrelated phases must not share a clock.
 	res, info := porcupine.CheckOperationsVerbose(kvModel, history, 20*time.Second)
-	if res == porcupine.Illegal {
+	switch res {
+	case porcupine.Illegal:
+		rep.KVCheck = "illegal"
 		rep.Violations = append(rep.Violations, "kv: history is NOT linearizable")
 		_ = info // a caller wanting a visualisation can re-run CheckOperationsVerbose itself
-	} else if res == porcupine.Unknown {
+	case porcupine.Unknown:
+		rep.KVCheck = "unknown"
 		logf("kv: linearizability check timed out (inconclusive, not counted as a violation)")
+	default:
+		rep.KVCheck = "ok"
 	}
+	rep.Violations = append(rep.Violations, kvBadErrs...)
+	rep.KVRetries = cluster.client.Retries()
+	rep.KVRedeliveries = cluster.stats.redeliveries.Load()
+	rep.KVRepliesLost = cluster.stats.repliesLost.Load()
+	cluster.stats.mu.Lock()
+	rep.KVIdentities = len(cluster.stats.identities)
+	cluster.stats.mu.Unlock()
+	if n := cluster.stats.staleLive.Load(); n > 0 {
+		rep.Violations = append(rep.Violations, fmt.Sprintf(
+			"kv: %d mutation(s) rejected as stale while their caller still waited: a later request id of the same identity overtook an earlier, still-outstanding one", n))
+	}
+	logf("kv: ops=%d check=%s kv/client retries=%d mutation deliveries=%d redeliveries=%d replies lost=%d identities=%d",
+		len(history), rep.KVCheck, rep.KVRetries, cluster.stats.mutations.Load(), rep.KVRedeliveries, rep.KVRepliesLost, rep.KVIdentities)
 
 	if sw != nil {
 		checkCtx, checkCancel := context.WithTimeout(ctx, 30*time.Second)
@@ -254,6 +363,7 @@ func Run(ctx context.Context, sc Scenario) (*Report, error) {
 		rep.Violations = append(rep.Violations, gwMix.check()...)
 		logf("gateway: requests=%d errors=%d panics=%d", gwMix.requests.Load(), gwMix.errors.Load(), gwMix.panics.Load())
 	}
+	rep.Violations = append(rep.Violations, pl.violations()...)
 
 	return rep, nil
 }

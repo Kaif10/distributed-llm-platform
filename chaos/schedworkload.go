@@ -31,8 +31,8 @@ type schedWorkload struct {
 	fenced      atomic.Int64
 }
 
-func newSchedWorkload(cluster *kvCluster) *schedWorkload {
-	q := sched.New(cluster, sched.Options{
+func newSchedWorkload(kv sched.KV) *schedWorkload {
+	q := sched.New(kv, sched.Options{
 		Prefix:       "chaos-sched",
 		DefaultLease: 600 * time.Millisecond,
 		MaxAttempts:  1_000_000, // the harness checks "every job eventually DONE", not attempt limits

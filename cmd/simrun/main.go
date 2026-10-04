@@ -34,6 +34,7 @@ func main() {
 	scheduler := flag.Bool("scheduler", true, "run the scheduler workload alongside the raw KV workload")
 	gatewayMix := flag.Bool("gateway", false, "also mix in gateway + mock inference worker traffic")
 	workers := flag.Int("workers", 3, "inference workers when -gateway is set")
+	replyLoss := flag.Float64("reply-loss", 0.05, "probability an applied KV mutation's reply is dropped, forcing kv/client to retry it (dedup path); 0 disables")
 	quiet := flag.Bool("quiet", false, "alias for -nemesis-interval 0: a control run with no injected faults")
 	verbose := flag.Bool("v", true, "print each nemesis event as it happens")
 	flag.Parse()
@@ -51,6 +52,7 @@ func main() {
 		Seed: s, Duration: *duration, NumKVNodes: *nodes, NumClients: *clients,
 		NemesisInterval: interval, PauseDuration: *pauseDur,
 		IncludeScheduler: *scheduler, IncludeGateway: *gatewayMix, NumWorkers: *workers,
+		ClientReplyLoss: *replyLoss,
 	}
 	if *verbose {
 		sc.Logf = func(format string, args ...any) { log.Printf(format, args...) }
@@ -74,6 +76,8 @@ func main() {
 	fmt.Printf("\n--- report (wall time %s) ---\n", time.Since(start).Round(time.Millisecond))
 	fmt.Printf("kv ops: %d   scheduler jobs submitted: %d   gateway requests: %d   nemesis events: %d\n",
 		rep.KVOps, rep.SchedJobs, rep.GatewayReq, len(rep.Events))
+	fmt.Printf("kv check: %s   kv/client retries: %d   mutation redeliveries (dedup path): %d   replies dropped: %d   client identities: %d\n",
+		rep.KVCheck, rep.KVRetries, rep.KVRedeliveries, rep.KVRepliesLost, rep.KVIdentities)
 	for _, e := range rep.Events {
 		fmt.Printf("  op#%-5d %-10s node %d\n", e.Index, e.Kind, e.Node)
 	}
@@ -87,7 +91,7 @@ func main() {
 	for _, v := range rep.Violations {
 		fmt.Println("  -", v)
 	}
-	fmt.Printf("\nReproduce with:\n  simrun -seed %d -duration %s -nodes %d -clients %d -nemesis-interval %d -pause-duration %s -scheduler=%v -gateway=%v -workers %d\n",
-		rep.Seed, sc.Duration, sc.NumKVNodes, sc.NumClients, sc.NemesisInterval, sc.PauseDuration, sc.IncludeScheduler, sc.IncludeGateway, sc.NumWorkers)
+	fmt.Printf("\nReproduce with:\n  simrun -seed %d -duration %s -nodes %d -clients %d -nemesis-interval %d -pause-duration %s -scheduler=%v -gateway=%v -workers %d -reply-loss %g\n",
+		rep.Seed, sc.Duration, sc.NumKVNodes, sc.NumClients, sc.NemesisInterval, sc.PauseDuration, sc.IncludeScheduler, sc.IncludeGateway, sc.NumWorkers, sc.ClientReplyLoss)
 	os.Exit(1)
 }
