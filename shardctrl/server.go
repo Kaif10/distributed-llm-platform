@@ -45,27 +45,38 @@ type Config struct {
 	// Addrs, if set, maps peer id to a client-reachable address, used for
 	// leader hints in NotLeader errors.
 	Addrs []string
-	Raft  raft.Config
+	// MaxRaftState is the persisted Raft state size, in bytes, past which
+	// the replica snapshots and compacts its log. 0 means
+	// DefaultMaxRaftState; negative disables snapshots (tests only: the log
+	// then grows with every Query, forever).
+	MaxRaftState int
+	Raft         raft.Config
 }
+
+// DefaultMaxRaftState is the compaction threshold when Config.MaxRaftState
+// is 0. The same order as shardkv's default: large enough that compaction
+// is rare, small enough that re-persisting the log stays cheap.
+const DefaultMaxRaftState = 1 << 20
 
 // Server is one shard-controller replica. It implements
 // shardctrlv1.ShardCtrlServer.
 //
 // # On snapshotting
 //
-// Unlike raftkv, Server never calls rf.Snapshot(). A KV store's Raft log
-// grows with every client Get/Put, so it must be compacted to keep the log
-// (and the time to replay it after a restart) bounded. The controller's
-// log only grows with administrative operations — Join, Leave, Move, and
-// Query, which are also logged but produce no new Config — issued by
-// whoever operates the cluster, which in practice is orders of magnitude
-// rarer than client traffic. Its bounded-by-admin-activity log, and the
-// Machine's whole-history Snapshot/Restore (see machine.go), make
-// compaction unnecessary for the scope of this phase. InstallSnapshot
-// delivery is still handled below (a SnapshotValid message just calls
-// Machine.Restore), defensively, in case a future caller adds it — Raft's
-// contract permits a service to receive one at any time regardless of
-// whether that service ever calls Snapshot.
+// Server compacts its Raft log the same way raftkv does: after applying an
+// entry, if the persisted Raft state has grown past Config.MaxRaftState, it
+// hands Raft a Machine snapshot and lets it discard the log prefix.
+//
+// An earlier version skipped this on the theory that the controller's log
+// only grows with rare administrative operations. That theory is wrong
+// because Query is logged too (it must be, to be linearizable), and every
+// shardkv leader issues one per poll interval for as long as it runs. With
+// no compaction the log grew with uptime, and since Raft re-encodes its
+// whole log on every persist, every operation, Query included, got slower
+// with it until pollers' deadlines could no longer be met and groups
+// stopped seeing new configurations. The snapshot itself still carries the
+// full config history (see Machine.Snapshot), so it grows only with
+// Join/Leave/Move; what compaction bounds is the per-Query log growth.
 type Server struct {
 	shardctrlv1.UnimplementedShardCtrlServer
 
@@ -96,6 +107,9 @@ type outcome struct {
 func New(peers []raft.Peer, me int, persister raft.Persister, cfg Config) *Server {
 	if cfg.CommitTimeout <= 0 {
 		cfg.CommitTimeout = 3 * time.Second
+	}
+	if cfg.MaxRaftState == 0 {
+		cfg.MaxRaftState = DefaultMaxRaftState
 	}
 	s := &Server{
 		me:        me,
@@ -185,9 +199,25 @@ func (s *Server) applyLoop() {
 					w.ch <- outcome{err: ErrLeaderChanged}
 				}
 			}
+			s.maybeSnapshot(msg.CommandIndex)
 		}
 		s.mu.Unlock()
 	}
+}
+
+// maybeSnapshot compacts when Raft's persisted state has grown past the
+// threshold. Caller holds s.mu.
+func (s *Server) maybeSnapshot(index uint64) {
+	if s.cfg.MaxRaftState <= 0 || s.persister.StateSize() < s.cfg.MaxRaftState {
+		return
+	}
+	snap, err := s.m.Snapshot()
+	if err != nil {
+		panic(fmt.Sprintf("shardctrl: snapshot: %v", err))
+	}
+	// Raft may take its own lock here; it never calls back into us while
+	// holding it, so holding s.mu across this call is safe (as in raftkv).
+	s.rf.Snapshot(index, snap)
 }
 
 // ---------------------------------------------------------------------------

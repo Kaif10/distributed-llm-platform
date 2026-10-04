@@ -478,9 +478,9 @@ type snapshotImage struct {
 
 // Snapshot encodes the whole machine — every Config ever produced, and the
 // dedup table — into a byte slice Restore accepts. Unlike kv/store, we keep
-// full history (Query can ask for any past Num), so a snapshot here does
-// not shrink the state the way a KV snapshot does; see server.go for why
-// that is fine for a controller.
+// full history (Query can ask for any past Num), so a snapshot grows with
+// administrative activity (Join/Leave/Move). What it bounds is the Raft
+// LOG, which otherwise grows with every logged Query; see server.go.
 func (m *Machine) Snapshot() ([]byte, error) {
 	img := snapshotImage{
 		Version:  snapshotVersion,
