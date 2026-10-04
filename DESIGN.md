@@ -48,7 +48,10 @@ engineering, linearizability checking, distributed tracing, Prometheus metrics, 
 against real containers — and has none of the things that make software production software. It has
 never served real traffic. There is no authentication and no TLS: every connection is
 `insecure.NewCredentials()` and the tenant is a client-supplied string, so any client can spend any
-tenant's quota. No security review. No multi-machine durability story — every "3-node cluster" here
+tenant's quota. Raft and shard-transfer traffic does at least have its own listeners, separate from
+the client API: they used to share a port, and a forged vote request sent to a client port deposed
+the leader. With no authentication anywhere, the peer ports must sit on a private network. No
+security review. No multi-machine durability story — every "3-node cluster" here
 is three processes fsyncing to one laptop SSD, so one disk failure loses all three replicas. No
 deployment, upgrade, on-call or capacity story, no SLOs, and no GC anywhere (Phase 3's shard
 snapshots, Phase 4's completed job records and Phase 5's cache entries all leak by design). It has
@@ -181,12 +184,12 @@ The section to read first if you read only one.
 | KV op on a **sharded** cluster, migration included | **Linearizable for the key's whole lifetime.** Never two owners; never silently unreachable. | Ownership is a pure function of the controller's config; config changes and migrations are entries in the *same* log as client writes (`shardkv/raftcommand.go:12-16`); ownership is re-checked authoritatively at apply time (`shardkv/server.go:238-243`). `ErrWrongGroup` (`FailedPrecondition`, `:617-618`) = re-resolve; `ErrNotReady` (`Unavailable`, `:619-620`) = retry here shortly. |
 | Retry whose shard moved mid-flight | **Effectively-once, across the move.** | Dedup sessions belong to the *shard*, not the group: frozen into the outgoing snapshot with the data (`shardkv/server.go:275-282`) and installed by the new owner (`:307`). |
 | `shardctrl` Join/Leave/Move/Query | **Linearizable sequence of configurations**, full history queryable. | The controller is its own Raft group; `rebalance` (`shardctrl/machine.go:360`) is deterministic — no map iteration order, no history dependence — so replicas compute byte-identical configs. |
-| `sched.Submit` | **At-least-once admission with idempotency-key dedup**; bounded queue, shed at the door. | Record written before the `tail` bump so a crash leaves a detectable orphan the next Submit repairs (`sched/queue.go:177`); idempotency keys reserved with a leased placeholder (`:265`). Over quota: `ResourceExhausted` + `retry_after_ms`. |
+| `sched.Submit` | **At-least-once admission; with an idempotency key, at most one job per key ever runs.** Bounded queue, shed at the door. | An idempotent Submit writes its job STAGED (never claimable), binds the key to that id, then publishes it PENDING and bumps `tail`; a retry that finds the key bound finishes those steps. A half-failed submit can no longer create a second runnable job. Stale staged records are failed after 60 s so they cannot pin `head`. |
 | `sched` job execution | **At-least-once.** A job may run more than once. | Nothing prevents it and nothing can: a worker can finish and die before saying so, indistinguishable from never starting (`sched/api.go:30-39`). |
 | `sched.Complete` | **Exactly-once commit.** At most one accepted result per job, ever. | The fencing token: `gen` bumped on every change of hands (`sched/queue.go:373`, `:381`, `:512`, `:597`), checked by `checkHolder` (`:408`) before every worker write, made atomic with the write by a CAS against the exact bytes read (`:150`). A same-gen retry of an accepted `Complete` is an idempotent no-op success. |
 | End-to-end job side effects | **Effectively-once only if the handler is idempotent on `job.Id`.** | The queue's obligation ends at the commit; the handler's begins. Stated as a disclaimer, not a feature (`sched/api.go:30-39`). |
-| `Generate` rate-limit decision | **Hard burst bound, fuzzy rate.** A tenant can never hold more than `Burst` tokens at an instant, whatever the clock skew or gateway count. | One shared bucket per tenant; read-refill-decrement-**CAS** (`ratelimit/ratelimit.go:191`). Skew shifts how much has *refilled* (precision/liveness); the burst bound is enforced by the CAS'd value, not by time. |
-| `Generate` cache lookup | **Best-effort, and may serve a different prompt's answer.** | Exact path is a linearizable read of `sha256(normalised prompt)` (`semcache/semcache.go:170-172`), fleet-wide. The near path is a local similarity scan above a threshold, then a bounded edit-distance check against the stored prompt, so a near hit must be a small edit and not merely a similar-looking prompt. Cosine alone matched different questions sharing a long system prompt (0.93 vs a 0.92 threshold). The check is lexical, so "is X safe" / "is X unsafe" still match; which precision/recall point is acceptable is a product decision. A cache *failure* never fails the request (`gateway/server.go:296-300`). |
+| `Generate` rate-limit decision | **Never over-admits; may under-admit; fails open when the KV is down (configurable).** | One shared bucket per tenant, updated by CAS. Gateways lease up to 10% of a tenant's burst per CAS and spend it locally (`ratelimit.Options.LeaseFraction`); leased tokens have left the shared bucket, so the fleet can never admit more than the budget, but tokens stranded in another gateway's lease can be refused for up to `LeaseTTL`. Tiny budgets stay exact. A bucket's refill time only moves forward, so clock skew cannot re-credit elapsed time (it once let 4,000 requests through a 220 budget). If the KV is unavailable the limiter fails open (`-rl-fail-open`, default true) so a control-plane outage does not stop inference; contention still fails closed. |
+| `Generate` cache lookup | **Exact-match by default; tenant-scoped; a cached answer is always a complete stream.** | Every key is scoped by a hash of the tenant, then looked up as `sha256(normalised prompt)`, a linearizable read. Only a stream that reached `done` is stored, so a truncated answer can never be cached. Near-duplicate matching is opt-in (`-cache-near`): cosine similarity proposes, then a flat 3-character edit budget must confirm. That is lexical, so it cannot see meaning ("cat"/"car" is one edit); earlier, length-scaled versions served "capital of Spain?" the answer for "capital of France?". A cache *failure* never fails the request. |
 | `Generate` routing | **Best-effort placement, deterministic given the same live set.** | Rendezvous hashing (`router/router.go:283-284`) — every gateway computes the same answer with no coordination — plus load-aware spill (`:307`). Routing to a dead worker is survivable: the gateway falls back. |
 | `Generate` response | **At-least-once execution, exactly-once delivery of one attempt's stream.** | Hedging runs two attempts; the first to produce a token wins and the loser is cancelled (`gateway/server.go:489-495`). A client can never observe an interleaving. Safe only because generation has no side effects. |
 | Worker registration | **Best-effort liveness advertisement.** Stale entries are harmless. | A lease renewed by the worker (`py/infer_worker.py:328-329`); no failure detector — absence of renewal *is* the signal. No fence, because a registration grants no exclusive permission and there is nothing to corrupt. |
@@ -347,25 +350,36 @@ The poll loop is disciplined to one thing at a time (`:421`): while any shard is
 even ask for a newer config — otherwise a shard still in flight from config N could be reassigned
 under N+1 before arriving, and that vintage would be delivered nowhere.
 
-### 4.8 Reads through the log, not ReadIndex or lease reads
+### 4.8 ReadIndex reads, not lease reads (and not log reads any more)
 
-**Rejected (for now):** ReadIndex and lease reads. **Chosen:** propose `Get` as a log entry
-(`kv/raftkv/server.go:310`).
+**Chosen:** ReadIndex (Raft thesis §6.4, `raft/readindex.go`). **Rejected:** lease reads. **Was:** every
+`Get` proposed as a log entry.
 
-A local read breaks linearizability twice over. A follower may be behind — write on the leader, read
-on a follower, fail to see your own write. And a leader may have been deposed without knowing: a
-partitioned old leader keeps answering from a map the cluster has moved past. Putting the read in the
-log orders it after every write that committed before it and makes the deposed-leader case
-impossible, because the read commits only if this node still leads a majority. Comment out the
-propose and Porcupine finds the violation in seconds.
+A local read breaks linearizability twice over. A follower may be behind: write on the leader, read
+on a follower, and miss your own write. And a leader may have been deposed without knowing: a
+partitioned old leader keeps answering from a map the cluster has moved past. The original design put
+every read in the log, which rules out both trivially, at the highest per-operation price in the
+system: a consensus round plus an fsync on every node, per read. Once the gateway's hot path was
+measured, that price was the bottleneck: every request read a rate-limit bucket and a cache entry.
 
-The cost is the highest per-operation price in the system: one consensus round plus an fsync on every
-node, per read. Both cheaper options stay linearizable. *ReadIndex*: record `commitIndex`, confirm
-leadership with one heartbeat round, wait for `lastApplied` to catch up, answer locally — no entry,
-no fsync, one round trip. *Lease reads*: assume leadership holds for `electionTimeoutMin` after a
-successful heartbeat round — zero round trips, at the price of a real assumption about bounded clock
-drift. The chosen design pays the maximum to keep the correctness argument trivial and one explicit
-clock assumption out of the system.
+ReadIndex keeps linearizability without the log entry. The leader records `commitIndex`, confirms it
+is still leader by hearing from a majority in a heartbeat round that began after the read arrived,
+waits until its state machine has applied that index, then reads locally. One round trip, no entry,
+no fsync. Two details carry the correctness argument:
+
+- **A new leader must have committed in its own term.** Until then it cannot know its commit index
+  is final. Real implementations commit a no-op at the start of each term; this one returns
+  `ErrReadIndexNotReady` and the server falls back to a log read for those first moments.
+- **The confirmation round must start after the read.** Acks from earlier rounds prove nothing about
+  now. Each AppendEntries carries the round current when it was built, and a reply in the same term
+  records it.
+
+`TestReadIndexDeposedLeaderRefuses` isolates a leader and requires it to refuse. Removing the
+confirmation makes it serve the stale read, and the test fails.
+
+*Lease reads* (assume leadership holds for `electionTimeoutMin` after a heartbeat round: zero round
+trips) stay rejected. They trade one round trip for a real assumption about bounded clock drift, and
+this system has already been bitten once by trusting clocks (the rate limiter, §3).
 
 ### 4.9 Seeded chaos, not true virtual-time deterministic simulation
 
@@ -546,7 +560,8 @@ Scope limits, stated as limits rather than as future work quietly excused.
 - **No token-level rate limiting.** The bucket counts *requests*; real LLM APIs limit on tokens.
   Doing it properly needs reserve-at-admission / settle-at-end-of-stream, a leased reservation record,
   a reaper for gateways that die mid-request, and a decision about actual exceeding estimate.
-- **No ReadIndex or lease reads.** Every `Get` is a full consensus round (§4.8).
+- **No lease reads, and no start-of-term no-op.** Reads use ReadIndex (§4.8); a leader that has not
+  yet committed in its term serves reads through the log instead.
 - **No Raft membership changes.** Cluster membership is fixed at start-up: no joint consensus, no
   single-server add/remove, no learners. Replacing a dead node means restarting the cluster with a new
   peer list. Sharding moves *data* between fixed groups; it never changes a group's members.

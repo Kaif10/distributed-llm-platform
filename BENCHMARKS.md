@@ -290,6 +290,57 @@ is 100x that, so the naive scan is noise on the path it protects.
 
 ---
 
+### The gateway's own ceiling, and taking consensus off its hot path (2026-10-04)
+
+`scripts/bench_gateway.sh` measures what the gateway itself can sustain. Workers are Go mocks
+(`cmd/mockworker`) with near-zero latency, so they are never the bottleneck; 2,000 requests at 64
+concurrent, 3 trials per row, each on a fresh gateway, one laptop on battery. Every trial is shown,
+because the spread is part of the result.
+
+| Gateway path | Trials (req/s) | Mean | Median TTFT |
+|---|---|---|---|
+| Rate limiter, Raft before group commit | 27 (1 trial; trial 2 had 637 errors) | 27 | 1.6 s |
+| Rate limiter, after group commit, exact (one Get+CAS per request) | 284 / 200 / 204 | 229 | 87–202 ms |
+| Rate limiter, after group commit, **leased tokens** | 7,845 / 442 / 4,298 | 4,195 | 5–8 ms |
+| Limiter + cache, exact | 129 / 217 / 208 | 185 | 167–274 ms |
+| Limiter + cache, leased tokens | 258 / 909 / 767 | 645 | 61–132 ms |
+
+*What this shows.* Consensus on every request was the gateway's ceiling. Group commit in Raft took it
+from 27 to ~230 req/s, and leasing rate-limit tokens (one CAS per tenant per batch instead of per
+request) took the limiter-only path into the thousands. The spread is wide (442 to 7,845 across three
+trials of the same configuration) and the slow trial is not yet explained, so read this as "an order of
+magnitude, typically", not as a number. With the cache on, every request still writes its result
+through Raft, and that write is now the cost. These rows predate ReadIndex: cache and bucket reads
+also no longer go through the log.
+
+### Bounded-load routing: closing the A→B regression (2026-10-04)
+
+Same setup as the Phase 5 table (4 Python mock workers, 12 prefixes, 32-block caches, 240 requests),
+with a new phase B2: rendezvous hashing with bounded loads (`router.PickBounded`, load factor 1.25).
+A worker above 1.25× the fleet average is skipped and its overflow goes to the prefix's next-ranked
+worker, so the spill also builds a warm cache.
+
+| Run | Routing | Hit rate | TTFT p50 | TTFT p99 | req/s | Per-worker |
+|---|---|---|---|---|---|---|
+| A | least-loaded | 0.20 | 203 ms | 2724 ms | **19.9** | 70/68/70/32 |
+| B | pure affinity | **0.56** | 362 ms | 4062 ms | 10.8 | 15/21/114/90 |
+| B2 | bounded load (1.25) | **0.44** | **232 ms** | 3679 ms | **15.5** | 46/67/88/39 |
+
+*What this shows:* the bound recovers most of the throughput affinity lost (+43% over B) and keeps
+more than twice the baseline's cache hits. It is a point on a frontier, not a free win: B2 gives up
+some hit rate to buy balance, and the load factor is the dial. The e2e now fails if B2 does not beat B
+on throughput, or loses the hit-rate advantage over A. One run; the 1.25 factor was not tuned.
+
+### What the outside reviews changed in these numbers
+
+Two independent code reviews found bugs that affected measurements. The Phase 5 hedging win was mostly
+load-spreading (corrected above). The k6 run's checks were weaker than claimed (corrected in Phase 6).
+Rate limiting under clock skew had admitted 4,000 requests against a 220 budget, and no earlier
+benchmark ran with skewed clocks, so no published number was affected, but the limiter's guarantee
+was false until fixed. Each fix is in `DESIGN.md` §3 and the README's bug record.
+
+---
+
 ## Real model (`--backend hf`)
 
 Unlike every table above, these came from an actual language model:
