@@ -74,6 +74,40 @@ protocol minimum: the persister rewrites the whole log and snapshot per append, 
 group commit on the Raft path. What the 33x buys: an acknowledged write survives any one node's
 disk, and every future leader is guaranteed to hold it.
 
+### Raft group commit (2026-10-04)
+
+The second of those two costs is now fixed. Measuring the gateway's request ceiling showed the KV
+plateauing at ~200 ops/s **whatever the concurrency**: every `Start` and every follower append
+rewrote and fsynced the whole log while holding the Raft lock, so the cluster ran one write per
+fsync. Raft now does group commit: appends mark the state dirty, a background loop saves the newest
+state once per round without the lock, and every append that arrived during one fsync shares the
+next. Safety is unchanged: the leader counts itself toward a majority only for entries its save
+covers, followers acknowledge only after their save lands (re-checking term and log afterwards,
+since the lock was released), and votes and term changes are still saved synchronously.
+
+Same laptop, same power state (battery), `kvctl bench -n 2000`, 3 `raftkv` processes, one run each:
+
+| Concurrent clients | Before | After | p99 before → after |
+|---|---|---|---|
+| 1 | 117 ops/s | 95 ops/s | 15 → 22 ms |
+| 8 | 226 ops/s | 206 ops/s | 49 → 75 ms |
+| 32 | 191 ops/s | **809 ops/s** | 181 → 89 ms |
+| 64 | 192 ops/s | **1,385 ops/s** | 596 → **71 ms** |
+
+*What this shows:* the old ceiling was the persistence pattern, not consensus. With concurrent
+writers, one fsync now carries many entries: 7.2x the throughput at 64 clients, with p99 falling
+8x. A single client gains nothing, because group commit only helps when writes overlap. The 1- and
+8-client rows differ by about run-to-run noise. The persister still rewrites the whole log per save,
+so the cost per save grows with the log until a snapshot trims it; an append-only Raft log is the
+next step.
+
+Verified: the full Raft suite (Figure 8, unreliable churn, snapshots under crash), Porcupine
+linearizability for the replicated and sharded KV, and the scheduler's exactly-once test all pass
+under `-race`. Getting there exposed a race in the Raft **test harness**: a crashed instance's last
+apply message could be recorded against the restarted instance's fresh state and reported as a
+duplicate. The fix drops stale-instance messages and logs each drop, and the logged drops matched
+the original failure exactly.
+
 | Failure test | Result |
 |---|---|
 | `kill -9` the leader mid-bench | next write succeeded 66 ms after a ~2 s election |

@@ -380,6 +380,10 @@ func (c *cluster) applier(i int, rf *raft.Raft, applyCh chan raft.ApplyMsg, stop
 					continue
 				}
 				c.mu.Lock()
+				if stale(stop) {
+					c.mu.Unlock()
+					continue
+				}
 				err := c.ingestSnap(i, m.Snapshot, m.SnapshotIndex)
 				c.mu.Unlock()
 				if err != "" {
@@ -387,6 +391,11 @@ func (c *cluster) applier(i int, rf *raft.Raft, applyCh chan raft.ApplyMsg, stop
 				}
 			case m.CommandValid:
 				c.mu.Lock()
+				if stale(stop) {
+					c.mu.Unlock()
+					c.t.Logf("server %d: dropped apply of index %d from a crashed instance", i, m.CommandIndex)
+					continue
+				}
 				err := c.checkLogs(i, m)
 				var snap []byte
 				if c.snapshot && err == "" && m.CommandIndex%snapshotInterval == 0 {
@@ -405,6 +414,22 @@ func (c *cluster) applier(i int, rf *raft.Raft, applyCh chan raft.ApplyMsg, stop
 				c.recordApplyErr(i, "apply message with neither CommandValid nor SnapshotValid")
 			}
 		}
+	}
+}
+
+// stale reports whether this applier's instance has been crashed. Callers
+// hold c.mu, and crash1 closes stop under c.mu before start1 resets the
+// node's expected apply index, so checking here is race-free. Without it, a
+// message the old instance delivered just before crashing could be picked
+// by this goroutine's select (Go chooses randomly between ready cases) and
+// recorded against the NEW instance's fresh state, reporting a duplicate
+// apply that the restarted instance never made.
+func stale(stop <-chan struct{}) bool {
+	select {
+	case <-stop:
+		return true
+	default:
+		return false
 	}
 }
 

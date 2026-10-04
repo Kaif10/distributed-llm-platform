@@ -705,6 +705,38 @@ in opposite directions.
 
 ---
 
+### 8.6 Consensus capped at one write per fsync
+
+Measuring the gateway's request ceiling gave 27 req/s, far below what the KV's own benchmark
+suggested. Following it down, the replicated KV plateaued at ~200 ops/s from 8 to 64 concurrent
+clients: latency grew with the queue and throughput did not move. The Raft persister rewrote and
+fsynced the whole log on every `Start` and every follower append while holding `rf.mu`, so the
+cluster could do one write per fsync no matter how much work was waiting. Phase 1's store had group
+commit from the start; the Raft path never got it.
+
+The fix is group commit in Raft (`raft/raft.go` `persistLoop`). The safety argument is the part
+that needed care:
+
+- **Leader.** It may send entries before they are durable locally (Raft thesis §10.2.1), but its
+  own `matchIndex` advances only after the save covering them lands, and only if it is still
+  leader of the same term (a leader's log is append-only within its term).
+- **Follower.** It acknowledges only after a save covering the acknowledged entries lands. That
+  includes entries it merely *matched*, which a concurrent request may have appended and not yet
+  saved. Because it releases the lock while waiting, it re-checks afterwards that the term is
+  unchanged and the entries are still in its log.
+- **Votes and terms** are still saved synchronously before anyone acts on them.
+
+Result: 192 → 1,385 ops/s at 64 clients, with p99 596 → 71 ms (`BENCHMARKS.md`). The first full test
+run then hung in Figure 8, and a targeted repeat showed an "apply out of order" failure. That was a
+race in the test harness, not in Raft. The harness's apply checker for a crashed instance could be
+mid-`select` when the crash closed its stop channel, and record the dead instance's message against
+the restarted instance's reset counters. The fix checks for staleness under the harness lock, and
+it logs every message it drops, so the explanation was confirmed rather than assumed: the logged
+drops matched the original failure exactly.
+
+**The lesson.** A benchmark of the layer above found a bottleneck two layers down. And when a
+consensus change makes a test fail, find out which side is wrong before changing either.
+
 ## 9. How to run and verify it
 
 Activate the project-local toolchain first — everything lives under `.tools/` and `.venv/`, nothing is

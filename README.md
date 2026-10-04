@@ -108,6 +108,7 @@ Full context and conditions in [BENCHMARKS.md](BENCHMARKS.md). All on one 8 GB l
 |---|---|---|
 | Group commit | 1,082 → **11,312** puts/s | Amortizing fsync across a batch; p50 unchanged, so the win is throughput, not latency |
 | Cost of consensus | 11,312 → **339** puts/s | The same store replicated across 3 processes on the same disk. This ~33x gap is what consensus costs |
+| Raft group commit | 192 → **1,385** ops/s at 64 clients, p99 596 → 71 ms | The KV had been capped at one write per fsync whatever the concurrency; found by benchmarking the gateway above it |
 | Exactly-once under chaos | 2,000 jobs, 1,334 lease-expiry pauses, 1,124 crashes, **1,314 zombie writes fenced**, exactly 2,000 commits | No job ever committed twice |
 | Linearizable across shard moves | **3,191 ops, 3 groups, 0 violations** | Porcupine-clean while shards migrate live |
 | Prefix-aware routing | cache hit rate 0.20 → **0.60** | …and throughput got *worse* (20.4 → 13.4 req/s). Affinity balances prefixes, not load — see below |
@@ -188,6 +189,10 @@ The engineering record, not a highlight reel. Each is written up where it happen
   exposed it. The e2e now fails if hedges reach half the requests;
   [re-measured](BENCHMARKS.md#correction-2026-10-01-the-original-hedging-result-was-mostly-load-spreading)
   with the old numbers kept beside the correction.
+- **Consensus was capped at one write per fsync.** Benchmarking the gateway (27 req/s) led two
+  layers down to Raft rewriting and fsyncing its whole log per append, holding its lock.
+  Group commit took the KV from ~200 to 1,385 ops/s at 64 clients. Getting the tests green
+  then exposed a race in the Raft test harness itself; it was confirmed by logging rather than assumed.
 - **Real-model "prefill" included queueing**, timed from before the worker's model lock, and
   the mocks counted injected stalls as prefill. Both now report compute only.
 

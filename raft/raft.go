@@ -103,6 +103,23 @@ type Raft struct {
 	// trigger[i] nudges peer i's replicator to send now rather than at the
 	// next heartbeat. Buffered(1) so many nudges coalesce into one send.
 	trigger []chan struct{}
+
+	// Group commit. Writing the whole state and fsyncing it on every
+	// Start capped the cluster at one write per fsync (~200 ops/s on a
+	// laptop, whatever the concurrency). Instead, Start and follower
+	// appends mark the state dirty (persistSeq) and persistLoop saves the
+	// newest state once per round, so every append that arrived during one
+	// fsync shares the next. The safety rule is unchanged: an entry only
+	// counts toward a commit majority once it is durable on that server
+	// (the leader's own matchIndex advances only after its save lands, and
+	// a follower acknowledges only after its save lands). Votes and term
+	// changes are still saved synchronously before anyone acts on them.
+	persistMu   sync.Mutex // serialises persister.Save; never held while taking mu
+	persistSeq  uint64     // under mu: bumped whenever state needs saving
+	durableSeq  uint64     // under mu: highest persistSeq known to be on disk
+	savedSeq    uint64     // under persistMu: highest persistSeq written
+	persistKick chan struct{}
+	durableCond *sync.Cond // on mu; broadcast when durableSeq advances or on Kill
 }
 
 // New creates a Raft peer. peers[me] is unused. The peer starts as a
@@ -136,6 +153,8 @@ func New(peers []Peer, me int, persister Persister, applyCh chan<- ApplyMsg, cfg
 		trigger:    make([]chan struct{}, len(peers)),
 	}
 	rf.applyCond = sync.NewCond(&rf.mu)
+	rf.durableCond = sync.NewCond(&rf.mu)
+	rf.persistKick = make(chan struct{}, 1)
 	for i := range rf.trigger {
 		rf.trigger[i] = make(chan struct{}, 1)
 	}
@@ -145,6 +164,7 @@ func New(peers []Peer, me int, persister Persister, applyCh chan<- ApplyMsg, cfg
 
 	go rf.ticker()
 	go rf.applier()
+	go rf.persistLoop()
 	for i := range peers {
 		if i != me {
 			go rf.replicator(i)
@@ -185,10 +205,13 @@ func (rf *Raft) Start(command []byte) (uint64, uint64, bool) {
 	}
 	rf.log = append(rf.log, Entry{Term: rf.currentTerm, Command: command})
 	index := rf.lastIndex()
-	rf.matchIndex[rf.me] = index
-	rf.persist()
+	// Not durable yet, so matchIndex[me] does NOT move here: persistLoop
+	// advances it once the save that covers this entry has landed.
+	rf.persistLater()
 	rf.logf("start idx=%d term=%d", index, rf.currentTerm)
-	// Replicate immediately instead of waiting for the next heartbeat.
+	// Replicate immediately, in parallel with our own disk write (Raft
+	// thesis §10.2.1: the leader may send entries before they are durable
+	// locally, as long as it does not count itself until they are).
 	// Commit latency becomes one round trip instead of up to one heartbeat
 	// interval plus one round trip.
 	rf.broadcast()
@@ -203,6 +226,7 @@ func (rf *Raft) Kill() {
 		close(rf.done)
 		rf.mu.Lock()
 		rf.applyCond.Broadcast()
+		rf.durableCond.Broadcast() // release handlers waiting on a save
 		rf.mu.Unlock()
 	}
 }
@@ -349,6 +373,99 @@ type persistentState struct {
 // that reveals the change. The snapshot is saved alongside so the pair is
 // always consistent.
 func (rf *Raft) persist() {
+	rf.persistSeq++
+	seq := rf.persistSeq
+	rf.save(seq, rf.encodeState(), rf.snapshot)
+	rf.markDurable(seq)
+	// Everything in the log is on disk now, ours included.
+	if rf.role == leader && rf.lastIndex() > rf.matchIndex[rf.me] {
+		rf.matchIndex[rf.me] = rf.lastIndex()
+	}
+}
+
+// persistLater marks the state dirty and wakes persistLoop, without waiting.
+// Callers that must not act until the state is durable follow it with
+// waitDurable. Caller holds rf.mu.
+func (rf *Raft) persistLater() uint64 {
+	rf.persistSeq++
+	select {
+	case rf.persistKick <- struct{}{}:
+	default: // a save is already pending; it will pick this up
+	}
+	return rf.persistSeq
+}
+
+// waitDurable blocks (releasing rf.mu) until state version seq is on disk.
+// It returns false if the peer was killed first. Caller holds rf.mu.
+func (rf *Raft) waitDurable(seq uint64) bool {
+	for rf.durableSeq < seq && !rf.killed() {
+		rf.durableCond.Wait()
+	}
+	return !rf.killed()
+}
+
+// persistLoop is the group commit: each round it captures the newest state
+// under rf.mu, saves it WITHOUT holding rf.mu (so appends keep arriving and
+// queue for the next round), then publishes the new durable version.
+func (rf *Raft) persistLoop() {
+	for {
+		select {
+		case <-rf.done:
+			return
+		case <-rf.persistKick:
+		}
+		rf.mu.Lock()
+		if rf.persistSeq == rf.durableSeq {
+			rf.mu.Unlock()
+			continue
+		}
+		seq := rf.persistSeq
+		state, snap := rf.encodeState(), rf.snapshot
+		wasLeader, term, last := rf.role == leader, rf.currentTerm, rf.lastIndex()
+		rf.mu.Unlock()
+
+		rf.save(seq, state, snap)
+
+		rf.mu.Lock()
+		rf.markDurable(seq)
+		// Count ourselves toward the majority only now, and only if we are
+		// still the leader of the same term: a leader's log is append-only
+		// within its term, so everything up to `last` is in what we saved.
+		if wasLeader && rf.role == leader && rf.currentTerm == term && last > rf.matchIndex[rf.me] {
+			rf.matchIndex[rf.me] = last
+			rf.advanceCommitIndex()
+		}
+		rf.mu.Unlock()
+	}
+}
+
+// save writes state version seq unless a newer version is already on disk.
+// Saves from persist() (holding rf.mu) and persistLoop (not holding it) are
+// serialised by persistMu; the version check stops a slow older save from
+// overwriting a newer one.
+func (rf *Raft) save(seq uint64, state, snapshot []byte) {
+	rf.persistMu.Lock()
+	defer rf.persistMu.Unlock()
+	if seq <= rf.savedSeq {
+		return
+	}
+	if err := rf.persister.Save(state, snapshot); err != nil {
+		// Losing the ability to persist means we can no longer make
+		// promises. Crashing is the safe choice.
+		panic("raft: persist: " + err.Error())
+	}
+	rf.savedSeq = seq
+}
+
+// markDurable publishes that version seq is on disk. Caller holds rf.mu.
+func (rf *Raft) markDurable(seq uint64) {
+	if seq > rf.durableSeq {
+		rf.durableSeq = seq
+		rf.durableCond.Broadcast()
+	}
+}
+
+func (rf *Raft) encodeState() []byte {
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(persistentState{
 		CurrentTerm:       rf.currentTerm,
@@ -359,11 +476,7 @@ func (rf *Raft) persist() {
 	}); err != nil {
 		panic("raft: encode state: " + err.Error())
 	}
-	if err := rf.persister.Save(buf.Bytes(), rf.snapshot); err != nil {
-		// Losing the ability to persist means we can no longer make
-		// promises. Crashing is the safe choice.
-		panic("raft: persist: " + err.Error())
-	}
+	return buf.Bytes()
 }
 
 func (rf *Raft) readPersist(state, snapshot []byte) {

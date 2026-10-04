@@ -203,8 +203,41 @@ func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	logChanged := false
 	defer func() {
-		if termChanged || logChanged {
+		switch {
+		case termChanged:
+			// A new term is a promise (we will not vote again in it): save
+			// synchronously, as before. This also covers any log change.
 			rf.persist()
+		case logChanged:
+			rf.persistLater()
+		}
+		// Success tells the leader these entries are DURABLE here, and
+		// that is what it counts toward commit. Wait for the save that
+		// covers them, whichever request started it: entries we merely
+		// matched may have been appended by a concurrent AppendEntries
+		// whose save has not landed yet. waitDurable releases rf.mu, so
+		// concurrent appends coalesce into the same fsync.
+		if !reply.Success {
+			return
+		}
+		if !rf.waitDurable(rf.persistSeq) {
+			reply.Success = false // killed before the save landed
+			return
+		}
+		// rf.mu was released while waiting. A newer term may have begun and
+		// its leader may have truncated the very entries we are about to
+		// acknowledge (the old code could not see this: it saved while
+		// holding the lock). Acknowledge only if we are still in the same
+		// term and still hold the last entry this request covered.
+		lastNew := args.PrevLogIndex + uint64(len(args.Entries))
+		if rf.currentTerm != args.Term {
+			reply.Success = false
+			reply.Term = rf.currentTerm
+			return
+		}
+		if len(args.Entries) > 0 && lastNew > rf.lastIncludedIndex &&
+			(lastNew > rf.lastIndex() || rf.termAt(lastNew) != args.Entries[len(args.Entries)-1].Term) {
+			reply.Success = false
 		}
 	}()
 
