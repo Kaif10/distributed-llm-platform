@@ -90,7 +90,8 @@ LOGDIR=${LOGDIR:-/tmp/e2e_llm}
 rm -rf "$LOGDIR" data/e2ellm; mkdir -p "$LOGDIR"
 
 PY=.venv/Scripts/python.exe
-KV=127.0.0.1:7601,127.0.0.1:7602,127.0.0.1:7603
+KV=127.0.0.1:7601,127.0.0.1:7602,127.0.0.1:7603          # raftkv client addresses
+KVPEERS=127.0.0.1:17601,127.0.0.1:17602,127.0.0.1:17603  # raftkv peer-only Raft addresses
 GW=127.0.0.1:7650
 W_BASE=7660
 
@@ -124,7 +125,7 @@ make build >/dev/null
 
 step "start 3-node raftkv"
 for i in 0 1 2; do
-  ./bin/raftkv.exe -id $i -peers $KV -data data/e2ellm/kv$i >"$LOGDIR/kv$i.log" 2>&1 &
+  ./bin/raftkv.exe -id $i -peers $KVPEERS -client-addrs $KV -data data/e2ellm/kv$i >"$LOGDIR/kv$i.log" 2>&1 &
   pids+=($!)
 done
 sleep 2

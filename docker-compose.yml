@@ -7,13 +7,16 @@
 # Networking notes (verified against cmd/raftkv/main.go, cmd/sched/main.go,
 # cmd/gateway/main.go, py/infer_worker.py before writing this):
 #
-#   - raftkv derives ITS OWN listen address by indexing -id into -peers
-#     (net.Listen("tcp", addrs[id])); it does not have a separate -addr flag.
-#     Compose gives every service a DNS name matching the service name that
-#     resolves, from inside that very container, to that container's own IP
-#     - so "-peers kv0:7001,kv1:7001,kv2:7001 -id 0" makes kv0 listen on its
-#     own address exactly as the bare-metal "-peers 127.0.0.1:700x" example
-#     in the README does on one host.
+#   - raftkv derives ITS OWN two listen addresses by indexing -id into
+#     -peers (Raft, peer-only, :17001 here) and -client-addrs (KV API +
+#     gRPC health, :7001 here); it has no separate -addr flag. Compose gives
+#     every service a DNS name matching the service name that resolves, from
+#     inside that very container, to that container's own IP - so "-id 0
+#     -peers kv0:17001,... -client-addrs kv0:7001,..." makes kv0 listen on
+#     its own addresses exactly as the bare-metal 127.0.0.1 example in the
+#     README does on one host. Everything else (sched, gateway, kvctl) only
+#     ever uses the :7001 client addresses; nothing outside the kv nodes
+#     needs :17001, and no port is published to the host.
 #   - sched and gateway default -addr to 127.0.0.1:..., which would refuse
 #     connections from other containers; both are overridden to ":<port>"
 #     (all interfaces) below.
@@ -43,12 +46,16 @@ volumes:
   kv2-data:
 
 x-kv-healthcheck: &kv-healthcheck
-  # kvctl exits 0 on both a successful get of an EXISTING key and of a
-  # MISSING one (cmd/kvctl/main.go: `found` false just prints "(not found)"
-  # and err stays nil) - so this succeeds as soon as the 3-node cluster can
-  # serve a linearizable read, i.e. has a leader and quorum, without needing
-  # any data to be preloaded. Exec form: no shell required on distroless.
-  test: ["CMD", "/usr/local/bin/kvctl", "-addr", "kv0:7001,kv1:7001,kv2:7001", "-timeout", "3s", "get", "healthcheck-probe-key"]
+  # Per-node, not per-cluster: each kv service overrides `test` with
+  # `kvctl -addr <ITSELF>:7001 health`, which asks only that node (no
+  # failover, no leader-following) for its grpc.health.v1 status. The node
+  # answers from its own Raft state (cmd/internal/node/health.go): a leader
+  # is SERVING only if a read commits through it on a majority; a follower
+  # only if it currently knows a leader (Raft clears that the moment the
+  # node starts an election, which an isolated node keeps doing). The old
+  # check - a read against all three addresses - passed for kv0 even with
+  # kv0 dead, as long as kv1+kv2 had quorum. Exec form: no shell required
+  # on distroless.
   interval: 5s
   timeout: 4s
   retries: 20
@@ -62,26 +69,26 @@ services:
   kv0:
     image: dsys-go:local
     build: {context: ., dockerfile: docker/Dockerfile.services}
-    command: ["raftkv", "-id", "0", "-peers", "kv0:7001,kv1:7001,kv2:7001", "-data", "/data", "-v"]
+    command: ["raftkv", "-id", "0", "-peers", "kv0:17001,kv1:17001,kv2:17001", "-client-addrs", "kv0:7001,kv1:7001,kv2:7001", "-data", "/data", "-v"]
     volumes: ["kv0-data:/data"]
     networks: [dsysnet]
-    healthcheck: *kv-healthcheck
+    healthcheck: {<<: *kv-healthcheck, test: ["CMD", "/usr/local/bin/kvctl", "-addr", "kv0:7001", "-timeout", "3s", "health"]}
 
   kv1:
     image: dsys-go:local
     build: {context: ., dockerfile: docker/Dockerfile.services}
-    command: ["raftkv", "-id", "1", "-peers", "kv0:7001,kv1:7001,kv2:7001", "-data", "/data", "-v"]
+    command: ["raftkv", "-id", "1", "-peers", "kv0:17001,kv1:17001,kv2:17001", "-client-addrs", "kv0:7001,kv1:7001,kv2:7001", "-data", "/data", "-v"]
     volumes: ["kv1-data:/data"]
     networks: [dsysnet]
-    healthcheck: *kv-healthcheck
+    healthcheck: {<<: *kv-healthcheck, test: ["CMD", "/usr/local/bin/kvctl", "-addr", "kv1:7001", "-timeout", "3s", "health"]}
 
   kv2:
     image: dsys-go:local
     build: {context: ., dockerfile: docker/Dockerfile.services}
-    command: ["raftkv", "-id", "2", "-peers", "kv0:7001,kv1:7001,kv2:7001", "-data", "/data", "-v"]
+    command: ["raftkv", "-id", "2", "-peers", "kv0:17001,kv1:17001,kv2:17001", "-client-addrs", "kv0:7001,kv1:7001,kv2:7001", "-data", "/data", "-v"]
     volumes: ["kv2-data:/data"]
     networks: [dsysnet]
-    healthcheck: *kv-healthcheck
+    healthcheck: {<<: *kv-healthcheck, test: ["CMD", "/usr/local/bin/kvctl", "-addr", "kv2:7001", "-timeout", "3s", "health"]}
 
   sched:
     image: dsys-go:local

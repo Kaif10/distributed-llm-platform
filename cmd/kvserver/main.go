@@ -1,6 +1,6 @@
 // kvserver runs a single-node durable KV store over gRPC.
 //
-//	kvserver -addr :7001 -data ./data/node1
+//	kvserver -addr 127.0.0.1:7001 -data ./data/node1
 package main
 
 import (
@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -20,7 +21,7 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", ":7001", "listen address")
+	addr := flag.String("addr", "127.0.0.1:7001", "listen address (loopback by default, like every other server here; use :7001 to accept remote clients)")
 	dataDir := flag.String("data", "data/node1", "data directory")
 	noSync := flag.Bool("nosync", false, "disable fsync (UNSAFE: loses acknowledged writes on crash)")
 	flag.Parse()
@@ -39,7 +40,9 @@ func main() {
 	gs := grpc.NewServer()
 	kvv1.RegisterKVServer(gs, server.New(st))
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	// SIGTERM too: it is what `docker stop` (and systemd, k8s) sends, and
+	// without it the graceful path below never runs in a container.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() {
 		<-ctx.Done()

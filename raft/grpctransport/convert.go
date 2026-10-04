@@ -1,15 +1,19 @@
 package grpctransport
 
 import (
+	"fmt"
+
 	raftv1 "dsys/gen/raft/v1"
 	"dsys/raft"
 )
 
 // Conversions between the Go structs in package raft and the generated
 // protobuf messages. All functions are nil-safe: a nil input yields a nil
-// output. Byte slices are passed through (protobuf marshalling copies them on
-// the wire anyway); the Entries slice is always freshly allocated so the two
-// representations never alias each other's backing array.
+// output. The exception is a malformed ELEMENT inside an entries list, which
+// is an error (see entriesFromProto). Byte slices are passed through
+// (protobuf marshalling copies them on the wire anyway); the Entries slice is
+// always freshly allocated so the two representations never alias each
+// other's backing array.
 
 func entriesToProto(in []raft.Entry) []*raftv1.Entry {
 	if in == nil {
@@ -22,18 +26,27 @@ func entriesToProto(in []raft.Entry) []*raftv1.Entry {
 	return out
 }
 
-func entriesFromProto(in []*raftv1.Entry) []raft.Entry {
+// entriesFromProto rejects a nil element instead of mapping it to the zero
+// Entry, and rejects a term-0 entry for the same reason: no real leader sends
+// one (terms start at 1; index 0 is the sentinel and is never shipped), and
+// Raft would append it to the log as if it were genuine. The term check is
+// what catches this over the wire, where a nil element in a repeated field
+// is marshalled as an empty message and arrives as {Term: 0}.
+func entriesFromProto(in []*raftv1.Entry) ([]raft.Entry, error) {
 	if in == nil {
-		return nil
+		return nil, nil
 	}
 	out := make([]raft.Entry, len(in))
 	for i, e := range in {
 		if e == nil {
-			continue
+			return nil, fmt.Errorf("entries[%d] is nil", i)
+		}
+		if e.GetTerm() == 0 {
+			return nil, fmt.Errorf("entries[%d] has term 0", i)
 		}
 		out[i] = raft.Entry{Term: e.GetTerm(), Command: e.GetCommand()}
 	}
-	return out
+	return out, nil
 }
 
 func requestVoteArgsToProto(a *raft.RequestVoteArgs) *raftv1.RequestVoteRequest {
@@ -88,18 +101,22 @@ func appendEntriesArgsToProto(a *raft.AppendEntriesArgs) *raftv1.AppendEntriesRe
 	}
 }
 
-func appendEntriesArgsFromProto(p *raftv1.AppendEntriesRequest) *raft.AppendEntriesArgs {
+func appendEntriesArgsFromProto(p *raftv1.AppendEntriesRequest) (*raft.AppendEntriesArgs, error) {
 	if p == nil {
-		return nil
+		return nil, nil
+	}
+	entries, err := entriesFromProto(p.GetEntries())
+	if err != nil {
+		return nil, err
 	}
 	return &raft.AppendEntriesArgs{
 		Term:         p.GetTerm(),
 		LeaderID:     int(p.GetLeaderId()),
 		PrevLogIndex: p.GetPrevLogIndex(),
 		PrevLogTerm:  p.GetPrevLogTerm(),
-		Entries:      entriesFromProto(p.GetEntries()),
+		Entries:      entries,
 		LeaderCommit: p.GetLeaderCommit(),
-	}
+	}, nil
 }
 
 func appendEntriesReplyToProto(r *raft.AppendEntriesReply) *raftv1.AppendEntriesResponse {

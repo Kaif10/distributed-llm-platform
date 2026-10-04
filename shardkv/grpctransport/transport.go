@@ -4,11 +4,14 @@
 // traffic (RequestVote/AppendEntries/InstallSnapshot); this one carries the
 // ShardMigration service (proto/shardkv/v1) that lets one replica group
 // pull a shard's data OUT of another, unrelated, replica group. The two
-// never share a client or a server registration, even though both end up
-// multiplexed onto the same *grpc.Server in cmd/shardkv.
+// never share a client or a server registration; cmd/shardkv puts both on
+// its PEER listener (never the client one), because both are
+// unauthenticated replica-to-replica traffic.
 //
 //	// outbound: a fetcher tried against a source group's replica addresses
-//	fetcher := grpctransport.NewFetcher()
+//	// (WithPeerAddrs maps the client addresses the controller config
+//	// records to the peer addresses the migration service listens on)
+//	fetcher := grpctransport.NewFetcher(grpctransport.WithPeerAddrs(m))
 //	snap, ok, err := fetcher.PullShard(ctx, sourceAddrs, configNum, shardID)
 //
 //	// inbound: expose this replica's HandlePullShard on a grpc.Server
@@ -18,6 +21,7 @@ package grpctransport
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -61,12 +65,31 @@ func WithDialOptions(opts ...grpc.DialOption) Option {
 	return func(f *Fetcher) { f.dialOpts = append(f.dialOpts, opts...) }
 }
 
+// WithPeerAddrs makes PullShard translate each address it is given through
+// m before dialing. The addresses shardkv hands PullShard come from the
+// controller config, i.e. whatever was registered with Join: the groups'
+// CLIENT addresses, which is what clients need to find a key's group. The
+// ShardMigration service is deliberately not served there (it would let
+// any client dump a shard), only on each replica's peer address, so the
+// fetcher needs this client->peer map. An address missing from m is
+// skipped (and logged once): dialing the client port could never succeed.
+func WithPeerAddrs(m map[string]string) Option {
+	return func(f *Fetcher) {
+		f.peerAddrs = make(map[string]string, len(m))
+		for k, v := range m {
+			f.peerAddrs[k] = v
+		}
+	}
+}
+
 // Fetcher implements shardkv.ShardFetcher over gRPC. It lazily dials and
 // caches one connection per address it has ever been asked to try, shared
 // across calls and safe for concurrent use.
 type Fetcher struct {
-	timeout  time.Duration
-	dialOpts []grpc.DialOption
+	timeout   time.Duration
+	dialOpts  []grpc.DialOption
+	peerAddrs map[string]string // nil = dial as given; read-only after NewFetcher
+	unmapped  sync.Map          // client addresses already warned about
 
 	mu      sync.Mutex
 	conns   map[string]*grpc.ClientConn
@@ -128,6 +151,16 @@ func (f *Fetcher) PullShard(ctx context.Context, addrs []string, configNum int64
 	}
 	req := &shardkvv1.PullShardRequest{ConfigNum: configNum, Shard: int32(shardID)}
 	for _, addr := range addrs {
+		if f.peerAddrs != nil {
+			peer, ok := f.peerAddrs[addr]
+			if !ok {
+				if _, warned := f.unmapped.LoadOrStore(addr, true); !warned {
+					slog.Warn("shard pull: no peer address for source replica; add it to -peer-map", "client_addr", addr)
+				}
+				continue
+			}
+			addr = peer
+		}
 		c, err := f.getClient(addr)
 		if err != nil {
 			continue

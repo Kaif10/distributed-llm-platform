@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -58,7 +59,9 @@ func main() {
 		}
 	}()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	// SIGTERM too: it is what `docker stop` (and systemd, k8s) sends, and
+	// without it the graceful path below never runs in a container.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go registerLoop(ctx, strings.Split(*gwFlag, ","), *id, *addr, *leaseMs, w)
 

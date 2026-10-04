@@ -2,6 +2,7 @@ package grpctransport
 
 import (
 	"bytes"
+	"context"
 	"net"
 	"reflect"
 	"sync"
@@ -9,7 +10,11 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
+	raftv1 "dsys/gen/raft/v1"
 	"dsys/raft"
 )
 
@@ -251,7 +256,7 @@ func TestConcurrentCalls(t *testing.T) {
 			if !ok || r.Term != i+1 {
 				errs <- "bad RequestVote"
 			}
-			a, ok := p.AppendEntries(&raft.AppendEntriesArgs{Term: i, Entries: []raft.Entry{{Term: i, Command: []byte{byte(i)}}}})
+			a, ok := p.AppendEntries(&raft.AppendEntriesArgs{Term: i, Entries: []raft.Entry{{Term: i + 1, Command: []byte{byte(i)}}}}) // entry terms start at 1
 			if !ok || a.Term != i+1 {
 				errs <- "bad AppendEntries"
 			}
@@ -267,24 +272,77 @@ func TestConcurrentCalls(t *testing.T) {
 func TestConvertNilSafe(t *testing.T) {
 	if requestVoteArgsToProto(nil) != nil || requestVoteArgsFromProto(nil) != nil ||
 		requestVoteReplyToProto(nil) != nil || requestVoteReplyFromProto(nil) != nil ||
-		appendEntriesArgsToProto(nil) != nil || appendEntriesArgsFromProto(nil) != nil ||
+		appendEntriesArgsToProto(nil) != nil ||
 		appendEntriesReplyToProto(nil) != nil || appendEntriesReplyFromProto(nil) != nil ||
 		installSnapshotArgsToProto(nil) != nil || installSnapshotArgsFromProto(nil) != nil ||
 		installSnapshotReplyToProto(nil) != nil || installSnapshotReplyFromProto(nil) != nil {
 		t.Fatal("nil input must yield nil output")
 	}
-	if entriesToProto(nil) != nil || entriesFromProto(nil) != nil {
+	if a, err := appendEntriesArgsFromProto(nil); a != nil || err != nil {
+		t.Fatal("nil input must yield nil output")
+	}
+	if e, err := entriesFromProto(nil); entriesToProto(nil) != nil || e != nil || err != nil {
 		t.Fatal("nil entries must stay nil")
 	}
 }
 
 func TestEntriesCopied(t *testing.T) {
 	in := []raft.Entry{{Term: 1, Command: []byte("a")}, {Term: 2, Command: []byte("b")}}
-	out := entriesFromProto(entriesToProto(in))
+	out, err := entriesFromProto(entriesToProto(in))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !reflect.DeepEqual(in, out) {
 		t.Fatalf("round trip: %+v vs %+v", in, out)
 	}
 	if &in[0] == &out[0] {
 		t.Fatal("entries slice aliases input")
+	}
+}
+
+// A nil element in AppendEntries' entries is malformed input. It must be
+// rejected, not silently turned into a term-0 entry that Raft would then
+// append to its log as if a leader had really sent it.
+func TestAppendEntriesNilEntryRejected(t *testing.T) {
+	if _, err := entriesFromProto([]*raftv1.Entry{{Term: 1}, nil}); err == nil {
+		t.Fatal("entriesFromProto accepted a nil entry")
+	}
+
+	h := &fakeHandler{}
+	s := &server{h: h}
+	_, err := s.AppendEntries(context.Background(), &raftv1.AppendEntriesRequest{
+		Term:    3,
+		Entries: []*raftv1.Entry{{Term: 3, Command: []byte("ok")}, nil},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("err = %v, want InvalidArgument", err)
+	}
+	h.mu.Lock()
+	if h.ae != nil {
+		t.Fatalf("handler was called with %+v; malformed request must not reach Raft", h.ae)
+	}
+	h.mu.Unlock()
+
+	// Same through a real connection: whichever side catches it, the call
+	// must fail and the handler must never see a fabricated entry.
+	addr := startServer(t, h)
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err = raftv1.NewRaftClient(conn).AppendEntries(ctx, &raftv1.AppendEntriesRequest{
+		Term:    3,
+		Entries: []*raftv1.Entry{{Term: 3, Command: []byte("ok")}, nil},
+	})
+	if err == nil {
+		t.Fatal("AppendEntries with a nil entry succeeded over the wire")
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.ae != nil {
+		t.Fatalf("handler was called with %+v over the wire", h.ae)
 	}
 }

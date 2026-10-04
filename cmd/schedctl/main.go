@@ -43,7 +43,7 @@ const (
 var retryAfter = regexp.MustCompile(`retry_after_ms=(\d+)`)
 
 func main() {
-	addr := flag.String("sched", "127.0.0.1:7100", "scheduler address")
+	addr := flag.String("sched", "127.0.0.1:9001", "scheduler address (cmd/sched's default -addr)")
 	timeout := flag.Duration("timeout", 30*time.Second, "give up retrying a request after this long")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: schedctl [-sched host:port] [-timeout 30s] submit|status|stats|watch|bench ...")

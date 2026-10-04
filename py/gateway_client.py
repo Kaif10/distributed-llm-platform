@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from typing import Iterator
 
@@ -32,8 +33,6 @@ for _p in (_HERE, os.path.join(_HERE, "dsys_gateway")):
         sys.path.insert(0, _p)
 
 from dsys_gateway.gateway.v1 import gateway_pb2, gateway_pb2_grpc  # noqa: E402
-
-_TRANSIENT = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)
 
 
 class RateLimited(Exception):
@@ -47,8 +46,9 @@ class RateLimited(Exception):
 class GatewayClient:
     """Thin wrapper over GatewayStub across one or more gateway replicas.
 
-    Gateways are stateless (shared state is in the KV), so on a transient
-    failure we just move to the next address."""
+    Gateways are stateless (shared state is in the KV), so a stream that
+    fails with UNAVAILABLE before its first token moves to the next address
+    (see _FailoverStream)."""
 
     def __init__(self, addrs: str | list[str] = "localhost:7500") -> None:
         if isinstance(addrs, str):
@@ -63,21 +63,18 @@ class GatewayClient:
         return self._stubs[self._idx % len(self._stubs)]
 
     def start(self, prompt: str, tenant: str = "default", max_tokens: int = 32, no_cache: bool = False,
-              timeout: float | None = 60.0):
-        """Open the stream and return the call object (iterable of Token,
+              timeout: float | None = 60.0) -> "_FailoverStream":
+        """Open the stream and return a call-like handle (iterable of Token,
         with .cancel()). Use this when you need the handle; generate() is the
-        convenient form."""
+        convenient form.
+
+        A server-streaming call never fails when it is created: a dead
+        gateway only shows up as UNAVAILABLE on the first read. So failover
+        lives in the returned handle's iterator, not here."""
         req = gateway_pb2.GenerateRequest(tenant=tenant, prompt=prompt, max_tokens=max_tokens, no_cache=no_cache)
-        for _ in range(len(self._stubs)):
-            try:
-                call = self._stub().Generate(req, timeout=timeout)
-                self.last_call = call
-                return call
-            except grpc.RpcError as e:  # connection refused surfaces here or on first read
-                if e.code() not in _TRANSIENT:
-                    raise
-                self._idx += 1
-        raise ConnectionError(f"no gateway reachable among {self.addrs}")
+        call = _FailoverStream(self, req, timeout)
+        self.last_call = call
+        return call
 
     def generate(self, prompt: str, tenant: str = "default", max_tokens: int = 32,
                  no_cache: bool = False, timeout: float | None = 60.0) -> Iterator[gateway_pb2.Token]:
@@ -108,6 +105,57 @@ class GatewayClient:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+
+class _FailoverStream:
+    """A Generate stream that moves to the next gateway if the current one
+    fails with UNAVAILABLE BEFORE delivering any token (connection refused,
+    gateway down). After the first token it never fails over: restarting
+    the generation elsewhere would hand the caller duplicated output, so a
+    mid-stream error propagates. DEADLINE_EXCEEDED is not retried either:
+    the caller's whole timeout is already spent.
+
+    Behaves like the grpc call it wraps (iterate it, .cancel() it; other
+    attributes such as .code() are delegated to the current call)."""
+
+    def __init__(self, client: GatewayClient, req: gateway_pb2.GenerateRequest, timeout: float | None) -> None:
+        self._client, self._req, self._timeout = client, req, timeout
+        self._lock = threading.Lock()  # cancel() may come from another thread
+        self._cancelled = False
+        self._delivered = False
+        self._tried = 1
+        self._call = client._stub().Generate(req, timeout=timeout)
+
+    def __iter__(self) -> "_FailoverStream":
+        return self
+
+    def __next__(self) -> gateway_pb2.Token:
+        while True:
+            call = self._call
+            try:
+                tok = next(call)
+            except grpc.RpcError as e:
+                with self._lock:
+                    if (self._delivered or self._cancelled
+                            or e.code() != grpc.StatusCode.UNAVAILABLE):
+                        raise
+                    if self._tried >= len(self._client._stubs):
+                        raise ConnectionError(
+                            f"no gateway reachable among {self._client.addrs}: {e.details()}") from e
+                    self._client._idx += 1
+                    self._tried += 1
+                    self._call = self._client._stub().Generate(self._req, timeout=self._timeout)
+                continue
+            self._delivered = True
+            return tok
+
+    def cancel(self) -> bool:
+        with self._lock:
+            self._cancelled = True
+            return self._call.cancel()
+
+    def __getattr__(self, name: str):
+        return getattr(self._call, name)
 
 
 # -- demo -------------------------------------------------------------------
@@ -167,6 +215,9 @@ if __name__ == "__main__":
     except RateLimited as e:
         print(f"\nrate limited: {e.hint}")
         sys.exit(2)
+    except ConnectionError as e:
+        print(f"{e} (is a gateway running on {target}?)")
+        sys.exit(1)
     except grpc.RpcError as e:
         print(f"RPC failed: {e.code().name}: {e.details()} (is the gateway running on {target}?)")
         sys.exit(1)

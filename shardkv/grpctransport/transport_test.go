@@ -109,3 +109,27 @@ func TestPullShardAllUnreachableGivesOkFalseNilErr(t *testing.T) {
 		t.Fatalf("PullShard took %v, want at most roughly %v", elapsed, maxElapsed)
 	}
 }
+
+// The controller config records groups' CLIENT addresses, but the migration
+// service only listens on PEER addresses. WithPeerAddrs must dial the mapped
+// peer address, and must skip (not dial) an address it has no mapping for.
+func TestPullShardDialsMappedPeerAddress(t *testing.T) {
+	snap := []byte("pulled over the peer port")
+	peer := startServer(t, &fakeHandler{haveIt: true, snapshot: snap})
+	decoy := startServer(t, &fakeHandler{haveIt: true, snapshot: []byte("wrong: dialed the unmapped address")})
+
+	f := grpctransport.NewFetcher(grpctransport.WithPeerAddrs(map[string]string{"client-a:7001": peer}))
+	t.Cleanup(func() { _ = f.Close() })
+
+	got, ok, err := f.PullShard(context.Background(), []string{decoy, "client-a:7001"}, 1, 0)
+	if err != nil || !ok {
+		t.Fatalf("PullShard: ok=%v err=%v, want ok via the mapped peer address", ok, err)
+	}
+	if !bytes.Equal(got, snap) {
+		t.Fatalf("PullShard: got %q, want %q", got, snap)
+	}
+
+	if _, ok, _ := f.PullShard(context.Background(), []string{decoy}, 1, 0); ok {
+		t.Fatal("PullShard dialed an address with no peer mapping")
+	}
+}
