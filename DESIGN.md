@@ -547,6 +547,12 @@ Scope limits, stated as limits rather than as future work quietly excused.
   Doing it properly needs reserve-at-admission / settle-at-end-of-stream, a leased reservation record,
   a reaper for gateways that die mid-request, and a decision about actual exceeding estimate.
 - **No ReadIndex or lease reads.** Every `Get` is a full consensus round (§4.8).
+- **No Raft membership changes.** Cluster membership is fixed at start-up: no joint consensus, no
+  single-server add/remove, no learners. Replacing a dead node means restarting the cluster with a new
+  peer list. Sharding moves *data* between fixed groups; it never changes a group's members.
+- **No inference engine.** No continuous batching, no paged KV memory, no GPU scheduling. The real
+  backend runs one request at a time per worker, so this is a serving *gateway* in front of workers,
+  not an inference server.
 - **No virtual-time deterministic simulation.** Four honestly enumerated tiers (§4.9); the live
   nemesis schedule is best-effort and only the first event is guaranteed reproducible.
 - **No clock-skew or confirmed disk-pressure chaos.** Both attempted, both reported as not achieved

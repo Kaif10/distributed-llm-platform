@@ -1,4 +1,7 @@
-# dsys — a distributed LLM inference platform, built from the write-ahead log up
+# dsys — a Raft-backed control plane and LLM serving gateway, built from the write-ahead log up
+
+[![ci](https://github.com/Kaif10/distributed-llm-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/Kaif10/distributed-llm-platform/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A Raft-replicated, sharded control plane with a lease-and-fencing job scheduler and a
 stateless serving gateway doing rate limiting, semantic caching, prefix-aware routing and
@@ -217,8 +220,6 @@ make chaos-docker      # chaos against REAL containers (needs Docker Desktop)
 make obs-up            # Prometheus + Grafana + Jaeger   (make obs-down to stop)
 ```
 
-```
-
 ```bash
 source ./env.sh        # Git Bash equivalent
 ```
@@ -305,8 +306,6 @@ of chaos against real containers instead (partitions, crashes, `tc netem`
 latency/loss injection); `make obs-up` brings up Prometheus, Grafana, and Jaeger
 so a request's trace end to end (gateway → worker, or scheduler submit → complete)
 is one query away.
-
-Single-node server (Phase 1):
 
 ## Layout
 

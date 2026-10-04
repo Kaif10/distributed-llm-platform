@@ -155,6 +155,26 @@ reminder that a CAS-per-step design over consensus pays consensus latency per st
 
 ---
 
+## How much to trust these numbers
+
+Most tables below are **one run each**. They are reported as measured, not averaged, and the
+comparisons they support are the large ones (hit rate 0.20 → 0.60, p99 halving). Small differences
+between single runs are not evidence of anything. Specific weaknesses:
+
+- **Tail percentiles from small samples.** With 80 requests, p99 is essentially the slowest request
+  or two. The real-model p99s (12.3 s vs 9.7 s) are single draws, inside run-to-run noise.
+- **Closed-loop load.** `llmbench -c N` and the k6 script hold N requests in flight and send the next
+  only when one finishes. When the system slows, the offered load falls with it, which understates
+  tail latency (coordinated omission).
+- **Injected tails.** The hedging results depend on stalls injected on purpose
+  (`--stall-prob/--stall-ms`). They show the mechanism, not a measured production tail.
+- **One laptop.** Every process shares one CPU, one disk and one kernel. Absolute numbers do not
+  transfer; ratios inside one run do.
+
+Where a section below has been re-measured with repeated trials or open-loop load, it says so.
+
+---
+
 ## Phase 5 — LLM serving layer
 
 **Setup.** 3 `raftkv` + 1 `gateway` + 4 `py/infer_worker.py`, all separate OS processes over real
