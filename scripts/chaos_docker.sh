@@ -87,7 +87,8 @@ schedrun() { docker compose run --rm --no-deps sched schedctl -sched sched:9001 
 wait_healthy() { # $1 = service, $2 = deadline seconds from now
   local svc=$1 deadline=$((SECONDS+${2:-120}))
   while :; do
-    docker compose ps "$svc" 2>/dev/null | grep -qi 'healthy' && return 0
+    # '(healthy)', not 'healthy': the latter also matches "(unhealthy)".
+    docker compose ps "$svc" 2>/dev/null | grep -q '(healthy)' && return 0
     [ "$SECONDS" -gt "$deadline" ] && return 1
     sleep 2
   done

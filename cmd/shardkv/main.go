@@ -45,11 +45,13 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
 	"dsys/cmd/internal/node"
 	kvv1 "dsys/gen/kv/v1"
 	"dsys/raft"
 	raftgrpctransport "dsys/raft/grpctransport"
+	"dsys/shard"
 	"dsys/shardkv"
 	shardkvgrpctransport "dsys/shardkv/grpctransport"
 )
@@ -145,6 +147,9 @@ func main() {
 	shardkvgrpctransport.Register(peerGS, srv)     // other groups pulling shards
 	clientGS := grpc.NewServer(grpc.MaxRecvMsgSize(raftgrpctransport.MaxMessageSize))
 	kvv1.RegisterKVServer(clientGS, srv)
+	healthpb.RegisterHealthServer(clientGS, &node.Health{Raft: srv.Raft(), Me: *id, Probe: func(ctx context.Context) error {
+		return probeOwnedShard(ctx, srv)
+	}})
 
 	// SIGTERM too: it is what `docker stop` (and systemd, k8s) sends, and
 	// without it the graceful path below never runs in a container.
@@ -162,6 +167,37 @@ func main() {
 		*gid, *id, peerLis.Addr(), clientLis.Addr(), *dataDir, persister.StateSize(), ctrlAddrs)
 	if err := node.Serve(peerGS, peerLis, clientGS, clientLis); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// probeOwnedShard is the leader's health probe: a read of a key in a shard
+// this group owns, which must commit through this node's log. shardkv
+// rejects keys of shards it does not own (or has not finished migrating in)
+// BEFORE touching the log, so the key has to be chosen per shard. A group
+// that owns no shard yet (not joined) has nothing to read through; it is
+// then judged on leadership alone.
+func probeOwnedShard(ctx context.Context, srv *shardkv.Server) error {
+	cfg := srv.CurrentConfig()
+	var lastErr error
+	for s, owner := range cfg.Shards {
+		if owner != srv.GID() {
+			continue
+		}
+		_, err := srv.Get(ctx, &kvv1.GetRequest{Key: probeKey(s)})
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+	}
+	return lastErr
+}
+
+// probeKey returns a fixed key that hashes to shard s.
+func probeKey(s int) string {
+	for i := 0; ; i++ {
+		if k := "__health_probe_" + strconv.Itoa(i); shard.Key2Shard(k) == s {
+			return k
+		}
 	}
 }
 

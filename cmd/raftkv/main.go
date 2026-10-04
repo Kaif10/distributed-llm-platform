@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
 	"dsys/cmd/internal/node"
 	kvv1 "dsys/gen/kv/v1"
@@ -89,6 +90,12 @@ func main() {
 	grpctransport.Register(peerGS, srv.Raft())
 	clientGS := grpc.NewServer(grpc.MaxRecvMsgSize(grpctransport.MaxMessageSize))
 	kvv1.RegisterKVServer(clientGS, srv)
+	// Per-node health (kvctl -addr <this node> health): as leader, prove a
+	// read commits through this node; see node.Health for the rules.
+	healthpb.RegisterHealthServer(clientGS, &node.Health{Raft: srv.Raft(), Me: *id, Probe: func(ctx context.Context) error {
+		_, err := srv.Get(ctx, &kvv1.GetRequest{Key: "__health_probe"})
+		return err
+	}})
 
 	// SIGTERM too: it is what `docker stop` (and systemd, k8s) sends, and
 	// without it the graceful path below never runs in a container.

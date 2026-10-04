@@ -5,6 +5,7 @@
 //	kvctl [-addr ...] del <key>
 //	kvctl [-addr ...] cas <key> <expected|-> <value>   ("-" = expect absent)
 //	kvctl [-addr ...] bench [-n 1000] [-c 8]
+//	kvctl -addr <one node> [-timeout 3s] health          (that node's OWN status; exit 0 = SERVING)
 //
 // -addr is a comma-separated list of servers for a single flat cluster (one
 // Raft group holding the whole keyspace, as in Phase 2). -ctrl is a
@@ -33,6 +34,9 @@ import (
 
 	"dsys/kv/client"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 )
 
@@ -41,7 +45,7 @@ func main() {
 	ctrlFlag := flag.String("ctrl", "", "comma-separated shard controller addresses (sharded mode)")
 	timeout := flag.Duration("timeout", 10*time.Second, "give up retrying a request after this long")
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: kvctl (-addr host:port,... | -ctrl host:port,...) [-timeout 10s] put|get|del|cas|bench ...")
+		fmt.Fprintln(os.Stderr, "usage: kvctl (-addr host:port,... | -ctrl host:port,...) [-timeout 10s] put|get|del|cas|bench|health ...")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -52,6 +56,9 @@ func main() {
 
 	addrs := parseAddrs(*addrFlag)
 	ctrlAddrs := parseAddrs(*ctrlFlag)
+	if flag.Arg(0) == "health" {
+		os.Exit(health(addrs, *timeout))
+	}
 	if len(addrs) == 0 && len(ctrlAddrs) == 0 {
 		fatal(errors.New("exactly one of -addr or -ctrl is required"))
 	}
@@ -190,6 +197,36 @@ func bench(ctx context.Context, root *client.Client, args []string) error {
 	// covers all workers (and, in sharded mode, controller re-queries).
 	fmt.Printf("retries: %d\n", root.Retries())
 	return nil
+}
+
+// health asks exactly ONE node (raftkv, shardkv or shardctrl, at its client
+// address) for its own grpc.health.v1 status and exits 0 only on SERVING.
+// Deliberately no failover and no leader-following: the question is "is
+// THIS node healthy", which a request any majority could answer cannot
+// tell (see cmd/internal/node.Health for how a node decides).
+func health(addrs []string, timeout time.Duration) int {
+	if len(addrs) != 1 {
+		fmt.Fprintln(os.Stderr, "kvctl: health takes exactly one -addr (the node to check)")
+		return 2
+	}
+	conn, err := grpc.NewClient(addrs[0], grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "kvctl:", err)
+		return 1
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	resp, err := healthpb.NewHealthClient(conn).Check(ctx, &healthpb.HealthCheckRequest{})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "kvctl: health:", status.Convert(err).Message())
+		return 1
+	}
+	fmt.Println(resp.GetStatus())
+	if resp.GetStatus() != healthpb.HealthCheckResponse_SERVING {
+		return 1
+	}
+	return 0
 }
 
 func pick(cond bool, yes, no string) string {
