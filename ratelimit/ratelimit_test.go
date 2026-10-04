@@ -313,3 +313,41 @@ func TestLeasingSingleGatewayIsExact(t *testing.T) {
 		t.Fatalf("one leasing gateway admitted %d of a 400 budget, want exactly 400", n)
 	}
 }
+
+// Regression: two gateways whose clocks disagree by 200ms. refill() used to
+// set lastMs = now even when now < lastMs, so the slow-clock gateway moved
+// lastMs BACK and the fast-clock one then re-credited the same 200ms on its
+// next Take, every time: the limit was effectively gone. Skew may shift
+// WHEN tokens refill by the skew; it must not multiply the rate.
+func TestClockSkewDoesNotMultiplyRate(t *testing.T) {
+	const rate, burst = 10.0, 20.0
+	const skew = 200 * time.Millisecond
+	const simulated, step = 20 * time.Second, 10 * time.Millisecond
+	for _, fraction := range []float64{0, 0.2} {
+		kv := newMemKV()
+		slow, fast := &fakeClock{}, &fakeClock{}
+		slow.ms.Store(1_700_000_000_000)
+		fast.ms.Store(1_700_000_000_000 + skew.Milliseconds())
+		a := New(kv, Options{Rate: rate, Burst: burst, Clock: slow.now, LeaseFraction: fraction})
+		b := New(kv, Options{Rate: rate, Burst: burst, Clock: fast.now, LeaseFraction: fraction})
+		admitted := 0
+		for elapsed := time.Duration(0); elapsed < simulated; elapsed += step {
+			for _, l := range []*Limiter{a, b} {
+				ok, _, err := l.Take(bg, "t", 1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if ok {
+					admitted++
+				}
+			}
+			slow.advance(step)
+			fast.advance(step)
+		}
+		want := burst + rate*simulated.Seconds()
+		t.Logf("lease fraction %.1f: admitted %d over %v (budget %.0f = burst + rate x time)", fraction, admitted, simulated, want)
+		if float64(admitted) > 1.2*want || float64(admitted) < 0.8*want {
+			t.Fatalf("lease fraction %.1f: admitted %d with %v clock skew, want within 20%% of %.0f", fraction, admitted, skew, want)
+		}
+	}
+}
