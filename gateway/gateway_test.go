@@ -21,6 +21,7 @@ import (
 	"dsys/infer/mock"
 	"dsys/ratelimit"
 	"dsys/router"
+	"dsys/semcache"
 )
 
 // ---------------------------------------------------------------------------
@@ -617,5 +618,57 @@ func TestConcurrentLoad(t *testing.T) {
 	t.Logf("40 concurrent requests: %+v", st)
 	if st.Requests != 40 {
 		t.Fatalf("requests=%d", st.Requests)
+	}
+}
+
+// Cache entries must be scoped by tenant: tenant B must never be served a
+// completion that was generated (and paid for, and possibly personalised)
+// for tenant A, even for a byte-identical prompt.
+func TestCacheIsIsolatedPerTenant(t *testing.T) {
+	c := newFakeCache()
+	h := newHarness(t, 1, Options{PrefixRouting: true, Cache: c}, func(int) mock.Options {
+		return mock.Options{BasePrefillMs: 1, PrefillPerChar: 0, TokenMs: 1}
+	})
+	const prompt = "summarise my private notes"
+	if _, first, err := h.generate(bg, prompt, "tenant-a", 4, false); err != nil || first.Cached {
+		t.Fatalf("tenant A first request: first=%+v err=%v", first, err)
+	}
+	_, first, err := h.generate(bg, prompt, "tenant-b", 4, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Cached {
+		t.Fatal("tenant B was served tenant A's cached completion for the same prompt")
+	}
+	if _, first, err := h.generate(bg, prompt, "tenant-a", 4, false); err != nil || !first.Cached {
+		t.Fatalf("tenant A repeat should be a cache hit: first=%+v err=%v", first, err)
+	}
+}
+
+// The same isolation against the real semcache with its near path ON, which
+// normalises case/whitespace and accepts keys a few edits apart: tenant ids
+// that differ by one character or only by case must still not share.
+func TestCacheIsIsolatedPerTenantWithRealNearCache(t *testing.T) {
+	kv := newMemKV()
+	c := semcache.New(kv, semcache.NewNGramEmbedder(0), semcache.Options{Near: true})
+	h := newHarness(t, 1, Options{PrefixRouting: true, Cache: c}, func(int) mock.Options {
+		return mock.Options{BasePrefillMs: 1, PrefillPerChar: 0, TokenMs: 1}
+	})
+	const prompt = "summarise my private notes"
+	if _, _, err := h.generate(bg, prompt, "tenant-a", 4, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, other := range []string{"tenant-b", "Tenant-a", "tenant-a "} {
+		_, first, err := h.generate(bg, prompt, other, 4, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first.Cached {
+			t.Fatalf("tenant %q was served tenant-a's cached completion", other)
+		}
+	}
+	// Within a tenant, a one-character typo is still a near hit.
+	if _, first, err := h.generate(bg, "summarize my private notes", "tenant-a", 4, false); err != nil || !first.Cached {
+		t.Fatalf("same-tenant near duplicate should hit: first=%+v err=%v", first, err)
 	}
 }

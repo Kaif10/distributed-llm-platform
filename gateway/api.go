@@ -22,7 +22,7 @@
 // admitting "the last token" at the same instant cannot both succeed.
 //
 // The cache comes second because a hit costs one KV read and no GPU. Its
-// shared state (prompt hash -> answer) is in the KV so a hit on one replica
+// shared state ((tenant, prompt) hash -> answer) is in the KV so a hit on one replica
 // is a hit on all; only the vector index for near-duplicates is local.
 //
 // Routing by prompt prefix exists because modern inference servers (vLLM,

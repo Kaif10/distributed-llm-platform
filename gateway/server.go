@@ -14,6 +14,8 @@ package gateway
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
@@ -282,10 +284,11 @@ func (s *Server) Generate(req *gatewayv1.GenerateRequest, stream grpc.ServerStre
 		rlSpan.End()
 	}
 
-	// 2. Semantic cache. A hit costs one KV read and no GPU.
+	// 2. Semantic cache. A hit costs one KV read and no GPU. Keyed by
+	// tenant as well as prompt; see cacheKey.
 	if s.opts.Cache != nil && !req.NoCache {
 		ccCtx, ccSpan := obs.Tracer("gateway").Start(ctx, "gateway.cache_lookup")
-		text, hit, err := s.opts.Cache.Lookup(ccCtx, req.Prompt)
+		text, hit, err := s.opts.Cache.Lookup(ccCtx, cacheKey(tenant, req.Prompt))
 		ccSpan.SetAttributes(attribute.Bool("cache_hit", hit))
 		ccSpan.End()
 		if err == nil && hit {
@@ -336,6 +339,24 @@ func (s *Server) Generate(req *gatewayv1.GenerateRequest, stream grpc.ServerStre
 
 	// 4. Stream, with hedging.
 	return s.streamFromWorkers(ctx, stream, req, tenant, maxTokens, prefix, live, primary, started)
+}
+
+// cacheKey is what the gateway hands the Cache as "the prompt": the prompt
+// qualified by tenant, so one tenant can never be served a completion that
+// was generated for another (a cross-tenant data leak, not just a stale
+// answer). Doing it here keeps the Cache interface tenant-agnostic.
+//
+// The tenant goes in as a hex SHA-256, not verbatim, because the cache does
+// not treat its key as opaque bytes: semcache lowercases and collapses
+// whitespace (so tenants "Acme" and "acme" would merge), and its opt-in near
+// path matches keys within a few character edits (so "tenant-a" and
+// "tenant-b" would be one edit apart). Two different tenants' digests differ
+// in ~60 of 64 lowercase hex characters, which survives normalisation and is
+// far outside any near-duplicate budget, while within one tenant the prefix
+// is identical and near matching behaves exactly as before.
+func cacheKey(tenant, prompt string) string {
+	sum := sha256.Sum256([]byte(tenant))
+	return "tenant:" + hex.EncodeToString(sum[:]) + "\n" + prompt
 }
 
 // streamCached replays a cached completion as a token stream, so a cache
@@ -542,7 +563,7 @@ func (s *Server) streamFromWorkers(
 			}
 			// Clean end of stream.
 			if s.opts.Cache != nil && !req.NoCache && len(full) > 0 {
-				_ = s.opts.Cache.Store(ctx, req.Prompt, string(full))
+				_ = s.opts.Cache.Store(ctx, cacheKey(tenant, req.Prompt), string(full))
 			}
 			return nil
 		case tok := <-winner.tokens:
@@ -558,7 +579,7 @@ func (s *Server) streamFromWorkers(
 			}
 			if tok.Done {
 				if s.opts.Cache != nil && !req.NoCache && len(full) > 0 {
-					_ = s.opts.Cache.Store(ctx, req.Prompt, string(full))
+					_ = s.opts.Cache.Store(ctx, cacheKey(tenant, req.Prompt), string(full))
 				}
 				return nil
 			}
