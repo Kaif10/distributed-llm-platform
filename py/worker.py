@@ -170,7 +170,7 @@ def demo_handler(job: sched_pb2.Job, fenced: threading.Event) -> bytes:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    target = sys.argv[1] if len(sys.argv) > 1 else "localhost:7100"
+    target = sys.argv[1] if len(sys.argv) > 1 else "localhost:9001"
     w = SchedWorker(target, demo_handler, lease_ms=int(os.environ.get("LEASE_MS", "10000")))
     log.info("worker %s pulling from %s", w.name, target)
     stop = threading.Event()

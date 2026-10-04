@@ -3,7 +3,7 @@
 // {"sleep_ms": N, "echo": "..."} (anything that is not JSON sleeps 100ms)
 // and returns {"echo": "...", "worker": "<name>"} as the result.
 //
-//	worker -sched 127.0.0.1:7100 [-name w1] [-concurrency 1] [-lease 10s]
+//	worker -sched 127.0.0.1:9001 [-name w1] [-concurrency 1] [-lease 10s]
 //
 // # The "pause a worker past its lease" experiment
 //
@@ -11,18 +11,18 @@
 // confirm it is fenced. -slow-after n makes the handler sleep 3x the lease
 // on the (n+1)th job; -suppress-heartbeat stops the worker renewing leases.
 // Together they simulate a worker that was SIGSTOPped or GC-paused across
-// its lease and does not know it. With the scheduler on :7100:
+// its lease and does not know it. With the scheduler on :9001:
 //
 //	# terminal 1: a healthy worker that will pick up whatever is reaped
-//	worker -sched 127.0.0.1:7100 -name healthy -lease 2s
+//	worker -sched 127.0.0.1:9001 -name healthy -lease 2s
 //
 //	# terminal 2: the worker that will become a zombie on its 2nd job
-//	worker -sched 127.0.0.1:7100 -name zombie -lease 2s -slow-after 1 -suppress-heartbeat
+//	worker -sched 127.0.0.1:9001 -name zombie -lease 2s -slow-after 1 -suppress-heartbeat
 //
 //	# terminal 3: give them work, then watch
-//	schedctl -sched 127.0.0.1:7100 submit '{"sleep_ms":10,"echo":"a"}'
-//	schedctl -sched 127.0.0.1:7100 submit '{"sleep_ms":10,"echo":"b"}'
-//	schedctl -sched 127.0.0.1:7100 watch 2
+//	schedctl -sched 127.0.0.1:9001 submit '{"sleep_ms":10,"echo":"a"}'
+//	schedctl -sched 127.0.0.1:9001 submit '{"sleep_ms":10,"echo":"b"}'
+//	schedctl -sched 127.0.0.1:9001 watch 2
 //
 // What you should see: zombie claims job 2 at gen 1 and goes quiet for 6s
 // with no heartbeats; ~2s in the reaper hands job 2 to healthy at a higher
@@ -54,7 +54,7 @@ import (
 )
 
 func main() {
-	addr := flag.String("sched", "127.0.0.1:7100", "scheduler address")
+	addr := flag.String("sched", "127.0.0.1:9001", "scheduler address (cmd/sched's default -addr)")
 	name := flag.String("name", "", "worker name (default hostname-pid)")
 	concurrency := flag.Int("concurrency", 1, "jobs to run in parallel")
 	lease := flag.Duration("lease", 10*time.Second, "lease to request; heartbeats every lease/3")

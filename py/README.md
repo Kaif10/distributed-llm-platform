@@ -34,7 +34,7 @@ so `client.py` adds `py/dsys_kv` to `sys.path` before importing.
 
 ## Run the demo
 
-Start the Go server in one terminal (e.g. `go run ./cmd/kvserver`, listening on `:7001`), then:
+Start the Go server in one terminal (e.g. `go run ./cmd/kvserver`, listening on `127.0.0.1:7001`), then:
 
 ```
 python py/client.py            # defaults to localhost:7001
@@ -71,7 +71,7 @@ Regenerate stubs after editing the proto (output lands in `py/dsys_sched/sched/v
 python -m grpc_tools.protoc -I proto --python_out=py/dsys_sched --grpc_python_out=py/dsys_sched --pyi_out=py/dsys_sched proto/sched/v1/sched.proto
 ```
 
-Run the demo worker against a scheduler (defaults to `localhost:7100`; `LEASE_MS` overrides the lease):
+Run the demo worker against a scheduler (defaults to `localhost:9001`; `LEASE_MS` overrides the lease):
 
 ```
 python py/worker.py host:port
@@ -88,7 +88,7 @@ from worker import SchedWorker
 def handle(job, fenced) -> bytes:
     return job.payload.upper()
 
-SchedWorker("localhost:7100", handle, name="py-1", lease_ms=5000).run()
+SchedWorker("localhost:9001", handle, name="py-1", lease_ms=5000).run()
 ```
 
 ## Inference worker and gateway client (`infer.v1`, `gateway.v1`)
