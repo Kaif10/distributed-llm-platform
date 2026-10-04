@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 	"dsys/infer/mock"
 	"dsys/ratelimit"
 	"dsys/router"
+	"dsys/semcache"
 )
 
 // ---------------------------------------------------------------------------
@@ -617,5 +619,354 @@ func TestConcurrentLoad(t *testing.T) {
 	t.Logf("40 concurrent requests: %+v", st)
 	if st.Requests != 40 {
 		t.Fatalf("requests=%d", st.Requests)
+	}
+}
+
+// Cache entries must be scoped by tenant: tenant B must never be served a
+// completion that was generated (and paid for, and possibly personalised)
+// for tenant A, even for a byte-identical prompt.
+func TestCacheIsIsolatedPerTenant(t *testing.T) {
+	c := newFakeCache()
+	h := newHarness(t, 1, Options{PrefixRouting: true, Cache: c}, func(int) mock.Options {
+		return mock.Options{BasePrefillMs: 1, PrefillPerChar: 0, TokenMs: 1}
+	})
+	const prompt = "summarise my private notes"
+	if _, first, err := h.generate(bg, prompt, "tenant-a", 4, false); err != nil || first.Cached {
+		t.Fatalf("tenant A first request: first=%+v err=%v", first, err)
+	}
+	_, first, err := h.generate(bg, prompt, "tenant-b", 4, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Cached {
+		t.Fatal("tenant B was served tenant A's cached completion for the same prompt")
+	}
+	if _, first, err := h.generate(bg, prompt, "tenant-a", 4, false); err != nil || !first.Cached {
+		t.Fatalf("tenant A repeat should be a cache hit: first=%+v err=%v", first, err)
+	}
+}
+
+// The same isolation against the real semcache with its near path ON, which
+// normalises case/whitespace and accepts keys a few edits apart: tenant ids
+// that differ by one character or only by case must still not share.
+func TestCacheIsIsolatedPerTenantWithRealNearCache(t *testing.T) {
+	kv := newMemKV()
+	c := semcache.New(kv, semcache.NewNGramEmbedder(0), semcache.Options{Near: true})
+	h := newHarness(t, 1, Options{PrefixRouting: true, Cache: c}, func(int) mock.Options {
+		return mock.Options{BasePrefillMs: 1, PrefillPerChar: 0, TokenMs: 1}
+	})
+	const prompt = "summarise my private notes"
+	if _, _, err := h.generate(bg, prompt, "tenant-a", 4, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, other := range []string{"tenant-b", "Tenant-a", "tenant-a "} {
+		_, first, err := h.generate(bg, prompt, other, 4, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first.Cached {
+			t.Fatalf("tenant %q was served tenant-a's cached completion", other)
+		}
+	}
+	// Within a tenant, a one-character typo is still a near hit.
+	if _, first, err := h.generate(bg, "summarize my private notes", "tenant-a", 4, false); err != nil || !first.Cached {
+		t.Fatalf("same-tenant near duplicate should hit: first=%+v err=%v", first, err)
+	}
+}
+
+// Regression: with a worker that produces tokens faster than they are
+// forwarded (here: instantly, and the client reads slowly), the forwarding
+// loop must deliver every token in order and only then cache the full text.
+// It used to select between "more tokens" and "worker finished" with both
+// ready, pick "finished" at random, return with tokens still buffered, and
+// Store the truncated text.
+func TestSlowClientGetsEveryTokenAndCacheGetsFullText(t *testing.T) {
+	const nTok, iters = 64, 200
+	c := newFakeCache()
+	h := newHarness(t, 1, Options{PrefixRouting: true, Cache: c}, func(int) mock.Options {
+		return mock.Options{
+			BasePrefillMs: 1, PrefillPerChar: 0, TokenMs: 1,
+			// No real sleeping: the worker emits all 64 tokens at once.
+			Sleep: func(ctx context.Context, _ time.Duration) error { return ctx.Err() },
+		}
+	})
+	truncated, badCache := 0, 0
+	for it := 0; it < iters; it++ {
+		prompt := fmt.Sprintf("slow client prompt %d", it)
+		st, err := h.client.Generate(bg, &gatewayv1.GenerateRequest{
+			Tenant: "t1", Prompt: prompt, MaxTokens: nTok,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var sb strings.Builder
+		next := int32(0)
+		sawDone := false
+		for {
+			tok, err := st.Recv()
+			if err != nil {
+				break // EOF (or error): stream over
+			}
+			if tok.Index != next {
+				t.Fatalf("iter %d: got token index %d, want %d", it, tok.Index, next)
+			}
+			next++
+			sb.WriteString(tok.Text)
+			if tok.Done {
+				sawDone = true
+				break
+			}
+			if next%16 == 0 {
+				time.Sleep(time.Millisecond) // a slow reader
+			}
+		}
+		complete := next == nTok && sawDone
+		if !complete {
+			truncated++
+			if truncated <= 3 {
+				t.Errorf("iter %d: stream truncated: %d/%d tokens, done=%v", it, next, nTok, sawDone)
+			}
+		}
+		// Store runs after the last Send, so give it a moment to land. A
+		// truncated stream must not be cached at all; a complete one must be
+		// cached byte for byte.
+		key := cacheKey("t1", prompt)
+		var cached string
+		var ok bool
+		wait := time.Second
+		if !complete {
+			wait = 50 * time.Millisecond
+		}
+		for deadline := time.Now().Add(wait); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+			c.mu.Lock()
+			cached, ok = c.m[key]
+			c.mu.Unlock()
+			if ok {
+				break
+			}
+		}
+		want := ""
+		if complete {
+			want = sb.String()
+		}
+		if ok != complete || cached != want {
+			badCache++
+			if badCache <= 3 {
+				t.Errorf("iter %d: cache has %d bytes (present=%v); stream had %d bytes (complete=%v)", it, len(cached), ok, sb.Len(), complete)
+			}
+		}
+	}
+	if truncated > 0 || badCache > 0 {
+		t.Fatalf("%d/%d streams truncated, %d/%d cache entries wrong", truncated, iters, badCache, iters)
+	}
+}
+
+// scriptedClient is an in-process InferenceClient that replays toks and
+// then ends the stream with endErr (io.EOF for a clean close).
+type scriptedClient struct {
+	toks   []*inferv1.Token
+	endErr error
+}
+
+func (c *scriptedClient) Generate(context.Context, *inferv1.GenerateRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[inferv1.Token], error) {
+	return &scriptedStream{toks: c.toks, endErr: c.endErr}, nil
+}
+
+func (c *scriptedClient) Health(context.Context, *inferv1.HealthRequest, ...grpc.CallOption) (*inferv1.HealthResponse, error) {
+	return &inferv1.HealthResponse{}, nil
+}
+
+type scriptedStream struct {
+	grpc.ClientStream
+	toks   []*inferv1.Token
+	endErr error
+}
+
+func (s *scriptedStream) Recv() (*inferv1.Token, error) {
+	if len(s.toks) == 0 {
+		return nil, s.endErr
+	}
+	t := s.toks[0]
+	s.toks = s.toks[1:]
+	return t, nil
+}
+
+// A worker stream that ends without a done token (EOF early, or an error
+// mid-stream) is not a complete answer: the request must fail and nothing
+// may be cached.
+func TestIncompleteWorkerStreamIsNotCached(t *testing.T) {
+	partial := []*inferv1.Token{{Text: "a ", Index: 0}, {Text: "b ", Index: 1}, {Text: "c ", Index: 2}}
+	for name, endErr := range map[string]error{
+		"eof-without-done": io.EOF,
+		"error-mid-stream": status.Error(codes.Internal, "worker blew up"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			kv := newMemKV()
+			reg := router.NewRegistry(kv, router.Options{CacheTTL: time.Millisecond})
+			if _, err := reg.Register(bg, router.Worker{ID: "w", Addr: "scripted"}, time.Minute); err != nil {
+				t.Fatal(err)
+			}
+			c := newFakeCache()
+			s := New(Options{KV: kv, Registry: reg, Cache: c, PrefixRouting: true,
+				Dial: func(string) (inferv1.InferenceClient, error) {
+					return &scriptedClient{toks: partial, endErr: endErr}, nil
+				}})
+			defer s.Close()
+			err := s.Generate(&gatewayv1.GenerateRequest{Tenant: "t", Prompt: "p", MaxTokens: 8}, &nopStream{ctx: bg})
+			if status.Code(err) != codes.Unavailable {
+				t.Fatalf("want Unavailable for an incomplete stream, got %v", err)
+			}
+			if n := c.stores.Load(); n != 0 {
+				t.Fatalf("an incomplete stream was cached (%d stores)", n)
+			}
+		})
+	}
+}
+
+// A worker's reported Inflight (sent at lease renewal) already includes the
+// streams this gateway has open to it. Adding this gateway's local count on
+// top counted them twice, making a worker this gateway is using look twice
+// as loaded as it is.
+func TestOwnStreamsAreNotCountedTwice(t *testing.T) {
+	s := New(Options{})
+	load := func(reported int32, leaseUntilMs int64) int32 {
+		t.Helper()
+		out := s.withLocalLoad([]router.Worker{{ID: "w", Inflight: reported, LeaseUntilMs: leaseUntilMs}})
+		return out[0].Inflight
+	}
+	// The worker's report predates our streams: it says 0.
+	if got := load(0, 1000); got != 0 {
+		t.Fatalf("idle: estimate %d, want 0", got)
+	}
+	s.addInflight("w", 3) // we open 3 streams
+	if got := load(0, 1000); got != 3 {
+		t.Fatalf("3 local streams, stale report of 0: estimate %d, want 3", got)
+	}
+	// The worker renews its lease and now reports our 3 streams.
+	if got := load(3, 2000); got != 3 {
+		t.Fatalf("worker reports our own 3 streams: estimate %d, want 3 (not 6)", got)
+	}
+	// We open 2 more before the next report: they count immediately.
+	s.addInflight("w", 2)
+	if got := load(3, 2000); got != 5 {
+		t.Fatalf("5 local streams, report of 3 (which were ours): estimate %d, want 5", got)
+	}
+	// Next report: our 5 plus 2 from another gateway.
+	if got := load(7, 3000); got != 7 {
+		t.Fatalf("report of 7 = our 5 + 2 elsewhere: estimate %d, want 7", got)
+	}
+	// Our streams finish; the stale report still shows them.
+	s.addInflight("w", -5)
+	if got := load(7, 3000); got != 2 {
+		t.Fatalf("our 5 streams closed since a report of 7: estimate %d, want 2", got)
+	}
+}
+
+// failingKV fails every operation while fail is set: a KV mid-election or
+// behind a partition.
+type failingKV struct {
+	*memKV
+	fail atomic.Bool
+}
+
+func (k *failingKV) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	if k.fail.Load() {
+		return nil, false, fmt.Errorf("kv unavailable: no leader")
+	}
+	return k.memKV.Get(ctx, key)
+}
+
+func (k *failingKV) Put(ctx context.Context, key string, value []byte) error {
+	if k.fail.Load() {
+		return fmt.Errorf("kv unavailable: no leader")
+	}
+	return k.memKV.Put(ctx, key, value)
+}
+
+func (k *failingKV) CAS(ctx context.Context, key string, expected []byte, expectAbsent bool, value []byte) (bool, []byte, error) {
+	if k.fail.Load() {
+		return false, nil, fmt.Errorf("kv unavailable: no leader")
+	}
+	return k.memKV.CAS(ctx, key, expected, expectAbsent, value)
+}
+
+// startMockWorker serves one mock worker on loopback and returns its addr.
+func startMockWorker(t *testing.T, id string) string {
+	t.Helper()
+	w := mock.New(mock.Options{ID: id, BasePrefillMs: 1, PrefillPerChar: 0, TokenMs: 1})
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gs := grpc.NewServer()
+	inferv1.RegisterInferenceServer(gs, w)
+	go func() { _ = gs.Serve(lis) }()
+	t.Cleanup(gs.Stop)
+	return lis.Addr().String()
+}
+
+// A control-plane outage (the KV unavailable) must not take inference down
+// while the workers are healthy: rate limiting fails open, the registry
+// serves its last known live set, the cache is skipped. With fail-open off
+// the limiter's error still fails the request, as before.
+func TestKVOutageDoesNotStopInference(t *testing.T) {
+	kv := &failingKV{memKV: newMemKV()}
+	reg := router.NewRegistry(kv, router.Options{CacheTTL: time.Millisecond})
+	if _, err := reg.Register(bg, router.Worker{ID: "w0", Addr: startMockWorker(t, "w0")}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	lim := ratelimit.New(kv, ratelimit.Options{Rate: 100, Burst: 100})
+	cache := semcache.New(kv, semcache.NewNGramEmbedder(0), semcache.Options{})
+	mk := func(failOpen bool) *Server {
+		return New(Options{KV: kv, Registry: reg, Limiter: lim, Cache: cache, PrefixRouting: true, RateLimitFailOpen: failOpen})
+	}
+	open, closed := mk(true), mk(false)
+	defer open.Close()
+	defer closed.Close()
+	req := &gatewayv1.GenerateRequest{Tenant: "t", Prompt: "p", MaxTokens: 2}
+	if err := open.Generate(req, &nopStream{ctx: bg}); err != nil {
+		t.Fatalf("KV healthy: %v", err)
+	}
+
+	kv.fail.Store(true)
+	time.Sleep(5 * time.Millisecond) // past the registry's CacheTTL
+	for i := 0; i < 3; i++ {
+		if err := open.Generate(req, &nopStream{ctx: bg}); err != nil {
+			t.Fatalf("KV down, fail-open: request %d failed: %v", i, err)
+		}
+	}
+	if n := open.Snapshot().RateLimitFailOpen; n != 3 {
+		t.Fatalf("RateLimitFailOpen=%d, want 3", n)
+	}
+	if err := closed.Generate(req, &nopStream{ctx: bg}); status.Code(err) != codes.Unavailable {
+		t.Fatalf("KV down, fail-closed: want Unavailable, got %v", err)
+	}
+}
+
+// contendedKV loses every CAS, so the limiter gives up with ErrContended.
+type contendedKV struct{ *memKV }
+
+func (k contendedKV) CAS(context.Context, string, []byte, bool, []byte) (bool, []byte, error) {
+	return false, nil, nil
+}
+
+// Contention is not an outage: the KV is up and many gateways are hammering
+// one tenant's bucket. Failing open there would admit exactly the tenant
+// causing it, so it still fails the request.
+func TestRateLimitContentionDoesNotFailOpen(t *testing.T) {
+	kv := newMemKV()
+	reg := router.NewRegistry(kv, router.Options{CacheTTL: time.Millisecond})
+	if _, err := reg.Register(bg, router.Worker{ID: "w0", Addr: startMockWorker(t, "w0")}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	lim := ratelimit.New(contendedKV{newMemKV()}, ratelimit.Options{Rate: 100, Burst: 100, MaxAttempts: 2})
+	s := New(Options{KV: kv, Registry: reg, Limiter: lim, PrefixRouting: true, RateLimitFailOpen: true})
+	defer s.Close()
+	err := s.Generate(&gatewayv1.GenerateRequest{Tenant: "t", Prompt: "p", MaxTokens: 2, NoCache: true}, &nopStream{ctx: bg})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("contended limiter with fail-open: want Unavailable, got %v", err)
+	}
+	if n := s.Snapshot().RateLimitFailOpen; n != 0 {
+		t.Fatalf("RateLimitFailOpen=%d, want 0", n)
 	}
 }

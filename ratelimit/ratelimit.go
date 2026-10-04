@@ -32,8 +32,10 @@
 // disagree slightly about how much has refilled, so the effective rate is
 // fuzzy by the skew; it can never let a tenant take more than Burst tokens
 // in one instant (that bound is enforced by the CAS'd value, not by time).
-// Same rule as Phase 4: clocks affect liveness/precision, CAS guards the
-// hard limit.
+// That holds only because the stored lastRefill never moves backwards: a
+// gateway whose clock is behind credits nothing rather than rewinding it,
+// so no interval is ever credited twice (see refill). Same rule as Phase 4:
+// clocks affect liveness/precision, CAS guards the hard limit.
 package ratelimit
 
 import (
@@ -180,12 +182,21 @@ func decodeBucket(raw []byte) (bucket, bool) {
 }
 
 // refill returns the bucket's state at nowMs, given its last stored state.
+//
+// lastMs only ever moves forward. A reader whose clock is behind the stored
+// lastMs credits nothing and leaves lastMs alone. Setting lastMs = nowMs
+// unconditionally (as this once did) let two skewed gateways alternately
+// drag lastMs back and forth, each re-crediting the same interval on every
+// Take: with 200ms of skew, 4000 of 4000 offered requests were admitted
+// against a 220-token budget (TestClockSkewDoesNotMultiplyRate). With
+// lastMs monotonic, the time already credited is never credited twice, so
+// skew delays refill by at most the skew instead of multiplying the rate.
 func refill(b bucket, lim Limit, nowMs int64) bucket {
 	if nowMs > b.lastMs {
 		elapsed := float64(nowMs-b.lastMs) / 1000.0
 		b.tokens = math.Min(lim.Burst, b.tokens+elapsed*lim.Rate)
+		b.lastMs = nowMs
 	}
-	b.lastMs = nowMs
 	return b
 }
 

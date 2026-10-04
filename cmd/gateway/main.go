@@ -32,6 +32,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -57,8 +58,10 @@ func main() {
 	burst := flag.Float64("burst", 20, "rate-limit burst per tenant")
 	leaseFraction := flag.Float64("rl-lease-fraction", 0.1, "lease up to this fraction of a tenant's burst per KV CAS and spend it locally (0 = exact, one CAS per request); see ratelimit.Options")
 	leaseTTL := flag.Duration("rl-lease-ttl", time.Second, "drop unused leased tokens after this long")
+	rlFailOpen := flag.Bool("rl-fail-open", true, "admit requests when the rate limiter's KV is unavailable instead of failing them (contention still fails); see gateway.Options.RateLimitFailOpen")
 	cache := flag.Bool("cache", true, "enable the semantic cache")
-	cacheThreshold := flag.Float64("cache-threshold", 0.92, "cosine similarity for a near-duplicate cache hit")
+	cacheNear := flag.Bool("cache-near", false, "also serve near-duplicate prompts (cosine >= -cache-threshold and <= 3 char edits); off = exact match only. Lexical, cannot see meaning; see semcache")
+	cacheThreshold := flag.Float64("cache-threshold", 0.92, "cosine similarity for a near-duplicate cache hit (with -cache-near)")
 	cacheTTL := flag.Duration("cache-ttl", 0, "expire cache entries after this long (0 = never)")
 	maxInflight := flag.Int("max-inflight", 8, "routing skips a worker at or above this many streams (ignored with -load-factor)")
 	loadFactor := flag.Float64("load-factor", 1.25, "bounded-load prefix routing: skip workers above this multiple of the fleet's average load (0 = plain affinity)")
@@ -119,15 +122,20 @@ func main() {
 	cacheDesc := "off"
 	if *cache {
 		semantic = semcache.New(kv, semcache.NewNGramEmbedder(256), semcache.Options{
+			Near:      *cacheNear,
 			Threshold: float32(*cacheThreshold),
 			TTL:       *cacheTTL,
 		})
-		cacheDesc = "on"
+		cacheDesc = "exact"
+		if *cacheNear {
+			cacheDesc = "exact+near"
+		}
 	}
 
 	srv := gateway.New(gateway.Options{
 		KV:                   kv,
 		Limiter:              limiter,
+		RateLimitFailOpen:    *rlFailOpen,
 		Cache:                semantic,
 		Registry:             registry,
 		PrefixRouting:        *prefixRouting,
@@ -160,7 +168,10 @@ func main() {
 		}
 	}()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	// SIGTERM as well as SIGINT: SIGTERM is what docker stop, Kubernetes
+	// and systemd send, and without it the process skipped the graceful
+	// path below and was SIGKILLed mid-stream after the grace period.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if *statsEvery > 0 {
@@ -210,6 +221,7 @@ func formatStats(s gateway.Stats) string {
 	b.WriteString("requests=")
 	b.WriteString(u(s.Requests))
 	b.WriteString(" rate_limited=" + u(s.RateLimited))
+	b.WriteString(" rl_fail_open=" + u(s.RateLimitFailOpen))
 	b.WriteString(" cache_hits=" + u(s.CacheHits))
 	b.WriteString(" hedges=" + u(s.HedgesLaunched) + "/" + u(s.HedgesWon))
 	b.WriteString(" cancelled=" + u(s.Cancelled))

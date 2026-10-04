@@ -7,7 +7,7 @@
 //
 //	client ─Generate(stream)─▶ gateway replica (any of N, all stateless)
 //	                              │ 1. rate limit: per-tenant token bucket in the KV (CAS)
-//	                              │ 2. semantic cache: near-duplicate prompt? stream the cached answer
+//	                              │ 2. semantic cache: seen this prompt (opt-in: a near-dup)? stream the cached answer
 //	                              │ 3. route: rendezvous-hash the prompt PREFIX onto a live worker
 //	                              │ 4. stream tokens back; hedge to a 2nd worker if the 1st is slow
 //	                              ▼    to start; cancel the loser; cancel the worker if the client goes
@@ -22,7 +22,7 @@
 // admitting "the last token" at the same instant cannot both succeed.
 //
 // The cache comes second because a hit costs one KV read and no GPU. Its
-// shared state (prompt hash -> answer) is in the KV so a hit on one replica
+// shared state ((tenant, prompt) hash -> answer) is in the KV so a hit on one replica
 // is a hit on all; only the vector index for near-duplicates is local.
 //
 // Routing by prompt prefix exists because modern inference servers (vLLM,
@@ -82,6 +82,19 @@ type Options struct {
 	Cache    Cache              // nil disables caching
 	Registry *router.Registry   // required
 
+	// RateLimitFailOpen admits a request when the rate limiter cannot reach
+	// the KV (an election, a partition) instead of failing it. The limiter
+	// protects workers from one tenant's excess; failing closed turns a
+	// control-plane blip into a full inference outage while the workers are
+	// healthy, which is the worse trade for a serving path. Admissions made
+	// this way are counted in Stats.RateLimitFailOpen. ratelimit.ErrContended
+	// is NOT a KV failure (the KV is up, many gateways are hammering one
+	// tenant's bucket), so it still fails the request even with this set:
+	// failing open there would wave through exactly the tenant causing it.
+	// false (the zero value) keeps the old fail-closed behaviour;
+	// cmd/gateway defaults its -rl-fail-open flag to true.
+	RateLimitFailOpen bool
+
 	// PrefixRouting picks the worker by rendezvous-hashing the prompt prefix
 	// (see router). false picks the least-loaded live worker instead; the
 	// benchmark toggles this to show the effect on prefix-cache hit rate.
@@ -126,6 +139,10 @@ type Stats struct {
 	HedgesWon      uint64
 	Cancelled      uint64
 	WorkerErrors   uint64
-	RoutedTo       map[string]uint64
-	LiveWorkers    int
+	// RateLimitFailOpen counts requests admitted without a rate-limit
+	// decision because the limiter's KV was unavailable (see
+	// Options.RateLimitFailOpen).
+	RateLimitFailOpen uint64
+	RoutedTo          map[string]uint64
+	LiveWorkers       int
 }

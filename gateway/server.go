@@ -14,8 +14,11 @@ package gateway
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,6 +33,7 @@ import (
 	gatewayv1 "dsys/gen/gateway/v1"
 	inferv1 "dsys/gen/infer/v1"
 	"dsys/obs"
+	"dsys/ratelimit"
 	"dsys/router"
 )
 
@@ -42,13 +46,14 @@ type Server struct {
 	conns map[string]inferv1.InferenceClient // addr -> client, lazily dialled
 	cc    map[string]*grpc.ClientConn
 
-	requests       atomic.Uint64
-	rateLimited    atomic.Uint64
-	cacheHits      atomic.Uint64
-	hedgesLaunched atomic.Uint64
-	hedgesWon      atomic.Uint64
-	cancelled      atomic.Uint64
-	workerErrors   atomic.Uint64
+	requests          atomic.Uint64
+	rateLimited       atomic.Uint64
+	cacheHits         atomic.Uint64
+	hedgesLaunched    atomic.Uint64
+	hedgesWon         atomic.Uint64
+	cancelled         atomic.Uint64
+	workerErrors      atomic.Uint64
+	rateLimitFailOpen atomic.Uint64
 
 	routedMu sync.Mutex
 	routedTo map[string]uint64
@@ -59,11 +64,21 @@ type Server struct {
 	// stale to steer routing: a burst of concurrent requests would all read
 	// the same zeros and pile onto the same worker. What a gateway knows
 	// exactly, and instantly, is its own outstanding requests, so routing
-	// decisions use registry-reported load PLUS this. It is the same reason
-	// real load balancers count outstanding requests locally rather than
-	// trusting a periodic health report.
+	// decisions combine the two; see withLocalLoad for how. It is the same
+	// reason real load balancers count outstanding requests locally rather
+	// than trusting a periodic health report.
 	inflightMu    sync.Mutex
 	localInflight map[string]int32
+	// reportSeen remembers, per worker, the last load report (identified by
+	// its LeaseUntilMs, which changes on every renewal) and what
+	// localInflight was when this gateway first saw it. Guarded by
+	// inflightMu.
+	reportSeen map[string]loadReport
+}
+
+type loadReport struct {
+	leaseUntilMs int64
+	localAt      int32
 }
 
 // New returns a gateway Server.
@@ -86,6 +101,7 @@ func New(opts Options) *Server {
 		cc:            map[string]*grpc.ClientConn{},
 		routedTo:      map[string]uint64{},
 		localInflight: map[string]int32{},
+		reportSeen:    map[string]loadReport{},
 	}
 	if s.opts.Dial == nil {
 		s.opts.Dial = s.dialGRPC
@@ -144,14 +160,15 @@ func (s *Server) Close() {
 // the in-process accessor binaries and tests use.)
 func (s *Server) Snapshot() Stats {
 	st := Stats{
-		Requests:       s.requests.Load(),
-		RateLimited:    s.rateLimited.Load(),
-		CacheHits:      s.cacheHits.Load(),
-		HedgesLaunched: s.hedgesLaunched.Load(),
-		HedgesWon:      s.hedgesWon.Load(),
-		Cancelled:      s.cancelled.Load(),
-		WorkerErrors:   s.workerErrors.Load(),
-		RoutedTo:       map[string]uint64{},
+		Requests:          s.requests.Load(),
+		RateLimited:       s.rateLimited.Load(),
+		CacheHits:         s.cacheHits.Load(),
+		HedgesLaunched:    s.hedgesLaunched.Load(),
+		HedgesWon:         s.hedgesWon.Load(),
+		Cancelled:         s.cancelled.Load(),
+		WorkerErrors:      s.workerErrors.Load(),
+		RateLimitFailOpen: s.rateLimitFailOpen.Load(),
+		RoutedTo:          map[string]uint64{},
 	}
 	s.routedMu.Lock()
 	for k, v := range s.routedTo {
@@ -182,18 +199,50 @@ func (s *Server) addInflight(id string, delta int32) {
 	s.inflightMu.Unlock()
 }
 
-// withLocalLoad returns live workers with this gateway's own outstanding
-// request count folded into Inflight.
+// withLocalLoad returns live workers with Inflight replaced by this
+// gateway's best estimate of each worker's current load:
+//
+//	estimate = reported - localAtReport + localNow
+//
+// i.e. the worker's last report plus OUR net change since that report.
+// The report already counts the streams this gateway had open when it was
+// made, so adding localNow on top (as this once did) counted them twice and
+// made the workers this gateway uses look up to twice as loaded as they
+// are. max(reported, localNow) would avoid that but drop either the other
+// gateways' load or our own fresh streams; the delta form keeps both:
+// reported - localAtReport estimates everyone else's streams (clamped at 0),
+// localNow is ours, exact.
+//
+// localAtReport is our count when we first SEE a report (a new
+// LeaseUntilMs), not when the worker made it; streams we opened or closed
+// in that gap (at most the registry cache TTL plus one renewal RPC) skew
+// the others-estimate by that many, and it self-corrects at the next report.
 func (s *Server) withLocalLoad(live []router.Worker) []router.Worker {
 	s.inflightMu.Lock()
 	defer s.inflightMu.Unlock()
-	if len(s.localInflight) == 0 {
-		return live
-	}
 	out := make([]router.Worker, len(live))
 	copy(out, live)
 	for i := range out {
-		out[i].Inflight += s.localInflight[out[i].ID]
+		w := &out[i]
+		local := s.localInflight[w.ID]
+		seen, ok := s.reportSeen[w.ID]
+		if !ok || seen.leaseUntilMs != w.LeaseUntilMs {
+			seen = loadReport{leaseUntilMs: w.LeaseUntilMs, localAt: local}
+			s.reportSeen[w.ID] = seen
+		}
+		w.Inflight = max(0, w.Inflight-seen.localAt) + local
+	}
+	// Forget workers that left, so the map is bounded by the live set.
+	if len(s.reportSeen) > len(live) {
+		present := make(map[string]bool, len(live))
+		for _, w := range live {
+			present[w.ID] = true
+		}
+		for id := range s.reportSeen {
+			if !present[id] {
+				delete(s.reportSeen, id)
+			}
+		}
 	}
 	return out
 }
@@ -267,8 +316,15 @@ func (s *Server) Generate(req *gatewayv1.GenerateRequest, stream grpc.ServerStre
 		rlCtx, rlSpan := obs.Tracer("gateway").Start(ctx, "gateway.ratelimit")
 		ok, retryAfter, err := s.opts.Limiter.Take(rlCtx, tenant, 1)
 		if err != nil {
-			rlSpan.End()
-			return status.Errorf(codes.Unavailable, "rate limiter: %v", err)
+			// Fail open on a KV failure, never on contention; see
+			// Options.RateLimitFailOpen for the reasoning.
+			if !s.opts.RateLimitFailOpen || errors.Is(err, ratelimit.ErrContended) || ctx.Err() != nil {
+				rlSpan.End()
+				return status.Errorf(codes.Unavailable, "rate limiter: %v", err)
+			}
+			s.rateLimitFailOpen.Add(1)
+			rlSpan.SetAttributes(attribute.Bool("fail_open", true))
+			ok = true
 		}
 		if !ok {
 			s.rateLimited.Add(1)
@@ -282,10 +338,11 @@ func (s *Server) Generate(req *gatewayv1.GenerateRequest, stream grpc.ServerStre
 		rlSpan.End()
 	}
 
-	// 2. Semantic cache. A hit costs one KV read and no GPU.
+	// 2. Semantic cache. A hit costs one KV read and no GPU. Keyed by
+	// tenant as well as prompt; see cacheKey.
 	if s.opts.Cache != nil && !req.NoCache {
 		ccCtx, ccSpan := obs.Tracer("gateway").Start(ctx, "gateway.cache_lookup")
-		text, hit, err := s.opts.Cache.Lookup(ccCtx, req.Prompt)
+		text, hit, err := s.opts.Cache.Lookup(ccCtx, cacheKey(tenant, req.Prompt))
 		ccSpan.SetAttributes(attribute.Bool("cache_hit", hit))
 		ccSpan.End()
 		if err == nil && hit {
@@ -338,6 +395,24 @@ func (s *Server) Generate(req *gatewayv1.GenerateRequest, stream grpc.ServerStre
 	return s.streamFromWorkers(ctx, stream, req, tenant, maxTokens, prefix, live, primary, started)
 }
 
+// cacheKey is what the gateway hands the Cache as "the prompt": the prompt
+// qualified by tenant, so one tenant can never be served a completion that
+// was generated for another (a cross-tenant data leak, not just a stale
+// answer). Doing it here keeps the Cache interface tenant-agnostic.
+//
+// The tenant goes in as a hex SHA-256, not verbatim, because the cache does
+// not treat its key as opaque bytes: semcache lowercases and collapses
+// whitespace (so tenants "Acme" and "acme" would merge), and its opt-in near
+// path matches keys within a few character edits (so "tenant-a" and
+// "tenant-b" would be one edit apart). Two different tenants' digests differ
+// in ~60 of 64 lowercase hex characters, which survives normalisation and is
+// far outside any near-duplicate budget, while within one tenant the prefix
+// is identical and near matching behaves exactly as before.
+func cacheKey(tenant, prompt string) string {
+	sum := sha256.Sum256([]byte(tenant))
+	return "tenant:" + hex.EncodeToString(sum[:]) + "\n" + prompt
+}
+
 // streamCached replays a cached completion as a token stream, so a cache
 // hit is indistinguishable from a fresh generation to the client except for
 // the `cached` flag and the speed.
@@ -359,8 +434,16 @@ type attempt struct {
 	// first carries the first token (or an error) so the racer can pick a
 	// winner as soon as either attempt produces anything.
 	first chan attemptFirst
-	// tokens carries the remaining tokens after the first.
+	// tokens carries the remaining tokens after the first, in order, and is
+	// closed when runAttempt returns. Closing it is the ONLY end-of-stream
+	// signal: the consumer learns the stream is over by draining it, so it
+	// can never stop while tokens are still buffered. (An earlier version
+	// signalled completion on errs and selected on both channels; with both
+	// ready, select picks at random, so a fast worker and a slow client
+	// truncated the response and cached the truncated text.)
 	tokens chan *inferv1.Token
+	// errs holds why the stream ended without a done token, written (at
+	// most once, buffered) BEFORE tokens is closed.
 	errs   chan error
 	cancel context.CancelFunc
 	span   trace.Span // gateway.attempt; ended when runAttempt returns
@@ -527,27 +610,45 @@ func (s *Server) streamFromWorkers(
 		return err
 	}
 
-	// Forward the rest, accumulating for the cache.
+	// Forward the rest, accumulating for the cache. Only a stream that
+	// reached done=true is a complete answer, and only a complete answer
+	// may be cached: anything else (worker error, worker EOF without done,
+	// client gone) returns without Store, so a partial completion can never
+	// be served to the next caller as if it were the whole thing.
 	var full []byte
 	full = append(full, firstTok.Text...)
+	store := func() {
+		if s.opts.Cache != nil && !req.NoCache && len(full) > 0 {
+			_ = s.opts.Cache.Store(ctx, cacheKey(tenant, req.Prompt), string(full))
+		}
+	}
+	if firstTok.Done {
+		store()
+		return nil
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			s.cancelled.Add(1)
 			return status.FromContextError(ctx.Err()).Err()
-		case err := <-winner.errs:
-			if err != nil {
+		case tok, ok := <-winner.tokens:
+			if !ok {
+				// Closed before a done token. runAttempt writes the reason
+				// to errs before closing tokens, so this does not block.
+				err := errStreamEndedEarly
+				select {
+				case e := <-winner.errs:
+					if e != nil {
+						err = e
+					}
+				default:
+				}
+				if ctx.Err() != nil {
+					s.cancelled.Add(1)
+					return status.FromContextError(ctx.Err()).Err()
+				}
 				s.workerErrors.Add(1)
 				return status.Errorf(codes.Unavailable, "worker %s: %v", winner.worker.ID, err)
-			}
-			// Clean end of stream.
-			if s.opts.Cache != nil && !req.NoCache && len(full) > 0 {
-				_ = s.opts.Cache.Store(ctx, req.Prompt, string(full))
-			}
-			return nil
-		case tok := <-winner.tokens:
-			if tok == nil {
-				continue
 			}
 			full = append(full, tok.Text...)
 			if err := stream.Send(&gatewayv1.Token{
@@ -557,14 +658,16 @@ func (s *Server) streamFromWorkers(
 				return err
 			}
 			if tok.Done {
-				if s.opts.Cache != nil && !req.NoCache && len(full) > 0 {
-					_ = s.opts.Cache.Store(ctx, req.Prompt, string(full))
-				}
+				store()
 				return nil
 			}
 		}
 	}
 }
+
+// errStreamEndedEarly: the worker closed its stream (EOF) without ever
+// sending a done token, so what we have is not a complete answer.
+var errStreamEndedEarly = errors.New("worker stream ended before done")
 
 // runAttempt opens one worker stream and pumps it into the attempt's
 // channels. It exits promptly when its context is cancelled, which is what
@@ -593,19 +696,17 @@ func (s *Server) runAttempt(ctx context.Context, a *attempt, reqID, prompt, tena
 	a.first <- attemptFirst{tok: tok, a: a}
 
 	if tok.Done {
-		a.errs <- nil
-		return
+		return // the deferred close of tokens is the end-of-stream signal
 	}
+	// Every exit below either follows a done token or writes the reason to
+	// errs first; the deferred close(a.tokens) then tells the consumer, after
+	// every token sent so far. Nothing here ever drops a token: the send
+	// blocks until the consumer takes it or the attempt is cancelled.
 	for {
 		tok, err := st.Recv()
 		if err != nil {
-			if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
-				a.errs <- nil
-				return
-			}
 			if isEOF(err) {
-				a.errs <- nil
-				return
+				err = errStreamEndedEarly
 			}
 			a.errs <- err
 			return
@@ -613,15 +714,15 @@ func (s *Server) runAttempt(ctx context.Context, a *attempt, reqID, prompt, tena
 		select {
 		case a.tokens <- tok:
 		case <-ctx.Done():
+			a.errs <- ctx.Err()
 			return
 		}
 		if tok.Done {
-			a.errs <- nil
 			return
 		}
 	}
 }
 
 func isEOF(err error) bool {
-	return err != nil && (err.Error() == "EOF" || errors.Is(err, context.Canceled))
+	return errors.Is(err, io.EOF)
 }

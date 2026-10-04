@@ -91,6 +91,86 @@ func TestRegistryLeaseExpiry(t *testing.T) {
 	}
 }
 
+// failingKV wraps memKV and fails every operation while fail is set, the way
+// a KV in the middle of a leader election or behind a partition does.
+type failingKV struct {
+	*memKV
+	fail atomic.Bool
+	gets atomic.Int64
+}
+
+var errKVDown = fmt.Errorf("kv unavailable: no leader")
+
+func (k *failingKV) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	k.gets.Add(1)
+	if k.fail.Load() {
+		return nil, false, errKVDown
+	}
+	return k.memKV.Get(ctx, key)
+}
+
+func (k *failingKV) CAS(ctx context.Context, key string, expected []byte, expectAbsent bool, value []byte) (bool, []byte, error) {
+	if k.fail.Load() {
+		return false, nil, errKVDown
+	}
+	return k.memKV.CAS(ctx, key, expected, expectAbsent, value)
+}
+
+// A KV outage must not take routing down with it: Live keeps serving the
+// last live set it read, still filtered by lease, so healthy workers keep
+// serving. Leases are the bound on staleness: once they lapse (workers
+// cannot renew while the KV is down either), the set drains.
+func TestLiveServesLastKnownSetWhenKVFails(t *testing.T) {
+	clk := &fakeClock{}
+	clk.ms.Store(1_700_000_000_000)
+	kv := &failingKV{memKV: newMemKV()}
+	r := NewRegistry(kv, Options{Clock: clk.now, CacheTTL: 100 * time.Millisecond})
+	for _, id := range []string{"a", "b"} {
+		if _, err := r.Register(bg, Worker{ID: id, Addr: id + ":1"}, 3*time.Second); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if live, err := r.Live(bg); err != nil || len(live) != 2 {
+		t.Fatalf("before outage: live=%+v err=%v", live, err)
+	}
+
+	kv.fail.Store(true)
+	clk.advance(time.Second) // past CacheTTL: Live must go back to the KV
+	live, err := r.Live(bg)
+	if err != nil || len(live) != 2 {
+		t.Fatalf("KV down, leases valid: live=%+v err=%v; want the last known 2 workers", live, err)
+	}
+	// While the KV is down, a failed read is not retried on every call:
+	// the stale set is reused for another CacheTTL.
+	before := kv.gets.Load()
+	for i := 0; i < 10; i++ {
+		_, _ = r.Live(bg)
+	}
+	if n := kv.gets.Load() - before; n != 0 {
+		t.Fatalf("%d KV reads within one CacheTTL of a failed read; want 0", n)
+	}
+
+	clk.advance(3 * time.Second) // leases lapse
+	if live, err := r.Live(bg); err != nil || len(live) != 0 {
+		t.Fatalf("KV down, leases lapsed: live=%+v err=%v; want empty", live, err)
+	}
+
+	// A registry that never read the set has nothing to fall back on.
+	r2 := NewRegistry(kv, Options{Clock: clk.now})
+	if _, err := r2.Live(bg); err == nil {
+		t.Fatal("no last-known set: want the KV error")
+	}
+
+	// Recovery: reads go back to the KV.
+	kv.fail.Store(false)
+	if _, err := r.Register(bg, Worker{ID: "c", Addr: "c:1"}, 3*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if live, err := r.Live(bg); err != nil || len(live) != 1 || live[0].ID != "c" {
+		t.Fatalf("after recovery: live=%+v err=%v", live, err)
+	}
+}
+
 func TestConcurrentRegistrationsAllLand(t *testing.T) {
 	clk := &fakeClock{}
 	kv := newMemKV()

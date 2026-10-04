@@ -76,7 +76,8 @@ type Registry struct {
 
 	mu       sync.Mutex
 	cached   []Worker
-	cachedAt time.Time
+	cachedAt time.Time // zeroed by invalidate to force a re-read
+	loaded   bool      // cached holds a successful read (the outage fallback)
 }
 
 // NewRegistry returns a Registry over kv.
@@ -194,6 +195,16 @@ func (r *Registry) invalidate() {
 
 // Live returns workers whose lease has not expired, from a short-lived
 // local cache.
+//
+// If the KV read fails (an election, a partition) and this Registry has
+// read the set before, Live serves that last known set, still filtered by
+// lease, instead of an error. The control plane being briefly unavailable
+// should not take inference down while the workers themselves are healthy.
+// It stays safe because the lease is the staleness bound: workers cannot
+// renew while the KV is down either, so a long outage drains the set as
+// leases lapse, exactly as if each worker had stopped renewing. The failed
+// read also restamps cachedAt, so during an outage the KV is retried once
+// per CacheTTL rather than by every request.
 func (r *Registry) Live(ctx context.Context) ([]Worker, error) {
 	now := r.opts.Clock()
 	r.mu.Lock()
@@ -206,7 +217,13 @@ func (r *Registry) Live(ctx context.Context) ([]Worker, error) {
 
 	raw, _, err := r.kv.Get(ctx, r.key())
 	if err != nil {
-		return nil, err
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if !r.loaded {
+			return nil, err
+		}
+		r.cachedAt = now
+		return filterLive(r.cached, now), nil
 	}
 	ws, err := decodeWorkers(raw)
 	if err != nil {
@@ -215,6 +232,7 @@ func (r *Registry) Live(ctx context.Context) ([]Worker, error) {
 	r.mu.Lock()
 	r.cached = ws
 	r.cachedAt = now
+	r.loaded = true
 	r.mu.Unlock()
 	return filterLive(ws, now), nil
 }
