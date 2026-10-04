@@ -2,29 +2,34 @@
 //
 // A three-node cluster on one machine:
 //
-//	raftkv -id 0 -peers 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 -data data/r0
-//	raftkv -id 1 -peers 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 -data data/r1
-//	raftkv -id 2 -peers 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 -data data/r2
+//	raftkv -id 0 -peers 127.0.0.1:17001,127.0.0.1:17002,127.0.0.1:17003 -client-addrs 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
+//	raftkv -id 1 -peers 127.0.0.1:17001,127.0.0.1:17002,127.0.0.1:17003 -client-addrs 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
+//	raftkv -id 2 -peers 127.0.0.1:17001,127.0.0.1:17002,127.0.0.1:17003 -client-addrs 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
 //
-// Each process serves both the Raft RPCs (peer traffic) and the KV API
-// (client traffic) on its own address. Clients can talk to any node; a
-// follower answers "not leader" with a hint and kvctl follows it.
+// (those are the defaults, so "raftkv -id N" alone does the same).
+//
+// Each process listens twice: Raft RPCs (peer traffic) on -peers[id], the KV
+// API and gRPC health (client traffic) on -client-addrs[id]. The Raft
+// service is not registered on the client port at all, so a client cannot
+// send it AppendEntries/RequestVote; keep the peer port reachable by the
+// other replicas only. Clients (kvctl -addr, sched -kv, gateway -kv) use the
+// -client-addrs list; a follower answers "not leader" with a hint drawn
+// from that list and kvctl follows it.
 package main
 
 import (
 	"context"
 	"flag"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
 
+	"dsys/cmd/internal/node"
 	kvv1 "dsys/gen/kv/v1"
 	"dsys/kv/raftkv"
 	"dsys/raft"
@@ -32,8 +37,11 @@ import (
 )
 
 func main() {
-	id := flag.Int("id", 0, "this node's index into -peers")
-	peersFlag := flag.String("peers", "127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003", "comma-separated addresses of all nodes, in id order")
+	id := flag.Int("id", 0, "this node's index into -peers and -client-addrs")
+	peersFlag := flag.String("peers", "127.0.0.1:17001,127.0.0.1:17002,127.0.0.1:17003",
+		"PEER-ONLY Raft addresses of all nodes, in id order; this node serves Raft on peers[id]. Unauthenticated: reachable by the other replicas only")
+	clientsFlag := flag.String("client-addrs", "127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003",
+		"client-facing KV addresses of all nodes, in id order; this node serves the KV API and gRPC health on client-addrs[id], and leader hints point here")
 	dataDir := flag.String("data", "", "data directory (default data/r<id>)")
 	maxRaftState := flag.Int("maxraftstate", 1<<20, "snapshot when Raft state exceeds this many bytes (0 = never)")
 	heartbeat := flag.Duration("heartbeat", 100*time.Millisecond, "leader heartbeat interval")
@@ -42,9 +50,10 @@ func main() {
 	verbose := flag.Bool("v", false, "log Raft state transitions")
 	flag.Parse()
 
-	addrs := strings.Split(*peersFlag, ",")
-	if *id < 0 || *id >= len(addrs) {
-		log.Fatalf("-id %d out of range for %d peers", *id, len(addrs))
+	addrs := node.SplitAddrs(*peersFlag)
+	clientAddrs := node.SplitAddrs(*clientsFlag)
+	if err := node.CheckLayout(*id, addrs, clientAddrs); err != nil {
+		log.Fatal(err)
 	}
 	if *dataDir == "" {
 		*dataDir = "data/r" + itoa(*id)
@@ -68,17 +77,18 @@ func main() {
 	}
 	srv := raftkv.New(peers, *id, persister, raftkv.Config{
 		MaxRaftState: *maxRaftState,
-		Addrs:        addrs,
+		Addrs:        clientAddrs, // leader hints are for clients
 		Raft:         rcfg,
 	})
 
-	lis, err := net.Listen("tcp", addrs[*id])
+	peerLis, clientLis, err := node.Listeners(addrs[*id], clientAddrs[*id])
 	if err != nil {
-		log.Fatalf("listen %s: %v", addrs[*id], err)
+		log.Fatal(err)
 	}
-	gs := grpc.NewServer(grpc.MaxRecvMsgSize(grpctransport.MaxMessageSize))
-	grpctransport.Register(gs, srv.Raft()) // peer-facing
-	kvv1.RegisterKVServer(gs, srv)         // client-facing
+	peerGS := grpc.NewServer(grpc.MaxRecvMsgSize(grpctransport.MaxMessageSize))
+	grpctransport.Register(peerGS, srv.Raft())
+	clientGS := grpc.NewServer(grpc.MaxRecvMsgSize(grpctransport.MaxMessageSize))
+	kvv1.RegisterKVServer(clientGS, srv)
 
 	// SIGTERM too: it is what `docker stop` (and systemd, k8s) sends, and
 	// without it the graceful path below never runs in a container.
@@ -88,12 +98,14 @@ func main() {
 		<-ctx.Done()
 		log.Print("shutting down")
 		srv.Kill()
-		gs.Stop()
+		clientGS.Stop()
+		peerGS.Stop()
 	}()
 
-	log.Printf("raftkv node %d listening on %s (data %s, persisted %d bytes)", *id, lis.Addr(), *dataDir, persister.StateSize())
-	if err := gs.Serve(lis); err != nil {
-		log.Fatalf("serve: %v", err)
+	log.Printf("raftkv node %d: peers on %s, clients on %s (data %s, persisted %d bytes)",
+		*id, peerLis.Addr(), clientLis.Addr(), *dataDir, persister.StateSize())
+	if err := node.Serve(peerGS, peerLis, clientGS, clientLis); err != nil {
+		log.Fatal(err)
 	}
 }
 

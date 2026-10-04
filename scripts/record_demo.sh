@@ -19,7 +19,8 @@ TMP=${TMPDIR:-/tmp}
 mkdir -p "$OUT"
 
 PY=.venv/Scripts/python.exe
-KV=127.0.0.1:7801,127.0.0.1:7802,127.0.0.1:7803
+KV=127.0.0.1:7801,127.0.0.1:7802,127.0.0.1:7803          # raftkv client addresses
+KVPEERS=127.0.0.1:17801,127.0.0.1:17802,127.0.0.1:17803  # raftkv peer-only Raft addresses
 
 # stamp reads stdin and prefixes each line with a unix timestamp.
 stamp() { while IFS= read -r line; do printf '%s|%s\n' "$(date +%s.%N)" "$line"; done; }
@@ -56,9 +57,9 @@ fi
 if want failover; then
 echo "recording failover demo..."
 {
-  say "\$ raftkv -id 0/1/2 -peers 127.0.0.1:7801,7802,7803    # 3 real processes"
+  say "\$ raftkv -id 0/1/2 -peers 127.0.0.1:17801,... -client-addrs 127.0.0.1:7801,...    # 3 real processes"
   for i in 0 1 2; do
-    ./bin/raftkv.exe -id $i -peers $KV -data "data/demo/kv$i" -v > "$TMP/demo_kv$i.log" 2>&1 &
+    ./bin/raftkv.exe -id $i -peers $KVPEERS -client-addrs $KV -data "data/demo/kv$i" -v > "$TMP/demo_kv$i.log" 2>&1 &
   done
   sleep 3
   say ""
@@ -100,8 +101,9 @@ fi
 if want llm; then
 echo "recording llm demo (loads model weights)..."
 LKV=127.0.0.1:7901,127.0.0.1:7902,127.0.0.1:7903
+LKVPEERS=127.0.0.1:17901,127.0.0.1:17902,127.0.0.1:17903
 for i in 0 1 2; do
-  ./bin/raftkv.exe -id $i -peers $LKV -data "data/demo/llm$i" > "$TMP/demo_llmkv$i.log" 2>&1 &
+  ./bin/raftkv.exe -id $i -peers $LKVPEERS -client-addrs $LKV -data "data/demo/llm$i" > "$TMP/demo_llmkv$i.log" 2>&1 &
 done
 sleep 2
 ./bin/gateway.exe -addr 127.0.0.1:7950 -kv $LKV -prefix-routing=true -cache=true \

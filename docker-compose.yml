@@ -7,13 +7,16 @@
 # Networking notes (verified against cmd/raftkv/main.go, cmd/sched/main.go,
 # cmd/gateway/main.go, py/infer_worker.py before writing this):
 #
-#   - raftkv derives ITS OWN listen address by indexing -id into -peers
-#     (net.Listen("tcp", addrs[id])); it does not have a separate -addr flag.
-#     Compose gives every service a DNS name matching the service name that
-#     resolves, from inside that very container, to that container's own IP
-#     - so "-peers kv0:7001,kv1:7001,kv2:7001 -id 0" makes kv0 listen on its
-#     own address exactly as the bare-metal "-peers 127.0.0.1:700x" example
-#     in the README does on one host.
+#   - raftkv derives ITS OWN two listen addresses by indexing -id into
+#     -peers (Raft, peer-only, :17001 here) and -client-addrs (KV API +
+#     gRPC health, :7001 here); it has no separate -addr flag. Compose gives
+#     every service a DNS name matching the service name that resolves, from
+#     inside that very container, to that container's own IP - so "-id 0
+#     -peers kv0:17001,... -client-addrs kv0:7001,..." makes kv0 listen on
+#     its own addresses exactly as the bare-metal 127.0.0.1 example in the
+#     README does on one host. Everything else (sched, gateway, kvctl) only
+#     ever uses the :7001 client addresses; nothing outside the kv nodes
+#     needs :17001, and no port is published to the host.
 #   - sched and gateway default -addr to 127.0.0.1:..., which would refuse
 #     connections from other containers; both are overridden to ":<port>"
 #     (all interfaces) below.
@@ -62,7 +65,7 @@ services:
   kv0:
     image: dsys-go:local
     build: {context: ., dockerfile: docker/Dockerfile.services}
-    command: ["raftkv", "-id", "0", "-peers", "kv0:7001,kv1:7001,kv2:7001", "-data", "/data", "-v"]
+    command: ["raftkv", "-id", "0", "-peers", "kv0:17001,kv1:17001,kv2:17001", "-client-addrs", "kv0:7001,kv1:7001,kv2:7001", "-data", "/data", "-v"]
     volumes: ["kv0-data:/data"]
     networks: [dsysnet]
     healthcheck: *kv-healthcheck
@@ -70,7 +73,7 @@ services:
   kv1:
     image: dsys-go:local
     build: {context: ., dockerfile: docker/Dockerfile.services}
-    command: ["raftkv", "-id", "1", "-peers", "kv0:7001,kv1:7001,kv2:7001", "-data", "/data", "-v"]
+    command: ["raftkv", "-id", "1", "-peers", "kv0:17001,kv1:17001,kv2:17001", "-client-addrs", "kv0:7001,kv1:7001,kv2:7001", "-data", "/data", "-v"]
     volumes: ["kv1-data:/data"]
     networks: [dsysnet]
     healthcheck: *kv-healthcheck
@@ -78,7 +81,7 @@ services:
   kv2:
     image: dsys-go:local
     build: {context: ., dockerfile: docker/Dockerfile.services}
-    command: ["raftkv", "-id", "2", "-peers", "kv0:7001,kv1:7001,kv2:7001", "-data", "/data", "-v"]
+    command: ["raftkv", "-id", "2", "-peers", "kv0:17001,kv1:17001,kv2:17001", "-client-addrs", "kv0:7001,kv1:7001,kv2:7001", "-data", "/data", "-v"]
     volumes: ["kv2-data:/data"]
     networks: [dsysnet]
     healthcheck: *kv-healthcheck

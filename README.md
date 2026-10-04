@@ -232,9 +232,10 @@ source ./env.sh        # Git Bash equivalent
 Three-node replicated cluster (one terminal each), then talk to any node:
 
 ```powershell
-.\bin\raftkv.exe -id 0 -peers 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
-.\bin\raftkv.exe -id 1 -peers 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
-.\bin\raftkv.exe -id 2 -peers 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
+# Raft (peer-only) on 17001-17003, KV clients on 7001-7003; these are the defaults
+.\bin\raftkv.exe -id 0 -peers 127.0.0.1:17001,127.0.0.1:17002,127.0.0.1:17003 -client-addrs 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
+.\bin\raftkv.exe -id 1 -peers 127.0.0.1:17001,127.0.0.1:17002,127.0.0.1:17003 -client-addrs 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
+.\bin\raftkv.exe -id 2 -peers 127.0.0.1:17001,127.0.0.1:17002,127.0.0.1:17003 -client-addrs 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
 .\bin\kvctl.exe -addr 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 put k v
 .\bin\kvctl.exe -addr 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 bench -n 500 -c 8
 ```
@@ -245,22 +246,26 @@ Sharded cluster (Phase 3): a controller cluster plus two independent replica
 groups, each group a full Raft cluster of its own.
 
 ```powershell
-# controller (3 terminals)
-.\bin\shardctrl.exe -id 0 -peers 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003
-.\bin\shardctrl.exe -id 1 -peers 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003
-.\bin\shardctrl.exe -id 2 -peers 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003
+# controller (3 terminals); defaults: Raft (peer-only) on 18001-18003, clients on 8001-8003
+.\bin\shardctrl.exe -id 0
+.\bin\shardctrl.exe -id 1
+.\bin\shardctrl.exe -id 2
 
-# group 100 (3 terminals)
-.\bin\shardkv.exe -gid 100 -id 0 -peers 127.0.0.1:9001,127.0.0.1:9002,127.0.0.1:9003 -ctrl 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003
-.\bin\shardkv.exe -gid 100 -id 1 -peers 127.0.0.1:9001,127.0.0.1:9002,127.0.0.1:9003 -ctrl 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003
-.\bin\shardkv.exe -gid 100 -id 2 -peers 127.0.0.1:9001,127.0.0.1:9002,127.0.0.1:9003 -ctrl 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003
+# group 100 (3 terminals): Raft + shard migration (peer-only) on 19001-19003, KV clients on 9101-9103.
+# -peer-map lists client=peer for the replicas of every OTHER group (own group is implicit).
+$P = "127.0.0.1:19001,127.0.0.1:19002,127.0.0.1:19003"; $C = "127.0.0.1:9101,127.0.0.1:9102,127.0.0.1:9103"
+$MAP = "127.0.0.1:9201=127.0.0.1:19201,127.0.0.1:9202=127.0.0.1:19202,127.0.0.1:9203=127.0.0.1:19203"
+.\bin\shardkv.exe -gid 100 -id 0 -peers $P -client-addrs $C -peer-map $MAP -ctrl 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003
+.\bin\shardkv.exe -gid 100 -id 1 -peers $P -client-addrs $C -peer-map $MAP -ctrl 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003
+.\bin\shardkv.exe -gid 100 -id 2 -peers $P -client-addrs $C -peer-map $MAP -ctrl 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003
 
-# register the group and talk to the cluster
-.\bin\shardctl.exe -ctrl 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003 join 100=127.0.0.1:9001,127.0.0.1:9002,127.0.0.1:9003
+# register the group by its CLIENT addresses and talk to the cluster
+.\bin\shardctl.exe -ctrl 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003 join 100=127.0.0.1:9101,127.0.0.1:9102,127.0.0.1:9103
 .\bin\kvctl.exe -ctrl 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003 put k v
 ```
 
-Start a second group (`-gid 200`, ports 9101-9103) and `shardctl join 200=...`
+Start a second group (`-gid 200`, peers 19201-19203, clients 9201-9203, `-peer-map` pointing
+at group 100's pairs) and `shardctl join 200=<its client addresses>`
 while writes are in flight: the controller rebalances shards onto it live,
 each shard's data and dedup sessions migrate, and every key keeps resolving
 through `kvctl` with no manual intervention.

@@ -20,7 +20,8 @@ cd "$ROOT"
 LOGDIR=${LOGDIR:-/tmp/e2e_sched}
 rm -rf "$LOGDIR" data/e2e; mkdir -p "$LOGDIR"
 
-KV=127.0.0.1:7301,127.0.0.1:7302,127.0.0.1:7303
+KV=127.0.0.1:7301,127.0.0.1:7302,127.0.0.1:7303          # raftkv client addresses
+KVPEERS=127.0.0.1:17301,127.0.0.1:17302,127.0.0.1:17303  # raftkv peer-only Raft addresses
 SCHED=127.0.0.1:7400
 
 pids=()
@@ -40,7 +41,7 @@ make build >/dev/null
 
 step "start 3-node raftkv cluster"
 for i in 0 1 2; do
-  ./bin/raftkv.exe -id $i -peers $KV -data data/e2e/kv$i >"$LOGDIR/kv$i.log" 2>&1 &
+  ./bin/raftkv.exe -id $i -peers $KVPEERS -client-addrs $KV -data data/e2e/kv$i >"$LOGDIR/kv$i.log" 2>&1 &
   pids+=($!)
 done
 sleep 2

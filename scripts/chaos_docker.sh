@@ -263,7 +263,8 @@ step "6. DISK PRESSURE: fill a size-capped volume under a live raftkv and report
 DPNET=dsys-diskpressure-net
 docker network rm "$DPNET" >/dev/null 2>&1 || true
 docker network create "$DPNET" >/dev/null
-DPPEERS=dp0:7001,dp1:7001,dp2:7001
+DPPEERS=dp0:17001,dp1:17001,dp2:17001   # peer-only Raft addresses
+DPCLIENTS=dp0:7001,dp1:7001,dp2:7001    # client (KV) addresses
 for i in 0 1 2; do
   docker rm -f "dsys-dp$i" >/dev/null 2>&1 || true
   docker volume rm "dsys-dp$i-vol" >/dev/null 2>&1 || true
@@ -272,13 +273,13 @@ for i in 0 1 2; do
     "dsys-dp$i-vol" >/dev/null
   docker run -d --name "dsys-dp$i" --network "$DPNET" --network-alias "dp$i" \
     -v "dsys-dp$i-vol:/data" \
-    dsys-go:local raftkv -id "$i" -peers "$DPPEERS" -data /data -maxraftstate 0 -v >/dev/null
+    dsys-go:local raftkv -id "$i" -peers "$DPPEERS" -client-addrs "$DPCLIENTS" -data /data -maxraftstate 0 -v >/dev/null
 done
 sleep 3
 info "throwaway 3-node raftkv up, each on its own 8MiB tmpfs volume (-maxraftstate 0: no compaction)"
 
 fill_out=$(docker run --rm --network "$DPNET" dsys-go:local \
-  kvctl -addr "$DPPEERS" -timeout 60s bench -n 60000 -c 8 2>&1)
+  kvctl -addr "$DPCLIENTS" -timeout 60s bench -n 60000 -c 8 2>&1)
 info "fill attempt output (last 15 lines):"
 echo "$fill_out" | tail -15 | sed 's/^/   /'
 

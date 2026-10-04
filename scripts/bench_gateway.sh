@@ -24,7 +24,8 @@ cd "$ROOT"
 LOGDIR=${LOGDIR:-${TMPDIR:-/tmp}/bench_gateway}
 rm -rf "$LOGDIR" data/benchgw; mkdir -p "$LOGDIR"
 
-KV=127.0.0.1:7701,127.0.0.1:7702,127.0.0.1:7703
+KV=127.0.0.1:7701,127.0.0.1:7702,127.0.0.1:7703          # raftkv client addresses
+KVPEERS=127.0.0.1:17701,127.0.0.1:17702,127.0.0.1:17703  # raftkv peer-only Raft addresses
 GW=127.0.0.1:7750
 EXTRA_GW_FLAGS=${EXTRA_GW_FLAGS:-}
 
@@ -43,7 +44,7 @@ num() { sed -n "s/.*\"$1\":\([0-9.]*\).*/\1/p" <<<"$2" | head -1; }
 make build >/dev/null
 
 for i in 0 1 2; do
-  ./bin/raftkv.exe -id $i -peers $KV -data data/benchgw/kv$i >"$LOGDIR/kv$i.log" 2>&1 &
+  ./bin/raftkv.exe -id $i -peers $KVPEERS -client-addrs $KV -data data/benchgw/kv$i >"$LOGDIR/kv$i.log" 2>&1 &
   pids+=($!)
 done
 sleep 2
