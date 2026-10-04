@@ -84,6 +84,15 @@
 //     result; every Submit of one key returned the same id and at most one
 //     record per key ever became runnable. TestManySeeds additionally
 //     requires fenced zombie commits and duplicate submits to have happened.
+//   - Gateway (IncludeGateway): every successful response, cached or not,
+//     equals the full ground-truth answer for its tenant+prompt; failures
+//     during chaos carry only retryable codes (Unavailable,
+//     DeadlineExceeded, ResourceExhausted, Canceled); no Generate outlives
+//     its deadline by more than 2s (stalled readers included); a 40-request
+//     batch after the heal succeeds at >= 95%; no worker generation is
+//     still running 3s after traffic stops. A worker failing with Internal
+//     is mapped to Unavailable by the gateway, so only the post-heal bound
+//     sees it.
 //   - No panics in any goroutine the harness starts: each one recovers and
 //     records its own panic as a violation (a recover only works on its own
 //     goroutine). Panics in library-owned goroutines crash the process. A
@@ -147,9 +156,10 @@ type Scenario struct {
 	// it; simrun's -scheduler flag defaults it to true.
 	IncludeScheduler bool
 	// IncludeGateway additionally wires a gateway.Server and mock inference
-	// workers, and sends it concurrent traffic. It is checked more lightly
-	// (no panics, sane hedge/cache counters) since it has no linearizable
-	// KV-shaped model of its own. Default false.
+	// workers, and sends it concurrent traffic (uncached, cache-on, slow
+	// readers, stalled readers). It has no linearizable model, but every
+	// successful answer is checked against the exact ground truth for its
+	// tenant+prompt; see gatewaymix.go for the full list. Default false.
 	IncludeGateway bool
 	NumWorkers     int // inference workers when IncludeGateway. Default 3.
 
@@ -192,6 +202,21 @@ type injectedFaults struct {
 	// multiple of 5 (claim it, never complete or fail it), so those jobs
 	// never reach DONE.
 	schedLoseEveryFifthJob bool
+	// gwWorkerInternal: inference workers fail this fraction of
+	// generations with codes.Internal.
+	gwWorkerInternal float64
+	// gwWorkerTruncate: inference workers end every stream one token
+	// early, still marked done (a short answer that looks complete).
+	gwWorkerTruncate bool
+	// gwCacheTruncate: the cache stores only half of every answer.
+	gwCacheTruncate bool
+	// gwCacheIgnoreTenant: the cache drops the gateway's tenant qualifier
+	// from its key, so one tenant's answer is served to another.
+	gwCacheIgnoreTenant bool
+	// gwPlainSendError: during the chaos phase, the client stream's Send
+	// fails normal-mode requests with a plain (non-gRPC-status) error,
+	// which the gateway passes through and so surfaces as Unknown.
+	gwPlainSendError bool
 }
 
 func (s Scenario) withDefaults() Scenario {
@@ -253,7 +278,17 @@ type Report struct {
 	SchedFenced         int64
 	SchedIdemKeys       int64
 	SchedIdemDupSubmits int64
-	GatewayReq int
+	// GatewayReq counts every Generate call (chaos phase plus the post-heal
+	// final batch) and GatewayErrors the failed ones. GatewayCacheHits
+	// counts successful responses served from the cache, GatewayStalled
+	// requests whose client never read the stream, and GatewayFinalOK of
+	// GatewayFinalTotal the post-heal batch's successes.
+	GatewayReq        int
+	GatewayErrors     int
+	GatewayCacheHits  int
+	GatewayStalled    int
+	GatewayFinalOK    int
+	GatewayFinalTotal int
 	Violations []string // empty means the run passed
 	Elapsed    time.Duration
 }

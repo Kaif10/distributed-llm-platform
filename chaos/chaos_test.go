@@ -211,9 +211,92 @@ func TestGatewayMixSurvivesChaos(t *testing.T) {
 		t.Fatal(err)
 	}
 	report(t, rep)
-	if rep.GatewayReq == 0 {
-		t.Fatal("gateway mix issued zero requests; it did not actually run")
+	gatewayNonVacuous(t, rep)
+}
+
+// gatewayNonVacuous fails a gateway run whose checks had nothing to check.
+func gatewayNonVacuous(t *testing.T, rep *Report) {
+	t.Helper()
+	t.Logf("gateway: requests=%d errors=%d cacheHits=%d stalled=%d final=%d/%d",
+		rep.GatewayReq, rep.GatewayErrors, rep.GatewayCacheHits, rep.GatewayStalled, rep.GatewayFinalOK, rep.GatewayFinalTotal)
+	if rep.GatewayReq == 0 || rep.GatewayFinalTotal == 0 {
+		t.Fatal("gateway mix issued no requests (or no final batch); it did not actually run")
 	}
+	if rep.GatewayCacheHits == 0 {
+		t.Error("no response was served from the cache: the cached-answer check was vacuous")
+	}
+	if rep.GatewayStalled == 0 {
+		t.Error("no stalled-reader request was issued: the backpressure path was not exercised")
+	}
+}
+
+// gatewayDemo is the scenario the gateway "checker catches X" tests share:
+// no nemesis and no scheduler, so the only thing that can fail is the
+// injected fault.
+func gatewayDemo(f injectedFaults) Scenario {
+	return Scenario{Seed: 21, Duration: 2 * time.Second, NumKVNodes: 3, NumClients: 6,
+		IncludeGateway: true, NumWorkers: 3, faults: f}
+}
+
+// TestGatewayQuietControl is the control for the gateway checker tests:
+// the same scenario with no injected fault passes, with real cache hits
+// and stalled readers.
+func TestGatewayQuietControl(t *testing.T) {
+	if testing.Short() {
+		t.Skip("long")
+	}
+	rep, err := Run(context.Background(), gatewayDemo(injectedFaults{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	report(t, rep)
+	gatewayNonVacuous(t, rep)
+}
+
+// TestCheckerCatchesGatewayWorkerErrors: workers that fail every generation
+// with Internal. The gateway maps that to Unavailable (a retryable code), so
+// only the post-heal availability bound can see it, and must. The
+// pre-hardening mix passed this with 193/193 requests failed.
+func TestCheckerCatchesGatewayWorkerErrors(t *testing.T) {
+	if testing.Short() {
+		t.Skip("long")
+	}
+	runExpectingViolation(t, gatewayDemo(injectedFaults{gwWorkerInternal: 1}), "succeeded after the cluster healed")
+}
+
+// TestCheckerCatchesGatewayTruncation: workers that end each stream one
+// token early but mark it done. The gateway cannot know; the content check
+// against the full answer must.
+func TestCheckerCatchesGatewayTruncation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("long")
+	}
+	runExpectingViolation(t, gatewayDemo(injectedFaults{gwWorkerTruncate: true}), "wrong answer")
+}
+
+// TestCheckerCatchesGatewayCacheCorruption: a cache that stores half the
+// answer, and a cache that ignores the tenant. Both are served to later
+// callers as cache hits, and both must differ from the uncached answer.
+func TestCheckerCatchesGatewayCacheCorruption(t *testing.T) {
+	if testing.Short() {
+		t.Skip("long")
+	}
+	t.Run("truncated-store", func(t *testing.T) {
+		runExpectingViolation(t, gatewayDemo(injectedFaults{gwCacheTruncate: true}), "wrong answer")
+	})
+	t.Run("cross-tenant", func(t *testing.T) {
+		runExpectingViolation(t, gatewayDemo(injectedFaults{gwCacheIgnoreTenant: true}), "wrong answer")
+	})
+}
+
+// TestCheckerCatchesGatewayBadCode: a request that fails with a
+// non-status error (surfacing as Unknown) must be reported, even though the
+// final batch is healthy.
+func TestCheckerCatchesGatewayBadCode(t *testing.T) {
+	if testing.Short() {
+		t.Skip("long")
+	}
+	runExpectingViolation(t, gatewayDemo(injectedFaults{gwPlainSendError: true}), "non-retryable error code")
 }
 
 // TestChooseEventDeterministicGivenFixedState is the real proof of

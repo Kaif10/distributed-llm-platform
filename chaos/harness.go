@@ -235,7 +235,7 @@ func Run(ctx context.Context, sc Scenario) (*Report, error) {
 	var gwMix *gatewayMix
 	if sc.IncludeGateway {
 		var err error
-		gwMix, err = newGatewayMix(cluster.newAdapter(), sc)
+		gwMix, err = newGatewayMix(cluster.newAdapter(), sc, pl)
 		if err != nil {
 			return nil, fmt.Errorf("chaos: wiring gateway: %w", err)
 		}
@@ -356,9 +356,14 @@ func Run(ctx context.Context, sc Scenario) (*Report, error) {
 			rep.SchedJobs, rep.SchedDone, rep.SchedFenced, sw.zombieClaims.Load(), rep.SchedIdemKeys, rep.SchedIdemDupSubmits)
 	}
 	if gwMix != nil {
+		vs, st := gwMix.check(ctx) // runs the post-heal final batch first
+		rep.Violations = append(rep.Violations, vs...)
 		rep.GatewayReq = int(gwMix.requests.Load())
-		rep.Violations = append(rep.Violations, gwMix.check()...)
-		logf("gateway: requests=%d errors=%d panics=%d", gwMix.requests.Load(), gwMix.errors.Load(), gwMix.panics.Load())
+		rep.GatewayErrors = int(gwMix.errors.Load())
+		rep.GatewayCacheHits, rep.GatewayStalled = st.cacheHits, st.stalled
+		rep.GatewayFinalOK, rep.GatewayFinalTotal = st.finalOK, st.finalTotal
+		logf("gateway: requests=%d errors=%d cacheHits=%d slowOK=%d stalled=%d final=%d/%d",
+			rep.GatewayReq, rep.GatewayErrors, st.cacheHits, st.slowOK, st.stalled, st.finalOK, st.finalTotal)
 	}
 	rep.Violations = append(rep.Violations, pl.violations()...)
 
