@@ -54,8 +54,15 @@ with KVClient("localhost:7001") as kv:
     print(kv.get("k"))
 ```
 
+`KVClient` also takes a raftkv cluster's client addresses (`"a:7001,b:7002,c:7003"` or a
+list): it follows "not leader" hints and moves past dead replicas on its own.
+
 Every mutating call carries a `RequestMeta(client_id, request_id)`. A retry of a
-failed call must reuse the same meta so the server can deduplicate it.
+failed call must reuse the same meta so the server can deduplicate it. The client's own
+retries already do; if a call still fails it raises `KVRequestError` (a `grpc.RpcError`)
+whose `.meta` you pass back as `meta=` to retry that same request later.
+
+Tests (in-process gRPC servers): `.venv/Scripts/python.exe -m unittest discover -s py/tests -v`
 
 ## Scheduler worker (`sched.v1`)
 
