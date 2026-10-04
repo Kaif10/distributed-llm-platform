@@ -24,7 +24,9 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	raftv1 "dsys/gen/raft/v1"
 	"dsys/raft"
@@ -219,7 +221,11 @@ func (s *server) RequestVote(_ context.Context, req *raftv1.RequestVoteRequest) 
 }
 
 func (s *server) AppendEntries(_ context.Context, req *raftv1.AppendEntriesRequest) (*raftv1.AppendEntriesResponse, error) {
-	return appendEntriesReplyToProto(s.h.HandleAppendEntries(appendEntriesArgsFromProto(req))), nil
+	args, err := appendEntriesArgsFromProto(req)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "malformed AppendEntries: %v", err)
+	}
+	return appendEntriesReplyToProto(s.h.HandleAppendEntries(args)), nil
 }
 
 func (s *server) InstallSnapshot(_ context.Context, req *raftv1.InstallSnapshotRequest) (*raftv1.InstallSnapshotResponse, error) {
