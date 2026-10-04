@@ -273,7 +273,10 @@ func (s *Server) applyKV(cmd *command) outcome {
 	if err := proto.Unmarshal(cmd.KVBytes, &e); err != nil {
 		panic(fmt.Sprintf("shardkv: bad kv entry: %v", err))
 	}
-	return outcome{r: m.Apply(&e)}
+	// ApplyChecked: a stale entry is skipped, and its waiter is told so
+	// instead of being handed an empty "success".
+	r, err := m.ApplyChecked(&e)
+	return outcome{r: r, err: err}
 }
 
 // applyConfig moves cur forward by exactly one configuration, recomputing

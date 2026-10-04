@@ -6,7 +6,10 @@
 A Raft-replicated, sharded control plane with a lease-and-fencing job scheduler and a
 stateless serving gateway doing rate limiting, semantic caching, prefix-aware routing and
 hedging — plus a seeded chaos harness that checks the whole thing with a linearizability
-checker. **No consensus libraries: Raft is implemented from the paper.**
+checker. **No consensus libraries: Raft is implemented from the paper.** Its test suite,
+test harness and simulated network are adapted from the MIT 6.5840 labs (credited in the file
+headers); the Raft implementation, everything above it, and the other test suites are this
+project's own.
 
 Go and Python. 18 test packages, all passing under `go test -race`.
 
@@ -107,7 +110,7 @@ Full context and conditions in [BENCHMARKS.md](BENCHMARKS.md). All on one 8 GB l
 | | Result | What it shows |
 |---|---|---|
 | Group commit | 1,082 → **11,312** puts/s | Amortizing fsync across a batch; p50 unchanged, so the win is throughput, not latency |
-| Cost of consensus | 11,312 → **339** puts/s | The same store replicated across 3 processes on the same disk. This ~33x gap is what consensus costs |
+| Cost of replication (Phase 2) | 11,312 → **339** puts/s | The same store replicated across 3 processes on one disk. Part of that ~33x is the protocol (an extra round trip and fsyncs on a majority); a large part was this implementation's persister, fixed below |
 | Raft group commit | 192 → **1,385** ops/s at 64 clients, p99 596 → 71 ms | The KV had been capped at one write per fsync whatever the concurrency; found by benchmarking the gateway above it |
 | Exactly-once under chaos | 2,000 jobs, 1,334 lease-expiry pauses, 1,124 crashes, **1,314 zombie writes fenced**, exactly 2,000 commits | No job ever committed twice |
 | Linearizable across shard moves | **3,191 ops, 3 groups, 0 violations** | Porcupine-clean while shards migrate live |
@@ -178,12 +181,14 @@ The engineering record, not a highlight reel. Each is written up where it happen
   refusing to operate as a "violation". Fixed by bounding it to a minority of failures.
 - **Fixing that broke a reproducibility test** — which turned out to be asserting something
   the design deliberately doesn't guarantee. The test was wrong, not the fix.
-- **The semantic cache could answer a different question.** Two different questions behind
-  the same long system prompt embed at cosine 0.93, above the 0.92 near-hit threshold,
-  because n-gram similarity is dominated by the text they share. The tests only used short
-  prompts, so they never saw it; recording the real-model demo did. Near hits are now
-  confirmed by a bounded edit distance against the stored prompt, and a regression test
-  fails without the fix.
+- **The semantic cache could answer a different question, and the first fix was not enough.**
+  Two different questions behind the same long system prompt embed at cosine 0.93, above the
+  0.92 threshold, because n-gram similarity is dominated by the shared text. The first fix
+  added an edit-distance check scaled to prompt length, and an outside review showed it still
+  served "capital of Spain?" the cached answer for "capital of France?" (a few edits inside a
+  15-character budget). Lexical similarity cannot see meaning. The cache is now **exact-match
+  only by default**, scoped per tenant; near-duplicate matching is opt-in (`-cache-near`) with
+  a flat 3-character budget, and its limits are documented.
 - **The published hedging win was mostly load-spreading.** It hedged at 250 ms, below the
   median latency, so 62% of requests were hedged. Running the suite against the real model
   exposed it. The e2e now fails if hedges reach half the requests;
@@ -195,6 +200,39 @@ The engineering record, not a highlight reel. Each is written up where it happen
   then exposed a race in the Raft test harness itself; it was confirmed by logging rather than assumed.
 - **Real-model "prefill" included queueing**, timed from before the worker's model lock, and
   the mocks counted injected stalls as prefill. Both now report compute only.
+
+### What two outside code reviews found
+
+Two independent reviewers read the code. Every finding below was reproduced with a test that
+failed before the fix and passes after (or, where it did not reproduce, that is recorded):
+
+- **Slow clients got truncated answers, and the truncation was cached.** End-of-stream and
+  tokens travelled on two channels and a `select` picked between them at random: 187 of 200
+  slow-reader streams were cut short and cached that way. Closing the token channel is now the
+  only end-of-stream signal, and only a stream that reached `done` is cached.
+- **Clock skew switched rate limiting off.** Gateways with skewed clocks each re-credited the
+  same elapsed time: 4,000 admitted against a budget of 220. The bucket's refill time now only
+  moves forward.
+- **Any client could rewrite the Raft log.** Raft RPCs shared the client port, unauthenticated:
+  a forged `RequestVote` with a huge term sent to a client port was granted and deposed the
+  leader. Peer and client traffic now have separate listeners.
+- **Shard data vanished after every group left and rejoined.** A shard reassigned from "no
+  owner" started empty. Replicas now remember each shard's last real owner.
+- **The scheduler stalled behind one long job.** With the production scan limit only 255 of 300
+  queued jobs were ever claimed. The chaos test had only passed because it raised the limit.
+- **An idempotent submit could create two jobs** if a write failed half-way and the client
+  retried. Jobs are now staged until their key is bound.
+- **Reconfiguration stopped after enough uptime.** The shard controller never compacted its log
+  and every query had a 100 ms deadline. It now snapshots, and query deadlines back off.
+- **The checks themselves could not fail.** The cancellation check matched any "cancel" in any
+  log; the gateway chaos test passed at 100% errors; KV chaos never used the production client
+  or its retry/dedup path; scheduler chaos used a non-production scan limit and no idempotency
+  keys. Each now has a demonstration that it catches an injected failure.
+- Smaller: tenant-shared cache entries, double-counted load, a corrupt rate-limit record that
+  wedged a tenant forever, inference failing whenever the control plane did (now fails open),
+  SIGTERM ignored, mismatched default ports, Python clients that could not fail over or follow
+  leader hints, Docker healthchecks that reported a dead node healthy, a misattributed citation,
+  and docs that claimed cache features that did not exist.
 
 ---
 

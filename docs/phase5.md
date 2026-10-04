@@ -393,8 +393,11 @@ on a precision/recall curve: lower it and you catch more paraphrases and occasio
 question; raise it and you cache almost nothing. With a real embedding model the failure mode gets
 *more* dangerous, not less, because a good model will happily rate "refund policy for enterprise
 customers" and "refund policy for trial customers" as very similar. The systems layer offers mechanisms
-— threshold, TTL (`semcache.go:66-73`), per-tenant key namespacing, a confirm-by-exact mode — but
-**which risk is acceptable is a product decision**. Say that out loud in a design interview; the wrong
+— a threshold, a TTL, per-tenant scoping of every cache key (the gateway prefixes keys with a hash
+of the tenant), and an exact-match-only mode, which is now the default (near-duplicate hits need
+`-cache-near`) — but **which risk is acceptable is a product decision**. (An earlier version of
+this paragraph listed tenant namespacing and an exact-only mode before either existed. An outside
+review caught it; both were then built.) Say that out loud in a design interview; the wrong
 answer is presenting a similarity threshold as a correctness guarantee. Two smaller honest notes:
 expiry is judged by whichever replica looks, so skew shifts expiry by the skew — a hit-rate concern,
 never a correctness one (`:101-105`); and `Store` runs *after* the last token (`server.go:480-482`), so
@@ -799,8 +802,8 @@ measuring, then check.
    shows you know when *not* to reach for CAS. Then the honest part: a semantic cache can serve **a
    different prompt's** answer. The threshold is a point on a precision/recall curve, the risk gets
    *worse* with a better embedder because it rates more things similar, and which risk is acceptable is
-   a product decision, not a systems one. Offer the mechanisms — threshold, TTL, per-tenant namespacing,
-   confirm-by-exact — and make someone else own the policy.
+   a product decision, not a systems one. Offer the mechanisms (threshold, TTL, per-tenant key scoping,
+   exact-match-only as the default) and make someone else own the policy.
 
 9. **How would you measure whether your routing change actually helped?** Design the regime first. My
    first attempt ran 4 prefixes over 4 workers with a default-size prefix cache; within seconds every

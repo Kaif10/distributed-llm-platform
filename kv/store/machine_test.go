@@ -325,3 +325,25 @@ func TestMachineRestoreGarbage(t *testing.T) {
 		t.Fatal("sessions lost after failed restore")
 	}
 }
+
+// ApplyChecked applies exactly like Apply (a stale entry mutates nothing)
+// but tells a waiting caller the entry was stale, instead of an empty
+// Result that reads as success.
+func TestApplyCheckedReportsStale(t *testing.T) {
+	m := NewMachine()
+	newer := &kvv1.LogEntry{Op: kvv1.Op_OP_PUT, Key: "k", Value: []byte("v2"), Meta: meta("c", 2)}
+	older := &kvv1.LogEntry{Op: kvv1.Op_OP_PUT, Key: "k", Value: []byte("v1"), Meta: meta("c", 1)}
+	if _, err := m.ApplyChecked(newer); err != nil {
+		t.Fatalf("newer: %v", err)
+	}
+	if _, err := m.ApplyChecked(older); !errors.Is(err, ErrStaleRequest) {
+		t.Fatalf("older (stale) entry: err = %v, want ErrStaleRequest", err)
+	}
+	if v, _ := m.Get("k"); string(v) != "v2" {
+		t.Fatalf("stale entry mutated state: k = %q", v)
+	}
+	// A duplicate of the newest is not stale: it returns the original result.
+	if _, err := m.ApplyChecked(newer); err != nil {
+		t.Fatalf("duplicate of the latest request: %v", err)
+	}
+}

@@ -137,6 +137,19 @@ func (m *Machine) Apply(e *kvv1.LogEntry) Result {
 	return r
 }
 
+// ApplyChecked is Apply for callers with someone waiting on the result. It
+// applies exactly as Apply does (stale entries are skipped, deterministically),
+// but reports a skipped stale entry as ErrStaleRequest instead of an empty
+// Result. Without that, a replicated server whose log held a stale request
+// (two in-flight requests from one identity, applied newest first) told the
+// waiting caller its write succeeded when it was never applied.
+func (m *Machine) ApplyChecked(e *kvv1.LogEntry) (Result, error) {
+	if _, _, err := m.Dedup(e.Meta); err != nil {
+		return Result{}, err
+	}
+	return m.Apply(e), nil
+}
+
 // applyOp performs the state change for one entry.
 func (m *Machine) applyOp(e *kvv1.LogEntry) Result {
 	switch e.Op {

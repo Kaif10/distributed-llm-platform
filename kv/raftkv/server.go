@@ -206,14 +206,16 @@ func (s *Server) applyLoop() {
 			// Machine.Apply is idempotent per RequestMeta, so a client's
 			// retry that got logged twice (leader change mid-flight) is
 			// applied once. Phase 1 built that property for exactly this.
-			r := s.m.Apply(&e)
+			// ApplyChecked: a stale entry is skipped, and its waiter is
+			// told so instead of being handed an empty "success".
+			r, applyErr := s.m.ApplyChecked(&e)
 			s.lastApplied = msg.CommandIndex
 			s.appliedCond.Broadcast()
 
 			if w, ok := s.waiters[msg.CommandIndex]; ok {
 				delete(s.waiters, msg.CommandIndex)
 				if w.term == msg.CommandTerm {
-					w.ch <- outcome{r: r}
+					w.ch <- outcome{r: r, err: applyErr}
 				} else {
 					w.ch <- outcome{err: ErrLeaderChanged}
 				}
