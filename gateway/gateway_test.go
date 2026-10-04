@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -670,5 +671,154 @@ func TestCacheIsIsolatedPerTenantWithRealNearCache(t *testing.T) {
 	// Within a tenant, a one-character typo is still a near hit.
 	if _, first, err := h.generate(bg, "summarize my private notes", "tenant-a", 4, false); err != nil || !first.Cached {
 		t.Fatalf("same-tenant near duplicate should hit: first=%+v err=%v", first, err)
+	}
+}
+
+// Regression: with a worker that produces tokens faster than they are
+// forwarded (here: instantly, and the client reads slowly), the forwarding
+// loop must deliver every token in order and only then cache the full text.
+// It used to select between "more tokens" and "worker finished" with both
+// ready, pick "finished" at random, return with tokens still buffered, and
+// Store the truncated text.
+func TestSlowClientGetsEveryTokenAndCacheGetsFullText(t *testing.T) {
+	const nTok, iters = 64, 200
+	c := newFakeCache()
+	h := newHarness(t, 1, Options{PrefixRouting: true, Cache: c}, func(int) mock.Options {
+		return mock.Options{
+			BasePrefillMs: 1, PrefillPerChar: 0, TokenMs: 1,
+			// No real sleeping: the worker emits all 64 tokens at once.
+			Sleep: func(ctx context.Context, _ time.Duration) error { return ctx.Err() },
+		}
+	})
+	truncated, badCache := 0, 0
+	for it := 0; it < iters; it++ {
+		prompt := fmt.Sprintf("slow client prompt %d", it)
+		st, err := h.client.Generate(bg, &gatewayv1.GenerateRequest{
+			Tenant: "t1", Prompt: prompt, MaxTokens: nTok,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var sb strings.Builder
+		next := int32(0)
+		sawDone := false
+		for {
+			tok, err := st.Recv()
+			if err != nil {
+				break // EOF (or error): stream over
+			}
+			if tok.Index != next {
+				t.Fatalf("iter %d: got token index %d, want %d", it, tok.Index, next)
+			}
+			next++
+			sb.WriteString(tok.Text)
+			if tok.Done {
+				sawDone = true
+				break
+			}
+			if next%16 == 0 {
+				time.Sleep(time.Millisecond) // a slow reader
+			}
+		}
+		complete := next == nTok && sawDone
+		if !complete {
+			truncated++
+			if truncated <= 3 {
+				t.Errorf("iter %d: stream truncated: %d/%d tokens, done=%v", it, next, nTok, sawDone)
+			}
+		}
+		// Store runs after the last Send, so give it a moment to land. A
+		// truncated stream must not be cached at all; a complete one must be
+		// cached byte for byte.
+		key := cacheKey("t1", prompt)
+		var cached string
+		var ok bool
+		wait := time.Second
+		if !complete {
+			wait = 50 * time.Millisecond
+		}
+		for deadline := time.Now().Add(wait); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+			c.mu.Lock()
+			cached, ok = c.m[key]
+			c.mu.Unlock()
+			if ok {
+				break
+			}
+		}
+		want := ""
+		if complete {
+			want = sb.String()
+		}
+		if ok != complete || cached != want {
+			badCache++
+			if badCache <= 3 {
+				t.Errorf("iter %d: cache has %d bytes (present=%v); stream had %d bytes (complete=%v)", it, len(cached), ok, sb.Len(), complete)
+			}
+		}
+	}
+	if truncated > 0 || badCache > 0 {
+		t.Fatalf("%d/%d streams truncated, %d/%d cache entries wrong", truncated, iters, badCache, iters)
+	}
+}
+
+// scriptedClient is an in-process InferenceClient that replays toks and
+// then ends the stream with endErr (io.EOF for a clean close).
+type scriptedClient struct {
+	toks   []*inferv1.Token
+	endErr error
+}
+
+func (c *scriptedClient) Generate(context.Context, *inferv1.GenerateRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[inferv1.Token], error) {
+	return &scriptedStream{toks: c.toks, endErr: c.endErr}, nil
+}
+
+func (c *scriptedClient) Health(context.Context, *inferv1.HealthRequest, ...grpc.CallOption) (*inferv1.HealthResponse, error) {
+	return &inferv1.HealthResponse{}, nil
+}
+
+type scriptedStream struct {
+	grpc.ClientStream
+	toks   []*inferv1.Token
+	endErr error
+}
+
+func (s *scriptedStream) Recv() (*inferv1.Token, error) {
+	if len(s.toks) == 0 {
+		return nil, s.endErr
+	}
+	t := s.toks[0]
+	s.toks = s.toks[1:]
+	return t, nil
+}
+
+// A worker stream that ends without a done token (EOF early, or an error
+// mid-stream) is not a complete answer: the request must fail and nothing
+// may be cached.
+func TestIncompleteWorkerStreamIsNotCached(t *testing.T) {
+	partial := []*inferv1.Token{{Text: "a ", Index: 0}, {Text: "b ", Index: 1}, {Text: "c ", Index: 2}}
+	for name, endErr := range map[string]error{
+		"eof-without-done": io.EOF,
+		"error-mid-stream": status.Error(codes.Internal, "worker blew up"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			kv := newMemKV()
+			reg := router.NewRegistry(kv, router.Options{CacheTTL: time.Millisecond})
+			if _, err := reg.Register(bg, router.Worker{ID: "w", Addr: "scripted"}, time.Minute); err != nil {
+				t.Fatal(err)
+			}
+			c := newFakeCache()
+			s := New(Options{KV: kv, Registry: reg, Cache: c, PrefixRouting: true,
+				Dial: func(string) (inferv1.InferenceClient, error) {
+					return &scriptedClient{toks: partial, endErr: endErr}, nil
+				}})
+			defer s.Close()
+			err := s.Generate(&gatewayv1.GenerateRequest{Tenant: "t", Prompt: "p", MaxTokens: 8}, &nopStream{ctx: bg})
+			if status.Code(err) != codes.Unavailable {
+				t.Fatalf("want Unavailable for an incomplete stream, got %v", err)
+			}
+			if n := c.stores.Load(); n != 0 {
+				t.Fatalf("an incomplete stream was cached (%d stores)", n)
+			}
+		})
 	}
 }

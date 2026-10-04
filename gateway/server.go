@@ -18,6 +18,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -380,8 +381,16 @@ type attempt struct {
 	// first carries the first token (or an error) so the racer can pick a
 	// winner as soon as either attempt produces anything.
 	first chan attemptFirst
-	// tokens carries the remaining tokens after the first.
+	// tokens carries the remaining tokens after the first, in order, and is
+	// closed when runAttempt returns. Closing it is the ONLY end-of-stream
+	// signal: the consumer learns the stream is over by draining it, so it
+	// can never stop while tokens are still buffered. (An earlier version
+	// signalled completion on errs and selected on both channels; with both
+	// ready, select picks at random, so a fast worker and a slow client
+	// truncated the response and cached the truncated text.)
 	tokens chan *inferv1.Token
+	// errs holds why the stream ended without a done token, written (at
+	// most once, buffered) BEFORE tokens is closed.
 	errs   chan error
 	cancel context.CancelFunc
 	span   trace.Span // gateway.attempt; ended when runAttempt returns
@@ -548,27 +557,45 @@ func (s *Server) streamFromWorkers(
 		return err
 	}
 
-	// Forward the rest, accumulating for the cache.
+	// Forward the rest, accumulating for the cache. Only a stream that
+	// reached done=true is a complete answer, and only a complete answer
+	// may be cached: anything else (worker error, worker EOF without done,
+	// client gone) returns without Store, so a partial completion can never
+	// be served to the next caller as if it were the whole thing.
 	var full []byte
 	full = append(full, firstTok.Text...)
+	store := func() {
+		if s.opts.Cache != nil && !req.NoCache && len(full) > 0 {
+			_ = s.opts.Cache.Store(ctx, cacheKey(tenant, req.Prompt), string(full))
+		}
+	}
+	if firstTok.Done {
+		store()
+		return nil
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			s.cancelled.Add(1)
 			return status.FromContextError(ctx.Err()).Err()
-		case err := <-winner.errs:
-			if err != nil {
+		case tok, ok := <-winner.tokens:
+			if !ok {
+				// Closed before a done token. runAttempt writes the reason
+				// to errs before closing tokens, so this does not block.
+				err := errStreamEndedEarly
+				select {
+				case e := <-winner.errs:
+					if e != nil {
+						err = e
+					}
+				default:
+				}
+				if ctx.Err() != nil {
+					s.cancelled.Add(1)
+					return status.FromContextError(ctx.Err()).Err()
+				}
 				s.workerErrors.Add(1)
 				return status.Errorf(codes.Unavailable, "worker %s: %v", winner.worker.ID, err)
-			}
-			// Clean end of stream.
-			if s.opts.Cache != nil && !req.NoCache && len(full) > 0 {
-				_ = s.opts.Cache.Store(ctx, cacheKey(tenant, req.Prompt), string(full))
-			}
-			return nil
-		case tok := <-winner.tokens:
-			if tok == nil {
-				continue
 			}
 			full = append(full, tok.Text...)
 			if err := stream.Send(&gatewayv1.Token{
@@ -578,14 +605,16 @@ func (s *Server) streamFromWorkers(
 				return err
 			}
 			if tok.Done {
-				if s.opts.Cache != nil && !req.NoCache && len(full) > 0 {
-					_ = s.opts.Cache.Store(ctx, cacheKey(tenant, req.Prompt), string(full))
-				}
+				store()
 				return nil
 			}
 		}
 	}
 }
+
+// errStreamEndedEarly: the worker closed its stream (EOF) without ever
+// sending a done token, so what we have is not a complete answer.
+var errStreamEndedEarly = errors.New("worker stream ended before done")
 
 // runAttempt opens one worker stream and pumps it into the attempt's
 // channels. It exits promptly when its context is cancelled, which is what
@@ -614,19 +643,17 @@ func (s *Server) runAttempt(ctx context.Context, a *attempt, reqID, prompt, tena
 	a.first <- attemptFirst{tok: tok, a: a}
 
 	if tok.Done {
-		a.errs <- nil
-		return
+		return // the deferred close of tokens is the end-of-stream signal
 	}
+	// Every exit below either follows a done token or writes the reason to
+	// errs first; the deferred close(a.tokens) then tells the consumer, after
+	// every token sent so far. Nothing here ever drops a token: the send
+	// blocks until the consumer takes it or the attempt is cancelled.
 	for {
 		tok, err := st.Recv()
 		if err != nil {
-			if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
-				a.errs <- nil
-				return
-			}
 			if isEOF(err) {
-				a.errs <- nil
-				return
+				err = errStreamEndedEarly
 			}
 			a.errs <- err
 			return
@@ -634,15 +661,15 @@ func (s *Server) runAttempt(ctx context.Context, a *attempt, reqID, prompt, tena
 		select {
 		case a.tokens <- tok:
 		case <-ctx.Done():
+			a.errs <- ctx.Err()
 			return
 		}
 		if tok.Done {
-			a.errs <- nil
 			return
 		}
 	}
 }
 
 func isEOF(err error) bool {
-	return err != nil && (err.Error() == "EOF" || errors.Is(err, context.Canceled))
+	return errors.Is(err, io.EOF)
 }
