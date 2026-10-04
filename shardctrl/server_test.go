@@ -34,7 +34,7 @@ type cluster struct {
 	lastLeader atomic.Int32
 }
 
-func newCluster(t *testing.T, n int) *cluster {
+func newCluster(t *testing.T, n int, opts ...func(*Config)) *cluster {
 	c := &cluster{
 		t:          t,
 		n:          n,
@@ -49,6 +49,9 @@ func newCluster(t *testing.T, n int) *cluster {
 				ElectionTimeoutMax: 500 * time.Millisecond,
 			},
 		},
+	}
+	for _, o := range opts {
+		o(&c.cfg)
 	}
 	for i := 0; i < n; i++ {
 		c.persisters[i] = raft.NewMemPersister()

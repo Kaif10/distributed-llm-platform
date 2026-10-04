@@ -97,15 +97,17 @@ type group struct {
 	addrs      []string
 	net        *simnet.Net
 	fetcher    *fakeFetcher
-	ctrl       *fakeCtrl
+	ctrl       Controller
+	tweaks     []func(*Options)
 	mu         sync.Mutex
 	servers    []*Server
 	persisters []*raft.MemPersister
 	lastLeader atomic.Int32
 }
 
-func newGroup(t *testing.T, gid int64, n int, ctrl *fakeCtrl, fetcher *fakeFetcher) *group {
+func newGroup(t *testing.T, gid int64, n int, ctrl Controller, fetcher *fakeFetcher, tweaks ...func(*Options)) *group {
 	g := &group{
+		tweaks:     tweaks,
 		gid:        gid,
 		addrs:      make([]string, n),
 		net:        simnet.New(n),
@@ -138,7 +140,7 @@ func (g *group) start(i int) {
 			peers[j] = g.net.Peer(i, j)
 		}
 	}
-	s := New(peers, i, g.persisters[i], Options{
+	opts := Options{
 		GID:           g.gid,
 		Addrs:         g.addrs,
 		Ctrl:          g.ctrl,
@@ -150,7 +152,11 @@ func (g *group) start(i int) {
 			ElectionTimeoutMin: 250 * time.Millisecond,
 			ElectionTimeoutMax: 500 * time.Millisecond,
 		},
-	})
+	}
+	for _, tw := range g.tweaks {
+		tw(&opts)
+	}
+	s := New(peers, i, g.persisters[i], opts)
 	g.mu.Lock()
 	g.servers[i] = s
 	g.mu.Unlock()
@@ -791,5 +797,100 @@ func TestLinearizabilityAcrossShardMoves(t *testing.T) {
 		t.Fatal("history is NOT linearizable")
 	case porcupine.Unknown:
 		t.Log("checker timed out; treating as inconclusive")
+	}
+}
+
+// TestDataSurvivesLeaveAllAndRejoin is the regression test for a shard's
+// data being dropped when every group leaves (every shard is assigned to
+// gid 0) and groups later join again. The old owner froze each shard into
+// its outgoing table on the way to gid 0, but the next owner treated
+// "previous owner 0" as "brand-new shard" and started from an empty
+// machine, so every key written before the leave silently vanished.
+//
+// The rejoin config splits shards between the SAME group that used to own
+// them (A, which must find its own frozen copy) and a different group (B,
+// which must pull it from A), so both recovery paths are exercised. Dedup
+// sessions must survive too: a pre-leave CAS retried after the rejoin must
+// return its original outcome rather than being re-applied.
+func TestDataSurvivesLeaveAllAndRejoin(t *testing.T) {
+	ctrl := newFakeCtrl()
+	fetcher := newFakeFetcher()
+	gA := newGroup(t, 100, 3, ctrl, fetcher)
+	gB := newGroup(t, 200, 3, ctrl, fetcher)
+	ctrl.push(allTo(100, map[int64][]string{100: gA.addrs}))
+	tc := &testCluster{ctrl: ctrl, groups: map[int64]*group{100: gA, 200: gB}}
+	cl := tc.client("c1")
+	ctx, cancel := ctxT(30 * time.Second)
+	defer cancel()
+
+	keys := make([]string, 0, 3*shard.NShards)
+	for i := 0; len(keys) < cap(keys); i++ {
+		keys = append(keys, fmt.Sprintf("k%d", i))
+	}
+	for _, k := range keys {
+		if err := cl.put(ctx, k, "v-"+k); err != nil {
+			t.Fatalf("put %s: %v", k, err)
+		}
+	}
+	casKey := keys[0]
+	casMeta := cl.meta()
+	casReq := &kvv1.CASRequest{Meta: casMeta, Key: casKey, Expected: []byte("v-" + casKey), Value: []byte("cas-" + casKey)}
+	if err := tc.do(ctx, casKey, func(s *Server) error { _, err := s.CompareAndSwap(ctx, casReq); return err }); err != nil {
+		t.Fatal(err)
+	}
+
+	// Everyone leaves: every shard unassigned, no groups listed.
+	leaveNum := ctrl.push(Config{})
+	waitApplied := func(g *group, num int64) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			for i := 0; i < g.n(); i++ {
+				if s := g.server(i); s != nil && s.IsLeader() && s.CurrentConfig().Num >= num {
+					return
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("group %d never applied config %d", g.gid, num)
+	}
+	waitApplied(gA, leaveNum)
+
+	// Rejoin: even shards back to A, odd shards to B.
+	var rejoin Config
+	rejoin.Groups = map[int64][]string{100: gA.addrs, 200: gB.addrs}
+	for i := range rejoin.Shards {
+		rejoin.Shards[i] = 100
+		if i%2 == 1 {
+			rejoin.Shards[i] = 200
+		}
+	}
+	ctrl.push(rejoin)
+
+	for _, k := range keys {
+		want := "v-" + k
+		if k == casKey {
+			want = "cas-" + k
+		}
+		v, found, err := cl.get(ctx, k)
+		if err != nil {
+			t.Fatalf("get %s after rejoin: %v", k, err)
+		}
+		if !found || v != want {
+			t.Fatalf("key %s (shard %d, now owned by %d) after leave-all + rejoin: got %q found=%v, want %q",
+				k, shard.Key2Shard(k), rejoin.Owner(shard.Key2Shard(k)), v, found, want)
+		}
+	}
+
+	var retry *kvv1.CASResponse
+	if err := tc.do(ctx, casKey, func(s *Server) error {
+		var err error
+		retry, err = s.CompareAndSwap(ctx, casReq)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !retry.Swapped {
+		t.Fatal("pre-leave CAS retried after rejoin was re-evaluated: its dedup session was lost")
 	}
 }

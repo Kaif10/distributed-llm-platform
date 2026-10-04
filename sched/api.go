@@ -104,8 +104,9 @@ type Options struct {
 	// disagree will disagree about expiry by that skew, which is a liveness
 	// concern (a lease reaped early or late), never a safety one (fencing).
 	Clock func() time.Time
-	// ScanLimit caps how many job records one Claim or Reap will read while
-	// scanning from head. 0 means 256. A scan is O(runnable-distance) reads
+	// ScanLimit caps how many job records one Reap, or one of Claim's two
+	// scan windows (from head, and from the rotating cursor), will read.
+	// 0 means 256. A scan is O(runnable-distance) reads
 	// through the KV; see docs/phase4.md for why this is acceptable here
 	// and what the indexed alternative looks like.
 	ScanLimit int
