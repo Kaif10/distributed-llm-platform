@@ -117,7 +117,9 @@ func TestExactHitAfterStore(t *testing.T) {
 	}
 
 	s := c.Stats()
-	if s.Lookups != 3 || s.ExactHits != 2 || s.NearHits != 0 || s.Misses != 1 || s.Stores != 1 || s.LocalVectors != 1 {
+	// LocalVectors is 0: with the near path off (the default) nothing is
+	// embedded or indexed.
+	if s.Lookups != 3 || s.ExactHits != 2 || s.NearHits != 0 || s.Misses != 1 || s.Stores != 1 || s.LocalVectors != 0 {
 		t.Fatalf("stats: %+v", s)
 	}
 }
@@ -127,7 +129,7 @@ func TestExactHitAfterStore(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestNearHit(t *testing.T) {
-	c, _ := newTestCache(newMemKV(), Options{})
+	c, _ := newTestCache(newMemKV(), Options{Near: true})
 	emb := c.emb
 
 	// Make the threshold choice visible: log the raw similarities.
@@ -162,7 +164,7 @@ func TestNearHit(t *testing.T) {
 // question was served the first one's answer. A genuine variant of the long
 // prompt (a typo in the question) must still hit.
 func TestNearHitRejectsDifferentQuestionSharingSystemPrompt(t *testing.T) {
-	c, _ := newTestCache(newMemKV(), Options{})
+	c, _ := newTestCache(newMemKV(), Options{Near: true})
 	sys := "You are a helpful teaching assistant for a university course on distributed systems. " +
 		"You explain consensus, replication, sharding, leases and fault tolerance clearly and " +
 		"accurately, in plain English, in at most two short sentences.\n\n"
@@ -188,6 +190,65 @@ func TestNearHitRejectsDifferentQuestionSharingSystemPrompt(t *testing.T) {
 		t.Fatalf("typo variant of a long prompt missed: hit=%v text=%q", hit, text)
 	}
 	if s := c.Stats(); s.NearHits != 1 || s.Lookups != s.ExactHits+s.NearHits+s.Misses {
+		t.Fatalf("stats: %+v", s)
+	}
+}
+
+// Regression: the near-duplicate check used to allow an edit budget of 5% of
+// the prompt length, so behind a ~300-char shared system prompt it allowed
+// ~15 edits, and "capital of Spain?" (5 edits from "capital of France?") was
+// served France's cached answer.
+func TestNearHitRejectsOneWordChangeBehindLongPrompt(t *testing.T) {
+	sys := "You are a concise geography tutor. Answer the user's question in a single short " +
+		"sentence. Do not add any commentary, caveats, or follow-up questions. If you do not " +
+		"know the answer, say that you do not know. Always use plain English and avoid jargon. " +
+		"Prefer the official name of a place over a colloquial one.\n\n"
+	france := sys + "User: What is the capital of France?\nAssistant:"
+	spain := sys + "User: What is the capital of Spain?\nAssistant:"
+	typo := sys + "User: What is the capitol of France?\nAssistant:" // one substitution
+	t.Logf("system prompt is %d chars", len(sys))
+
+	for _, near := range []bool{false, true} {
+		c, _ := newTestCache(newMemKV(), Options{Near: near})
+		vf, _ := c.emb.Embed(bg, normalise(france))
+		vs, _ := c.emb.Embed(bg, normalise(spain))
+		t.Logf("near=%v: cosine(france, spain) = %.4f, threshold = %.2f", near, Cosine(vf, vs), c.Options().Threshold)
+
+		if err := c.Store(bg, france, "Paris."); err != nil {
+			t.Fatal(err)
+		}
+		if text, hit, _ := c.Lookup(bg, spain); hit {
+			t.Fatalf("near=%v: capital of Spain was served the cached answer for France: %q", near, text)
+		}
+		// A one-character typo of the same long prompt is a near hit only
+		// when the near path is switched on.
+		text, hit, _ := c.Lookup(bg, typo)
+		if hit != near {
+			t.Fatalf("near=%v: one-char typo hit=%v text=%q", near, hit, text)
+		}
+		if hit && text != "Paris." {
+			t.Fatalf("near=%v: typo served %q", near, text)
+		}
+	}
+}
+
+// With default options the cache is exact-match only: a spelling variant
+// misses, and Store does not embed or index anything.
+func TestNearPathOffByDefault(t *testing.T) {
+	c, _ := newTestCache(newMemKV(), Options{})
+	if c.Options().Near {
+		t.Fatal("near path must be opt-in")
+	}
+	if err := c.Store(bg, promptA, answerA); err != nil {
+		t.Fatal(err)
+	}
+	if text, hit, _ := c.Lookup(bg, promptA2); hit {
+		t.Fatalf("spelling variant hit with the near path off: %q", text)
+	}
+	if text, hit, _ := c.Lookup(bg, promptA); !hit || text != answerA {
+		t.Fatalf("exact lookup: hit=%v text=%q", hit, text)
+	}
+	if s := c.Stats(); s.LocalVectors != 0 || s.NearHits != 0 || s.ExactHits != 1 || s.Misses != 1 {
 		t.Fatalf("stats: %+v", s)
 	}
 }
@@ -221,7 +282,7 @@ func TestEditDistanceWithin(t *testing.T) {
 // dangling index entry is dropped so the scan does not keep finding it.
 func TestNearHitDanglingKeyIsMiss(t *testing.T) {
 	kv := newMemKV()
-	c, _ := newTestCache(kv, Options{})
+	c, _ := newTestCache(kv, Options{Near: true})
 	if err := c.Store(bg, promptA, answerA); err != nil {
 		t.Fatal(err)
 	}
@@ -241,8 +302,8 @@ func TestNearHitDanglingKeyIsMiss(t *testing.T) {
 
 func TestTwoGatewaysShareExactNotNear(t *testing.T) {
 	kv := newMemKV()
-	a, _ := newTestCache(kv, Options{})
-	b, _ := newTestCache(kv, Options{})
+	a, _ := newTestCache(kv, Options{Near: true})
+	b, _ := newTestCache(kv, Options{Near: true})
 
 	if err := a.Store(bg, promptA, answerA); err != nil {
 		t.Fatal(err)
@@ -257,7 +318,7 @@ func TestTwoGatewaysShareExactNotNear(t *testing.T) {
 	// Local index: B has now indexed promptA (learned from the exact hit),
 	// so the variant is a near hit on B too. Use a third replica that has
 	// seen nothing to show the documented miss.
-	c, _ := newTestCache(kv, Options{})
+	c, _ := newTestCache(kv, Options{Near: true})
 	if _, hit, _ := c.Lookup(bg, promptA2); hit {
 		t.Fatal("C near lookup hit with an empty local index; vectors are not shared")
 	}
@@ -289,7 +350,7 @@ func TestTwoGatewaysShareExactNotNear(t *testing.T) {
 
 func TestTTLExpiry(t *testing.T) {
 	kv := newMemKV()
-	c, clk := newTestCache(kv, Options{TTL: time.Minute})
+	c, clk := newTestCache(kv, Options{TTL: time.Minute, Near: true})
 
 	if err := c.Store(bg, promptA, answerA); err != nil {
 		t.Fatal(err)
@@ -329,7 +390,7 @@ func TestTTLExpiry(t *testing.T) {
 
 func TestMaxLocalEviction(t *testing.T) {
 	const maxLocal = 200
-	c, _ := newTestCache(newMemKV(), Options{MaxLocal: maxLocal})
+	c, _ := newTestCache(newMemKV(), Options{MaxLocal: maxLocal, Near: true})
 	for i := 0; i < maxLocal+50; i++ {
 		if err := c.Store(bg, fmt.Sprintf("prompt number %d about topic %d", i, i*7), "x"); err != nil {
 			t.Fatal(err)
@@ -404,8 +465,8 @@ func TestNGramEmbedderDeterministicAndUnit(t *testing.T) {
 
 func TestConcurrentStoreLookup(t *testing.T) {
 	kv := newMemKV()
-	a, _ := newTestCache(kv, Options{MaxLocal: 64})
-	b, _ := newTestCache(kv, Options{MaxLocal: 64})
+	a, _ := newTestCache(kv, Options{MaxLocal: 64, Near: true})
+	b, _ := newTestCache(kv, Options{MaxLocal: 64, Near: true})
 	var wg sync.WaitGroup
 	for g := 0; g < 8; g++ {
 		wg.Add(1)
@@ -445,7 +506,7 @@ func TestConcurrentStoreLookup(t *testing.T) {
 
 func BenchmarkLookupNear(b *testing.B) {
 	const n = 5000
-	c, _ := newTestCache(newMemKV(), Options{MaxLocal: n})
+	c, _ := newTestCache(newMemKV(), Options{MaxLocal: n, Near: true})
 	for i := 0; i < n; i++ {
 		p := fmt.Sprintf("Explain concept %d of distributed systems in simple terms, please, with an example about topic %d.", i, i*31%997)
 		if err := c.Store(bg, p, "answer"); err != nil {

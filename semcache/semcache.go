@@ -17,6 +17,13 @@
 // linearizable KV. A hit here needs no embedding at all, just one hash and
 // one Get.
 //
+// The near path is OFF by default (Options.Near). Serving a cached answer to
+// a prompt that is not the same prompt is a correctness risk, not just a
+// hit-rate knob: an n-gram embedding plus an edit-distance check is lexical
+// and cannot see meaning, so it must be a deliberate choice per deployment.
+// With Near off, Lookup is exact-match only (after case/whitespace
+// normalisation) and Store does not embed at all.
+//
 // The near path exists to catch "Summarise" versus "Summarize". It needs a
 // vector per cached prompt and a similarity search over all of them, and
 // neither belongs in the KV: vectors are large relative to the rest of the
@@ -89,10 +96,15 @@ import (
 type Options struct {
 	// Prefix namespaces every key. Empty means "semcache".
 	Prefix string
-	// Threshold is the minimum cosine similarity for a near hit. 0 means
-	// 0.92, which with NGramEmbedder catches spelling variants and small
-	// edits but not a one-word change of subject; see the near-hit test for
-	// the numbers behind the choice.
+	// Near enables the near-duplicate path: a prompt within Threshold
+	// cosine AND at most NearMaxEdits character edits of a cached one is
+	// served that one's answer. false (the default) is exact-match only;
+	// see the package doc for why this is opt-in.
+	Near bool
+	// Threshold is the minimum cosine similarity for a near hit (only used
+	// with Near). 0 means 0.92. Cosine is only the candidate filter: behind a
+	// long shared system prompt two different questions score ~0.99, so the
+	// edit-distance check (nearDuplicate) is what actually decides.
 	Threshold float32
 	// MaxLocal bounds the local vector index. Once full, the oldest vector
 	// (by insertion) is evicted. 0 means 10000.
@@ -216,23 +228,30 @@ func decodeEntry(b []byte) (entry, bool) {
 	}, true
 }
 
+// NearMaxEdits is the near-duplicate edit budget, in characters.
+const NearMaxEdits = 3
+
 // nearDuplicate is the second stage of a near hit: the embedding proposes a
 // candidate, this disposes. Cosine over n-gram counts is dominated by
 // whatever text two prompts SHARE, so two different questions behind the
-// same long system prompt score ~0.93 and would otherwise be served each
-// other's answers. A near-duplicate is a small edit, so the check is a
-// bounded edit distance: at most 5% of the longer prompt, minimum 3, which
-// admits spelling variants and punctuation but not a different question.
+// same long system prompt score ~0.93-0.99 and would otherwise be served
+// each other's answers. A near-duplicate is a small edit, so the check is a
+// bounded edit distance.
 //
-// It is lexical, so it cannot see meaning: "is X safe" and "is X unsafe"
-// are two edits apart and still match. That is the price of a near-dup
-// cache without a semantic model, and why Threshold stays conservative.
+// The budget is ABSOLUTE (NearMaxEdits), not a fraction of the prompt. It
+// used to be 5% of the longer prompt, which sounds conservative until the
+// prompt carries a 300-char system prompt: then 15 edits were allowed and
+// "capital of Spain?" (5 edits from "capital of France?") got France's
+// answer. What distinguishes a typo from a different question is the size
+// of the edit to the part that differs, and that does not grow with the
+// shared text in front of it.
+//
+// It is lexical, so it cannot see meaning: "cat" and "car" are one edit
+// apart, as are "is X safe" and "is X unsafe" (two), and both still match.
+// No edit budget fixes that; only a real semantic model could, which is
+// why the whole near path is opt-in.
 func nearDuplicate(a, b string) bool {
-	k := max(len(a), len(b)) / 20
-	if k < 3 {
-		k = 3
-	}
-	return editDistanceWithin(a, b, k)
+	return editDistanceWithin(a, b, NearMaxEdits)
 }
 
 // editDistanceWithin reports whether the Levenshtein distance between a and
@@ -331,7 +350,8 @@ func (c *Cache) embedUnit(ctx context.Context, norm string) ([]float32, error) {
 // ---------------------------------------------------------------------------
 
 // Lookup returns the cached completion for prompt if one exists, trying the
-// shared exact path first and the local near path second. A near hit is
+// shared exact path first and, with Options.Near, the local near path
+// second. A near hit is
 // only possible for a prompt this replica has indexed; see the package doc.
 func (c *Cache) Lookup(ctx context.Context, prompt string) (string, bool, error) {
 	c.lookups.Add(1)
@@ -348,12 +368,16 @@ func (c *Cache) Lookup(ctx context.Context, prompt string) (string, bool, error)
 		// Learn: index this prompt if we have not already, so the near
 		// path can find its variants later. Embedding only on the first
 		// exact hit keeps the steady-state exact path embedding-free.
-		if !c.opts.Index.Has(key) {
+		if c.opts.Near && !c.opts.Index.Has(key) {
 			if vec, err := c.embedUnit(ctx, norm); err == nil {
 				c.opts.Index.Add(vec, key)
 			}
 		}
 		return e.text, true, nil
+	}
+	if !c.opts.Near {
+		c.misses.Add(1)
+		return "", false, nil
 	}
 	// Absent or stale. If stale, the index may still point at it; drop that
 	// so the near path below does not immediately re-find the same key.
@@ -397,7 +421,8 @@ func (c *Cache) Lookup(ctx context.Context, prompt string) (string, bool, error)
 // ---------------------------------------------------------------------------
 
 // Store records text as the completion for prompt: Put the shared exact
-// entry, then embed and add to the local index. The Put comes first because
+// entry, then (with Options.Near) embed and add to the local index. The Put
+// comes first because
 // it is what other replicas can see; if embedding then fails, the exact path
 // still works everywhere and the error tells the caller only the near path
 // was not updated.
@@ -408,6 +433,9 @@ func (c *Cache) Store(ctx context.Context, prompt, text string) error {
 		return err
 	}
 	c.stores.Add(1)
+	if !c.opts.Near {
+		return nil
+	}
 	vec, err := c.embedUnit(ctx, norm)
 	if err != nil {
 		return err

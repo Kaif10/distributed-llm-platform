@@ -7,7 +7,7 @@
 //
 //	client ─Generate(stream)─▶ gateway replica (any of N, all stateless)
 //	                              │ 1. rate limit: per-tenant token bucket in the KV (CAS)
-//	                              │ 2. semantic cache: near-duplicate prompt? stream the cached answer
+//	                              │ 2. semantic cache: seen this prompt (opt-in: a near-dup)? stream the cached answer
 //	                              │ 3. route: rendezvous-hash the prompt PREFIX onto a live worker
 //	                              │ 4. stream tokens back; hedge to a 2nd worker if the 1st is slow
 //	                              ▼    to start; cancel the loser; cancel the worker if the client goes

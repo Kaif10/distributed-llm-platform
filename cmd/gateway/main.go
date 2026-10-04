@@ -58,7 +58,8 @@ func main() {
 	leaseFraction := flag.Float64("rl-lease-fraction", 0.1, "lease up to this fraction of a tenant's burst per KV CAS and spend it locally (0 = exact, one CAS per request); see ratelimit.Options")
 	leaseTTL := flag.Duration("rl-lease-ttl", time.Second, "drop unused leased tokens after this long")
 	cache := flag.Bool("cache", true, "enable the semantic cache")
-	cacheThreshold := flag.Float64("cache-threshold", 0.92, "cosine similarity for a near-duplicate cache hit")
+	cacheNear := flag.Bool("cache-near", false, "also serve near-duplicate prompts (cosine >= -cache-threshold and <= 3 char edits); off = exact match only. Lexical, cannot see meaning; see semcache")
+	cacheThreshold := flag.Float64("cache-threshold", 0.92, "cosine similarity for a near-duplicate cache hit (with -cache-near)")
 	cacheTTL := flag.Duration("cache-ttl", 0, "expire cache entries after this long (0 = never)")
 	maxInflight := flag.Int("max-inflight", 8, "routing skips a worker at or above this many streams (ignored with -load-factor)")
 	loadFactor := flag.Float64("load-factor", 1.25, "bounded-load prefix routing: skip workers above this multiple of the fleet's average load (0 = plain affinity)")
@@ -119,10 +120,14 @@ func main() {
 	cacheDesc := "off"
 	if *cache {
 		semantic = semcache.New(kv, semcache.NewNGramEmbedder(256), semcache.Options{
+			Near:      *cacheNear,
 			Threshold: float32(*cacheThreshold),
 			TTL:       *cacheTTL,
 		})
-		cacheDesc = "on"
+		cacheDesc = "exact"
+		if *cacheNear {
+			cacheDesc = "exact+near"
+		}
 	}
 
 	srv := gateway.New(gateway.Options{
