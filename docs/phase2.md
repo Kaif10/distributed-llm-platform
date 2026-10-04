@@ -552,7 +552,7 @@ Answer these in your own words, here, before starting Phase 3.
   exercise (a).
 - Ongaro's thesis, chapter 4 (membership changes) and section 6.4 (read-only queries), for
   exercises (a), (c) and (d).
-- "Students' Guide to Raft" (Kleppmann's students, MIT 6.824 TA blog): the seven bugs above are its
+- "Students' Guide to Raft" (Jon Gjengset, written as an MIT 6.824 TA): the seven bugs above are its
   checklist with our line numbers.
 - Herlihy and Wing, "Linearizability: A Correctness Condition for Concurrent Objects", sections 1-2,
   and the Porcupine README for how the checker searches.

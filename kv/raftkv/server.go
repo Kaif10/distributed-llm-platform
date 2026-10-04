@@ -35,6 +35,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -94,6 +95,7 @@ type Server struct {
 	m           *store.Machine
 	lastApplied uint64
 	waiters     map[uint64]*waiter // by log index
+	appliedCond *sync.Cond         // on mu; broadcast whenever lastApplied moves
 }
 
 type waiter struct {
@@ -120,6 +122,7 @@ func New(peers []raft.Peer, me int, persister raft.Persister, cfg Config) *Serve
 		m:         store.NewMachine(),
 		waiters:   make(map[uint64]*waiter),
 	}
+	s.appliedCond = sync.NewCond(&s.mu)
 	s.rf = raft.New(peers, me, persister, s.applyCh, cfg.Raft)
 	go s.applyLoop()
 	return s
@@ -189,6 +192,7 @@ func (s *Server) applyLoop() {
 					panic(fmt.Sprintf("raftkv: restore snapshot: %v", err))
 				}
 				s.lastApplied = msg.SnapshotIndex
+				s.appliedCond.Broadcast()
 			}
 
 		case msg.CommandValid:
@@ -204,6 +208,7 @@ func (s *Server) applyLoop() {
 			// applied once. Phase 1 built that property for exactly this.
 			r := s.m.Apply(&e)
 			s.lastApplied = msg.CommandIndex
+			s.appliedCond.Broadcast()
 
 			if w, ok := s.waiters[msg.CommandIndex]; ok {
 				delete(s.waiters, msg.CommandIndex)
@@ -311,11 +316,59 @@ func (s *Server) Get(ctx context.Context, req *kvv1.GetRequest) (*kvv1.GetRespon
 	if req.Key == "" {
 		return nil, status.Error(codes.InvalidArgument, "empty key")
 	}
-	r, err := s.propose(ctx, &kvv1.LogEntry{Op: kvv1.Op_OP_GET, Key: req.Key})
+	v, found, err := s.readIndexGet(ctx, req.Key)
+	if errors.Is(err, raft.ErrReadIndexNotReady) {
+		// New leader, nothing committed in its term yet: read through the
+		// log, which is always correct (see raft/readindex.go step 2).
+		r, err := s.propose(ctx, &kvv1.LogEntry{Op: kvv1.Op_OP_GET, Key: req.Key})
+		if err != nil {
+			return nil, s.toStatus(err)
+		}
+		return &kvv1.GetResponse{Value: r.Value, Found: r.Found}, nil
+	}
 	if err != nil {
 		return nil, s.toStatus(err)
 	}
-	return &kvv1.GetResponse{Value: r.Value, Found: r.Found}, nil
+	return &kvv1.GetResponse{Value: v, Found: found}, nil
+}
+
+// readIndexGet serves a linearizable read without a log entry: confirm
+// leadership and a read index with Raft, wait until this replica has applied
+// that index, then read the local state machine (Raft thesis §6.4).
+func (s *Server) readIndexGet(ctx context.Context, key string) ([]byte, bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, s.cfg.CommitTimeout)
+	defer cancel()
+	idx, err := s.rf.ReadIndex(ctx)
+	switch {
+	case errors.Is(err, raft.ErrNotLeader):
+		return nil, false, ErrNotLeader
+	case errors.Is(err, context.DeadlineExceeded) && ctx.Err() != nil:
+		return nil, false, ErrTimeout
+	case err != nil:
+		return nil, false, err
+	}
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() { // wake the wait below if ctx ends first
+		select {
+		case <-ctx.Done():
+			s.mu.Lock()
+			s.appliedCond.Broadcast()
+			s.mu.Unlock()
+		case <-stop:
+		}
+	}()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for s.lastApplied < idx {
+		if ctx.Err() != nil {
+			return nil, false, ErrTimeout
+		}
+		s.appliedCond.Wait()
+	}
+	v, found := s.m.Get(key)
+	return bytes.Clone(v), found, nil // the caller reads it after we unlock
 }
 
 func (s *Server) Delete(ctx context.Context, req *kvv1.DeleteRequest) (*kvv1.DeleteResponse, error) {

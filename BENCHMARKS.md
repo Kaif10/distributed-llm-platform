@@ -383,8 +383,14 @@ asserts only that the experiment ran end to end.
 
 **What this shows, and why the failure is the good outcome.** Twenty VUs were pointed at two workers
 on purpose. A serving layer with no admission queue should queue and grow a tail *visibly* under
-demand beyond capacity, and 552/552 checks confirm nothing was dropped, corrupted or truncated — just
-slow. A threshold that passes no matter how hard you push tells you nothing about where capacity ends.
+demand beyond capacity, and 552/552 checks confirm every stream produced a first token and reached
+`done` rather than erroring. That is weaker than it sounds: the checks do not compare token counts or
+content, so they would not catch a truncated or corrupted stream that still ended with `done`. (A
+later review found exactly such a truncation risk in the gateway, which unit tests now cover.) The
+run's gateway flags were not recorded, and the k6 prompts differ by only a character or two, so with
+near-duplicate caching on, many requests may have been cache hits rather than model calls. Treat
+this as a tail-growth demonstration, not a correctness or capacity result. A threshold that passes no
+matter how hard you push tells you nothing about where capacity ends.
 
 ---
 

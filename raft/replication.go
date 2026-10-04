@@ -60,6 +60,7 @@ func (rf *Raft) sendAppendEntries(peer int) {
 		return
 	}
 	prev := rf.nextIndex[peer] - 1
+	round := rf.hbRound // for ReadIndex: which heartbeat round this answers
 	args := &AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderID:     rf.me,
@@ -88,6 +89,9 @@ func (rf *Raft) sendAppendEntries(peer int) {
 	if rf.role != leader || rf.currentTerm != args.Term {
 		return
 	}
+	// Any reply in our term, success or not, shows this peer still
+	// recognises us as leader (ReadIndex step 3).
+	rf.noteAck(peer, round)
 
 	if reply.Success {
 		// Advance only if this reply is newer than what we already know.

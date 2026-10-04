@@ -120,6 +120,14 @@ type Raft struct {
 	savedSeq    uint64     // under persistMu: highest persistSeq written
 	persistKick chan struct{}
 	durableCond *sync.Cond // on mu; broadcast when durableSeq advances or on Kill
+
+	// ReadIndex (readindex.go). hbRound numbers heartbeat rounds; each
+	// AppendEntries carries the round current when it was built, and a reply
+	// in our term records it in ackRound[peer]. A read is confirmed once a
+	// majority has acknowledged a round that began after the read arrived.
+	hbRound  uint64
+	ackRound []uint64
+	readCond *sync.Cond // on mu; broadcast on acks, role changes and Kill
 }
 
 // New creates a Raft peer. peers[me] is unused. The peer starts as a
@@ -151,9 +159,11 @@ func New(peers []Peer, me int, persister Persister, applyCh chan<- ApplyMsg, cfg
 		nextIndex:  make([]uint64, len(peers)),
 		matchIndex: make([]uint64, len(peers)),
 		trigger:    make([]chan struct{}, len(peers)),
+		ackRound:   make([]uint64, len(peers)),
 	}
 	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.durableCond = sync.NewCond(&rf.mu)
+	rf.readCond = sync.NewCond(&rf.mu)
 	rf.persistKick = make(chan struct{}, 1)
 	for i := range rf.trigger {
 		rf.trigger[i] = make(chan struct{}, 1)
@@ -227,6 +237,7 @@ func (rf *Raft) Kill() {
 		rf.mu.Lock()
 		rf.applyCond.Broadcast()
 		rf.durableCond.Broadcast() // release handlers waiting on a save
+		rf.readCond.Broadcast()    // and reads waiting on a heartbeat round
 		rf.mu.Unlock()
 	}
 }
@@ -286,6 +297,7 @@ func (rf *Raft) becomeFollower(term uint64) {
 		rf.logf("-> follower (term %d)", term)
 	}
 	rf.role = follower
+	rf.readCond.Broadcast() // pending ReadIndex calls must fail now
 }
 
 func (rf *Raft) becomeLeader() {
