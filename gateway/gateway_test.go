@@ -730,7 +730,7 @@ func TestSlowClientGetsEveryTokenAndCacheGetsFullText(t *testing.T) {
 		// Store runs after the last Send, so give it a moment to land. A
 		// truncated stream must not be cached at all; a complete one must be
 		// cached byte for byte.
-		key := cacheKey("t1", prompt)
+		key := cacheKey("t1", nTok, prompt)
 		var cached string
 		var ok bool
 		wait := time.Second
@@ -968,5 +968,29 @@ func TestRateLimitContentionDoesNotFailOpen(t *testing.T) {
 	}
 	if n := s.Snapshot().RateLimitFailOpen; n != 0 {
 		t.Fatalf("RateLimitFailOpen=%d, want 0", n)
+	}
+}
+
+// The cache key must include max_tokens: the same prompt asked for 4 tokens
+// and then for 16 is a different request, and serving the 4-token answer
+// (or a longer one to a shorter request) is a wrong answer.
+func TestCacheKeyIncludesMaxTokens(t *testing.T) {
+	c := newFakeCache()
+	h := newHarness(t, 1, Options{PrefixRouting: true, Cache: c}, func(int) mock.Options {
+		return mock.Options{BasePrefillMs: 1, PrefillPerChar: 0, TokenMs: 1}
+	})
+	const prompt = "list the planets"
+	if _, first, err := h.generate(bg, prompt, "t", 4, false); err != nil || first.Cached {
+		t.Fatalf("first request: first=%+v err=%v", first, err)
+	}
+	toks, first, err := h.generate(bg, prompt, "t", 16, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Cached {
+		t.Fatalf("max_tokens=16 was served the cached max_tokens=4 answer (%q)", toks)
+	}
+	if _, first, err := h.generate(bg, prompt, "t", 4, false); err != nil || !first.Cached {
+		t.Fatalf("same prompt and max_tokens should hit: first=%+v err=%v", first, err)
 	}
 }

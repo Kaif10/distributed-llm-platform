@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -406,7 +407,7 @@ func (s *Server) Generate(req *gatewayv1.GenerateRequest, stream grpc.ServerStre
 	} else if s.opts.Cache != nil && !req.NoCache {
 		ccCtx, ccSpan := obs.Tracer("gateway").Start(ctx, "gateway.cache_lookup")
 		kctx, cancel := s.kvCtx(ccCtx)
-		text, hit, err := s.opts.Cache.Lookup(kctx, cacheKey(tenant, req.Prompt))
+		text, hit, err := s.opts.Cache.Lookup(kctx, cacheKey(tenant, maxTokens, req.Prompt))
 		cancel()
 		s.kvOutcome(ctx, err)
 		ccSpan.SetAttributes(attribute.Bool("cache_hit", hit))
@@ -491,9 +492,15 @@ func (s *Server) Generate(req *gatewayv1.GenerateRequest, stream grpc.ServerStre
 // in ~60 of 64 lowercase hex characters, which survives normalisation and is
 // far outside any near-duplicate budget, while within one tenant the prefix
 // is identical and near matching behaves exactly as before.
-func cacheKey(tenant, prompt string) string {
+//
+// maxTokens is part of the key too: the same prompt asked for 4 tokens and
+// for 16 is a different request, and either answer served for the other is
+// wrong. It is the EFFECTIVE value, after DefaultMaxTokens, so 0 and an
+// explicit default share an entry. (Anything else that changes the output,
+// such as temperature, would belong here as well; this API has nothing else.)
+func cacheKey(tenant string, maxTokens int32, prompt string) string {
 	sum := sha256.Sum256([]byte(tenant))
-	return "tenant:" + hex.EncodeToString(sum[:]) + "\n" + prompt
+	return "tenant:" + hex.EncodeToString(sum[:]) + "\n" + strconv.Itoa(int(maxTokens)) + "\n" + prompt
 }
 
 // streamCached replays a cached completion as a token stream, so a cache
@@ -712,7 +719,7 @@ func (s *Server) streamFromWorkers(
 				return
 			}
 			kctx, cancel := s.kvCtx(ctx)
-			err := s.opts.Cache.Store(kctx, cacheKey(tenant, req.Prompt), string(full))
+			err := s.opts.Cache.Store(kctx, cacheKey(tenant, maxTokens, req.Prompt), string(full))
 			cancel()
 			s.kvOutcome(ctx, err)
 		}
