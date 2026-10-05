@@ -61,6 +61,11 @@ type Server struct {
 	// breaker.go.
 	kvBreaker *kvBreaker
 
+	// labelled is the set of tenants that have their own metric label;
+	// see Options.MaxTenantLabels and tenantLabel.
+	labelMu  sync.Mutex
+	labelled map[string]bool
+
 	routedMu sync.Mutex
 	routedTo map[string]uint64
 
@@ -97,6 +102,9 @@ func New(opts Options) *Server {
 	}
 	if opts.DefaultMaxTokens <= 0 {
 		opts.DefaultMaxTokens = 64
+	}
+	if opts.MaxTenantLabels <= 0 {
+		opts.MaxTenantLabels = 100
 	}
 	if opts.Clock == nil {
 		opts.Clock = time.Now
@@ -342,6 +350,15 @@ func (s *Server) Generate(req *gatewayv1.GenerateRequest, stream grpc.ServerStre
 	if tenant == "" {
 		tenant = "default"
 	}
+	if !validTenant(tenant) {
+		// The tenant is client-supplied and becomes a metric label and part
+		// of KV keys, so its shape is checked before it reaches either.
+		// (This bounds what a name can be, not how many a client can
+		// invent: each valid name still gets a rate-limit bucket. Bounding
+		// that needs authenticated tenants, which this system does not
+		// have; see DESIGN.md §1.)
+		return status.Error(codes.InvalidArgument, "tenant must be 1-64 characters of [A-Za-z0-9._:-]")
+	}
 	maxTokens := req.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = s.opts.DefaultMaxTokens
@@ -389,7 +406,7 @@ func (s *Server) Generate(req *gatewayv1.GenerateRequest, stream grpc.ServerStre
 		}
 		if !ok {
 			s.rateLimited.Add(1)
-			s.opts.Metrics.IncRateLimited(tenant)
+			s.opts.Metrics.IncRateLimited(s.tenantLabel(tenant))
 			rlSpan.SetAttributes(attribute.Bool("limited", true))
 			rlSpan.End()
 			return status.Errorf(codes.ResourceExhausted,
@@ -415,7 +432,7 @@ func (s *Server) Generate(req *gatewayv1.GenerateRequest, stream grpc.ServerStre
 		if err == nil && hit {
 			s.cacheHits.Add(1)
 			span.SetAttributes(attribute.Bool("cached", true))
-			s.opts.Metrics.ObserveRequest(tenant, true, false)
+			s.opts.Metrics.ObserveRequest(s.tenantLabel(tenant), true, false)
 			return s.streamCached(stream, text, started)
 		} else if err != nil {
 			// A cache failure must never fail the request: fall through to
@@ -686,7 +703,7 @@ func (s *Server) streamFromWorkers(
 		attribute.Bool("hedge_won", winner.isHedge),
 		attribute.Bool("prefix_cache_hit", firstTok.PrefixCacheHit),
 	)
-	s.opts.Metrics.ObserveRequest(tenant, false, hedged)
+	s.opts.Metrics.ObserveRequest(s.tenantLabel(tenant), false, hedged)
 	s.opts.Metrics.ObserveTTFT(float64(ttft))
 
 	// Forward the first token with the metadata the benchmark reads.
@@ -832,4 +849,39 @@ func (s *Server) runAttempt(ctx context.Context, a *attempt, reqID, prompt, tena
 
 func isEOF(err error) bool {
 	return errors.Is(err, io.EOF)
+}
+
+// tenantLabel is the metric label for tenant: its own name for the first
+// Options.MaxTenantLabels distinct tenants seen, "other" after that.
+func (s *Server) tenantLabel(tenant string) string {
+	s.labelMu.Lock()
+	defer s.labelMu.Unlock()
+	if s.labelled[tenant] {
+		return tenant
+	}
+	if s.labelled == nil {
+		s.labelled = map[string]bool{}
+	}
+	if len(s.labelled) >= s.opts.MaxTenantLabels {
+		return "other"
+	}
+	s.labelled[tenant] = true
+	return tenant
+}
+
+// validTenant: 1-64 characters of [A-Za-z0-9._:-].
+func validTenant(t string) bool {
+	if len(t) == 0 || len(t) > 64 {
+		return false
+	}
+	for i := 0; i < len(t); i++ {
+		c := t[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '.', c == '_', c == ':', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }

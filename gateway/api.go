@@ -139,6 +139,12 @@ type Options struct {
 	// DefaultMaxTokens applies when a request says 0. 0 means 64.
 	DefaultMaxTokens int32
 
+	// MaxTenantLabels bounds Prometheus label cardinality: the first this
+	// many distinct tenants get their own label and the rest share "other".
+	// The tenant is client-supplied (there is no auth), so without a bound
+	// a client inventing names creates unbounded metric series. 0 means 100.
+	MaxTenantLabels int
+
 	// Metrics receives Prometheus counters/histograms for the request path.
 	// nil (the zero value from a struct literal that doesn't set it)
 	// disables metrics entirely: every call site nil-checks before use,

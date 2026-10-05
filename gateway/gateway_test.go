@@ -659,7 +659,7 @@ func TestCacheIsIsolatedPerTenantWithRealNearCache(t *testing.T) {
 	if _, _, err := h.generate(bg, prompt, "tenant-a", 4, false); err != nil {
 		t.Fatal(err)
 	}
-	for _, other := range []string{"tenant-b", "Tenant-a", "tenant-a "} {
+	for _, other := range []string{"tenant-b", "Tenant-a", "tenant-a."} { // "tenant-a " (space) is now rejected outright
 		_, first, err := h.generate(bg, prompt, other, 4, false)
 		if err != nil {
 			t.Fatal(err)
@@ -992,5 +992,40 @@ func TestCacheKeyIncludesMaxTokens(t *testing.T) {
 	}
 	if _, first, err := h.generate(bg, prompt, "t", 4, false); err != nil || !first.Cached {
 		t.Fatalf("same prompt and max_tokens should hit: first=%+v err=%v", first, err)
+	}
+}
+
+// Tenant names come from the client. Malformed ones are rejected before they
+// reach a metric label or a KV key.
+func TestMalformedTenantRejected(t *testing.T) {
+	h := newHarness(t, 1, Options{PrefixRouting: true}, func(int) mock.Options {
+		return mock.Options{BasePrefillMs: 1, PrefillPerChar: 0, TokenMs: 1}
+	})
+	for _, tenant := range []string{strings.Repeat("a", 65), "has space", "slash/tenant", "new\nline", "emoji-é"} {
+		_, _, err := h.generate(bg, "hello", tenant, 2, true)
+		if status.Code(err) != codes.InvalidArgument {
+			t.Errorf("tenant %q: err = %v, want InvalidArgument", tenant, err)
+		}
+	}
+	if _, _, err := h.generate(bg, "hello", "acme-prod.eu:1", 2, true); err != nil {
+		t.Fatalf("valid tenant rejected: %v", err)
+	}
+}
+
+// Metric label cardinality is bounded no matter how many distinct tenants
+// clients invent: the first MaxTenantLabels get their own label, the rest
+// share "other".
+func TestTenantMetricLabelsBounded(t *testing.T) {
+	s := New(Options{MaxTenantLabels: 10})
+	defer s.Close()
+	labels := map[string]bool{}
+	for i := 0; i < 1000; i++ {
+		labels[s.tenantLabel(fmt.Sprintf("t%d", i))] = true
+	}
+	if len(labels) != 11 || !labels["other"] {
+		t.Fatalf("1000 tenants produced %d labels, want 10 named plus \"other\"", len(labels))
+	}
+	if s.tenantLabel("t3") != "t3" {
+		t.Fatal("an early tenant lost its own label")
 	}
 }
