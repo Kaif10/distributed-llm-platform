@@ -623,6 +623,13 @@ you loosen until the test stops flaking. The bound **is** the test.
 
 ### 8.2 Affinity balances prefixes, not load — the A→B regression
 
+> **Re-measured (2026-10-05).** The single-run numbers below came from a confounded setup:
+> `-max-inflight 16` against workers that run 4 at once, warm workers reused across phases, one
+> trial. With those removed (`scripts/bench_routing.sh`, 5 trials, closed and open loop) the
+> throughput cost of affinity is about 9%, not about 35%. Bounded-load routing has the best hit
+> rate (0.51 vs 0.29), and hedging remains the clear p99 win. See `BENCHMARKS.md`. The mechanism
+> described below is real; its magnitude was overstated.
+
 Not a code bug: a bug in the expectation, found because the benchmark measured outcome and not only
 mechanism. Prefix routing tripled the cache hit rate (0.20 → 0.60), cut mean prefill, and collapsed
 prefix spread to 1.08 — and made throughput *worse* (20.4 → 13.4 req/s) and p99 TTFT *worse* (967 →

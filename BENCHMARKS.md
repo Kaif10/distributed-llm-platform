@@ -331,6 +331,50 @@ more than twice the baseline's cache hits. It is a point on a frontier, not a fr
 some hit rate to buy balance, and the load factor is the dial. The e2e now fails if B2 does not beat B
 on throughput, or loses the hit-rate advantage over A. One run; the 1.25 factor was not tuned.
 
+### Routing re-measured with repeated trials (2026-10-05)
+
+An outside review named the confounds in every routing table above: a single trial, workers
+reused across phases (so caches warmed by one phase helped the next), `-max-inflight 16` against
+Python workers that run 4 requests at a time, only one slow worker, and closed-loop load only.
+`scripts/bench_routing.sh` removes them: a **fresh stack** (KV, gateway, workers) for every
+trial of every phase, `-max-inflight 4` to match worker concurrency, **two** of four workers
+stalling (probability 0.1, 2.5 s), **5 trials** per phase, and the same run again **open-loop**.
+240 requests per trial, 12 prefixes, 32-block worker caches, mock backend, one laptop.
+
+**Closed loop, 16 clients** (mean ± sample sd over 5 trials):
+
+| Phase | req/s | Hit rate | TTFT p50 | TTFT p99 | Hedges |
+|---|---|---|---|---|---|
+| A least-loaded | 17.5 ± 1.0 | 0.23 ± 0.02 | 202 ms | 2704 ms | 0 |
+| B pure affinity | 16.0 ± 0.4 | 0.29 ± 0.03 | 202 ms | 2864 ± 200 ms | 0 |
+| B2 bounded load (1.25) | 16.5 ± 1.3 | **0.51 ± 0.10** | 207 ms | 3094 ± 170 ms | 0 |
+| C affinity + hedging (1 s) | **19.2 ± 0.9** | 0.30 ± 0.05 | 202 ms | **1578 ± 138 ms** | 16 of 240 |
+
+**Open loop, Poisson arrivals at 12 req/s** (below capacity, so throughput just tracks the
+offered rate; latency is measured from each request's scheduled send time):
+
+| Phase | Hit rate | TTFT p50 | TTFT p99 |
+|---|---|---|---|
+| A least-loaded | 0.22 ± 0.04 | 201 ms | 2705 ms |
+| B pure affinity | 0.44 ± 0.11 | 171 ± 59 ms | 2726 ms |
+| B2 bounded load | **0.53 ± 0.09** | **146 ± 68 ms** | 2760 ms |
+| C affinity + hedging | 0.47 ± 0.08 | 170 ± 57 ms | **1295 ± 78 ms** |
+
+*What changed.* The Phase 5 table's "affinity cuts throughput from 20.4 to 13.4 req/s" was
+mostly an artifact of `-max-inflight 16`: with a cap four times the worker's real concurrency, a
+hot worker absorbed its whole share and queued. With a capacity-matched cap, affinity costs about
+9% of throughput in closed loop (17.5 → 16.0, outside one sd of each) and nothing measurable
+below capacity. The tension between locality and balance is real but modest.
+
+*What held up.* Bounded-load routing gives the best hit rate in both modes (0.51 and 0.53, against
+0.29 and 0.44 for pure affinity), because its overflow goes to each prefix's consistent second
+choice, which builds a warm cache too. Hedging at 1 s cuts p99 roughly in half in both modes
+while hedging about 7% of requests.
+
+*What this still does not show.* A mock backend with an injected stall distribution, 4 workers,
+one laptop. The real-model routing runs are in the next section; their re-run with this
+methodology has not been done.
+
 ### What the outside reviews changed in these numbers
 
 Two independent code reviews found bugs that affected measurements. The Phase 5 hedging win was mostly

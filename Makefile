@@ -1,6 +1,6 @@
 # Run `. .\env.ps1` (PowerShell) or `source ./env.sh` (Git Bash) first.
 
-.PHONY: all proto build test test-crash test-exercises test-raft test-lin test-shard test-sched e2e-sched test-llm e2e-llm e2e-llm-hf test-chaos chaos-docker obs-up obs-down lint tidy clean
+.PHONY: all proto build test test-crash test-exercises test-raft test-lin test-shard test-sched e2e-sched test-llm e2e-llm e2e-llm-hf bench-routing test-chaos chaos-docker obs-up obs-down lint tidy clean
 
 all: proto build test
 
@@ -65,6 +65,11 @@ e2e-llm:
 # CPU), sized for an 8GB laptop. Needs torch + transformers (py/requirements.txt).
 e2e-llm-hf:
 	BACKEND=hf bash scripts/e2e_llm.sh 80
+
+# The routing comparison as published: fresh stack per trial, 5 trials, closed
+# loop; OPEN=1 RATE=12 for open loop. (e2e-llm is the pass/fail gate.)
+bench-routing:
+	bash scripts/bench_routing.sh
 
 # Phase 6: the deterministic-ish chaos harness. -short runs the quick control
 # only; the full run is 12 seeds x KV+scheduler(+gateway) chaos.

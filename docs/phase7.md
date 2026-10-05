@@ -373,6 +373,8 @@ everything.
 With the benchmark finally able to fail, here is what it said. Four workers, 12 distinct ~600-char
 system prompts, 240 requests, 16 concurrent, workers capped at 32 cache blocks.
 
+> **Re-measured (2026-10-05).** This table came from one trial with confounds (an admission cap of 16 against workers that run 4 at once, workers reused across phases, one slow worker). Re-measured without them over 5 trials, closed and open loop, affinity costs about 9% of throughput rather than about 35%, bounded-load routing gives the best hit rate, and hedging remains the clear p99 win. See [BENCHMARKS.md](../BENCHMARKS.md#routing-re-measured-with-repeated-trials-2026-10-05).
+
 > **Correction (2026-10-01).** The hedging run below hedged at 250 ms, under the median TTFT, so it hedged ~62% of requests: its p99 gain was mostly load-spreading. Re-measured with tail-only hedging (1 s delay, 23% of requests hedged): p99 4,232 → 2,076 ms, with the median getting *worse*. See [BENCHMARKS.md](../BENCHMARKS.md#correction-2026-10-01-the-original-hedging-result-was-mostly-load-spreading).
 
 | run | routing | hedging | hit rate | mean prefill | TTFT p50 | TTFT p99 | req/s | per-worker |

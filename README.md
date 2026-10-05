@@ -114,7 +114,7 @@ Full context and conditions in [BENCHMARKS.md](BENCHMARKS.md). All on one 8 GB l
 | Raft group commit | 192 → **1,385** ops/s at 64 clients, p99 596 → 71 ms | The KV had been capped at one write per fsync whatever the concurrency; found by benchmarking the gateway above it |
 | Exactly-once under chaos | 2,000 jobs, 1,334 lease-expiry pauses, 1,124 crashes, **1,314 zombie writes fenced**, exactly 2,000 commits | No job ever committed twice |
 | Linearizable across shard moves | **3,191 ops, 3 groups, 0 violations** | Porcupine-clean while shards migrate live |
-| Prefix-aware routing | cache hit rate 0.20 → **0.60** | …and throughput got *worse* (20.4 → 13.4 req/s). Affinity balances prefixes, not load — see below |
+| Prefix-aware routing (5 trials, fresh workers each) | hit rate 0.23 → 0.29 (pure affinity), **0.51** with bounded load | Throughput 17.5 → 16.0 req/s: a ~9% cost, not the ~35% a single confounded run first showed ([re-measured](BENCHMARKS.md#routing-re-measured-with-repeated-trials-2026-10-05)) |
 | Hedging on top | p99 TTFT 4,232 → **2,076 ms**, hedging 23% of requests | Recovers the tail the hot-spot created. An earlier 1,515 → 958 ms figure hedged 62% of requests: load-spreading, not tail hedging ([correction](BENCHMARKS.md#correction-2026-10-01-the-original-hedging-result-was-mostly-load-spreading)) |
 | Chaos suite | 12 seeds, **0 violations** | Plus 14/14 checks against real containers |
 
@@ -159,11 +159,16 @@ it makes benchmarks deterministic and needs no weights; the real path proves the
 the router is built on actually hold. Implementation and its honest limits (no batching,
 no paged KV sharing, greedy decoding) in [`py/hf_backend.py`](py/hf_backend.py).
 
-**The most interesting result is a regression.** Prefix-aware routing tripled the worker
-cache hit rate and simultaneously made throughput and tail latency worse, because hashing
-12 prefixes onto 4 workers handed two of them ~85% of the traffic. Reporting hit rate alone
-would have shipped a throughput regression as a win. Hedging then recovered the tail.
-Written up in [docs/phase5.md](docs/phase5.md).
+**The most instructive result is a regression, and how much of it survived measurement.**
+A first run showed prefix-aware routing tripling the cache hit rate while cutting throughput
+from 20.4 to 13.4 req/s, because hashing 12 prefixes onto 4 workers handed two of them ~85% of
+the traffic. Reporting hit rate alone would have shipped that as a win. An outside review then
+pointed out the run's confounds (one trial, workers reused across phases, an admission cap of 16
+against workers that run 4 at once, one slow worker). Re-measured without them, over 5 trials
+each in closed and open loop, the tension is real but much smaller (about 9%), bounded-load
+routing gives the best hit rate (0.51 vs 0.29), and tail hedging is the clear win on p99.
+Written up in [docs/phase5.md](docs/phase5.md) and
+[BENCHMARKS.md](BENCHMARKS.md#routing-re-measured-with-repeated-trials-2026-10-05).
 
 ## Bugs the tests actually caught
 
@@ -233,6 +238,25 @@ failed before the fix and passes after (or, where it did not reproduce, that is 
   SIGTERM ignored, mismatched default ports, Python clients that could not fail over or follow
   leader hints, Docker healthchecks that reported a dead node healthy, a misattributed citation,
   and docs that claimed cache features that did not exist.
+
+A third review checked those fixes (it read the new Raft code for ordering races and found it
+correct) and found a further, smaller set, each again fixed test-first:
+
+- **A fully cached prompt corrupted the real model's output.** The last prompt token was re-fed
+  on top of a cache that already held it: cold output "snapshot lease fence quorum…", cached
+  output "commit commit commit commit…".
+- **A zero-filled WAL tail replayed as 512 phantom empty records** (CRC-32C of an empty payload
+  is 0). Empty records are now refused, so zeros can only be a crash tail.
+- **Shard pulls could never take longer than 100 ms.** An earlier fix raised the binary's flag;
+  the library still wrapped each pull in a poll-interval context.
+- **One long job made the scheduler report "queue full"** with one live job, because admission
+  counted the span behind it rather than live work.
+- **Fail-open took 10–20 s in a real outage**, waiting out the KV client's retries twice per
+  request; the tests had used a KV fake that failed instantly. Now a 300 ms budget per call and
+  a circuit breaker.
+- **`max_tokens` was missing from the cache key**, unbounded **tenant names** reached metric
+  labels, and **AppendEntries was unbounded** (a far-behind follower got the whole log in one RPC).
+- **The headline routing benchmark was confounded** (re-measured above).
 
 ---
 
