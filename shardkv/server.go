@@ -70,7 +70,14 @@ type Options struct {
 	// Query has become slower than the poll interval must still be heard.
 	// While Queries keep failing, the deadline doubles (up to
 	// maxQueryBackoff times this), and resets on the next success.
-	QueryTimeout  time.Duration
+	QueryTimeout time.Duration
+	// PullTimeout is the deadline for one shard pull from the previous
+	// owner, default 2s. Like QueryTimeout it is deliberately NOT the poll
+	// interval: a shard whose transfer takes longer than one tick (a big
+	// shard, a slow link) would otherwise be cancelled and restarted from
+	// scratch on every tick and never arrive, stalling the group on that
+	// config forever. A pull that times out is simply retried next tick.
+	PullTimeout   time.Duration
 	MaxRaftState  int // <=0 disables snapshots
 	CommitTimeout time.Duration
 	Raft          raft.Config
@@ -138,6 +145,9 @@ func New(peers []raft.Peer, me int, persister raft.Persister, opts Options) *Ser
 	}
 	if opts.QueryTimeout <= 0 {
 		opts.QueryTimeout = time.Second
+	}
+	if opts.PullTimeout <= 0 {
+		opts.PullTimeout = 2 * time.Second
 	}
 	s := &Server{
 		me:        me,
@@ -527,7 +537,7 @@ func (s *Server) pollLoop() {
 
 func (s *Server) pullNeeded(needed map[int]neededShard) {
 	for shardID, need := range needed {
-		ctx, cancel := context.WithTimeout(context.Background(), s.opts.PollInterval)
+		ctx, cancel := context.WithTimeout(context.Background(), s.opts.PullTimeout)
 		snap, ok, err := s.opts.Fetcher.PullShard(ctx, need.FromAddrs, need.AtConfig, shardID)
 		cancel()
 		if err != nil || !ok {
