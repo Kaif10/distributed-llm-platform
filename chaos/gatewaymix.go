@@ -306,7 +306,7 @@ func (s *collectStream) Send(tok *gatewayv1.Token) error {
 
 // do issues one Generate and records the outcome. Called on harness
 // goroutines that are already under panicLog.
-func (m *gatewayMix) do(ctx context.Context, res gwResult, delay time.Duration) {
+func (m *gatewayMix) do(ctx context.Context, res gwResult, delay time.Duration) gwResult {
 	octx, cancel := context.WithTimeout(ctx, res.deadline)
 	defer cancel()
 	st := &collectStream{ctx: octx, mode: res.mode, delay: delay,
@@ -324,6 +324,7 @@ func (m *gatewayMix) do(ctx context.Context, res gwResult, delay time.Duration) 
 	m.mu.Lock()
 	m.results = append(m.results, res)
 	m.mu.Unlock()
+	return res
 }
 
 func (m *gatewayMix) run(ctx context.Context, sc Scenario, wg *sync.WaitGroup) {
@@ -386,6 +387,28 @@ func (m *gatewayMix) finalBatch(ctx context.Context) {
 	wg.Wait()
 }
 
+// cacheProbe gives the cached-answer check something to check, every run.
+// Whether chaos-time traffic ever hits the cache depends on timing: under
+// faults a Store can miss its KV budget, and a repeat may arrive before the
+// first answer was stored. On Linux CI one seed got zero hits, and the
+// non-vacuity guard (rightly) failed the run. So after the heal, for a few
+// tenant+prompt pairs: ask once with the cache on, then repeat until a
+// response is served from the cache (bounded). Every probe response goes
+// through the same ground-truth comparison as all other traffic, so a
+// cached wrong answer still fails; if the cache never serves anything on a
+// healed cluster, the guard still fails, and that would be a real bug.
+func (m *gatewayMix) cacheProbe(ctx context.Context) {
+	for k := 0; k < 3; k++ {
+		res := gwResult{tenant: fmt.Sprintf("t%d", k), prompt: m.prompts[k%len(m.prompts)], deadline: 3 * time.Second}
+		for attempt := 0; attempt < 20; attempt++ {
+			if got := m.do(ctx, res, 0); got.err == nil && got.cached {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Checks
 // ---------------------------------------------------------------------------
@@ -446,6 +469,7 @@ type gwStats struct {
 // Call it after the run's traffic has stopped and the cluster has healed.
 func (m *gatewayMix) check(ctx context.Context) (violations []string, st gwStats) {
 	m.finalBatch(ctx)
+	m.cacheProbe(ctx)
 
 	ref := newReference()
 	m.mu.Lock()
