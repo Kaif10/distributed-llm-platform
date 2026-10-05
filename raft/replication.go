@@ -66,7 +66,7 @@ func (rf *Raft) sendAppendEntries(peer int) {
 		LeaderID:     rf.me,
 		PrevLogIndex: prev,
 		PrevLogTerm:  rf.termAt(prev),
-		Entries:      rf.entriesFrom(prev + 1), // empty on a pure heartbeat
+		Entries:      rf.appendBatch(prev + 1), // empty on a pure heartbeat; capped otherwise
 		LeaderCommit: rf.commitIndex,
 	}
 	rf.mu.Unlock()
@@ -105,6 +105,11 @@ func (rf *Raft) sendAppendEntries(peer int) {
 			rf.nextIndex[peer] = newMatch + 1
 		}
 		rf.advanceCommitIndex()
+		// Batches are capped (appendBatch): if this peer is still behind,
+		// send the next batch now rather than at the next heartbeat.
+		if rf.nextIndex[peer] <= rf.lastIndex() {
+			rf.signal(peer)
+		}
 		return
 	}
 

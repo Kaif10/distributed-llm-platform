@@ -149,6 +149,13 @@ type Config struct {
 	ElectionTimeoutMax time.Duration
 	// Logf receives debug output. nil disables logging.
 	Logf func(format string, args ...any)
+	// MaxAppendEntries and MaxAppendBytes cap one AppendEntries. Without
+	// a cap, a follower that fell far behind was sent the whole log tail in
+	// one RPC, which can exceed the transport's message limit and then fail
+	// forever. Zero means the defaults: 512 entries, 4 MiB of commands (an
+	// entry larger than that is still sent, alone).
+	MaxAppendEntries int
+	MaxAppendBytes   int
 }
 
 // DefaultConfig returns timing suitable for local testing.

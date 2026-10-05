@@ -141,6 +141,12 @@ func New(peers []Peer, me int, persister Persister, applyCh chan<- ApplyMsg, cfg
 	if cfg.ElectionTimeoutMin <= 0 {
 		cfg.ElectionTimeoutMin = def.ElectionTimeoutMin
 	}
+	if cfg.MaxAppendEntries <= 0 {
+		cfg.MaxAppendEntries = 512
+	}
+	if cfg.MaxAppendBytes <= 0 {
+		cfg.MaxAppendBytes = 4 << 20
+	}
 	if cfg.ElectionTimeoutMax <= cfg.ElectionTimeoutMin {
 		cfg.ElectionTimeoutMax = cfg.ElectionTimeoutMin * 2
 	}
@@ -265,11 +271,22 @@ func (rf *Raft) lastTerm() uint64 { return rf.log[len(rf.log)-1].Term }
 // [lastIncludedIndex, lastIndex].
 func (rf *Raft) termAt(i uint64) uint64 { return rf.log[i-rf.lastIncludedIndex].Term }
 
-// entriesFrom returns a copy of entries with absolute index >= i.
-func (rf *Raft) entriesFrom(i uint64) []Entry {
+// appendBatch returns a copy of the entries from absolute index i, capped by
+// MaxAppendEntries and MaxAppendBytes,
+// always including at least one entry when there is one to send. The
+// replicator sends the next batch as soon as this one is acknowledged.
+func (rf *Raft) appendBatch(i uint64) []Entry {
 	src := rf.log[i-rf.lastIncludedIndex:]
-	out := make([]Entry, len(src))
-	copy(out, src)
+	n, bytes := 0, 0
+	for n < len(src) && n < rf.cfg.MaxAppendEntries {
+		bytes += len(src[n].Command)
+		if n > 0 && bytes > rf.cfg.MaxAppendBytes {
+			break
+		}
+		n++
+	}
+	out := make([]Entry, n)
+	copy(out, src[:n])
 	return out
 }
 

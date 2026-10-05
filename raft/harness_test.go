@@ -46,6 +46,10 @@ func testConfig() raft.Config {
 		HeartbeatInterval:  heartbeatInterval,
 		ElectionTimeoutMin: electionTimeoutMin,
 		ElectionTimeoutMax: electionTimeoutMax,
+		// Deliberately tiny, so every catch-up in the suite (Figure 8,
+		// unreliable churn, snapshots, backtracking) has to go through
+		// several capped batches instead of one RPC carrying the whole tail.
+		MaxAppendEntries: 8,
 	}
 	if os.Getenv("RAFT_DEBUG") != "" {
 		cfg.Logf = raft.StdLogger
