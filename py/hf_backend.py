@@ -268,8 +268,19 @@ class HFBackend:
                 if past is not None:
                     past = self._crop(past, n_cached)
 
-                # Prefill only what the cache did not already cover.
-                suffix = token_ids[n_cached:] or token_ids[-1:]
+                # Prefill only what the cache did not already cover. If the
+                # cache covers the WHOLE prompt (its length is a multiple of
+                # BLOCK_TOKENS), we still need one forward pass to get the
+                # next-token logits; feed the last prompt token, but first
+                # crop it out of the cache. Re-feeding it on top of a cache
+                # that already holds it duplicates its key/value, and the
+                # model degenerated into repeating a single word
+                # (py/tests/test_hf_backend.py reproduces it).
+                start = n_cached
+                if past is not None and n_cached >= len(token_ids):
+                    start = len(token_ids) - 1
+                    past = self._crop(past, start)
+                suffix = token_ids[start:]
                 ids = torch.tensor([suffix], dtype=torch.long)
                 out = self.lm(input_ids=ids, past_key_values=past, use_cache=True)
                 past = out.past_key_values
