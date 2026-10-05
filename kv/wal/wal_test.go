@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/crc32"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -63,17 +64,20 @@ func TestAppendThenReplay(t *testing.T) {
 	}
 }
 
-func TestEmptyPayload(t *testing.T) {
+// Empty records are refused: they would be indistinguishable from a
+// zero-filled crash tail (see TestZeroFilledTail).
+func TestEmptyPayloadRefused(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.wal")
 	w := openT(t, path)
-	if err := w.Append(nil); err != nil {
-		t.Fatal(err)
-	}
-	w.Close()
-	w = openT(t, path)
 	defer w.Close()
-	if got := replayAll(t, w); len(got) != 1 || len(got[0]) != 0 {
-		t.Fatalf("got %v", got)
+	if err := w.Append(nil); !errors.Is(err, ErrEmptyPayload) {
+		t.Fatalf("Append(nil) = %v, want ErrEmptyPayload", err)
+	}
+	if err := w.AppendBatch([][]byte{[]byte("ok"), {}}); !errors.Is(err, ErrEmptyPayload) {
+		t.Fatalf("AppendBatch with an empty record = %v, want ErrEmptyPayload", err)
+	}
+	if got := replayAll(t, w); len(got) != 0 {
+		t.Fatalf("a refused batch wrote %d records", len(got))
 	}
 }
 
@@ -274,4 +278,71 @@ func TestCrashRecovery(t *testing.T) {
 		expectNext = uint64(len(seqs))
 	}
 	t.Logf("survived %d crashes, %d records durable", *crashIterations, expectNext)
+}
+
+// TestZeroFilledTail: after a crash some filesystems leave the file extended
+// with zeros where the last write's data never landed. Eight zero bytes read
+// as a header with length 0 and checksum 0, and CRC-32C of an empty payload
+// IS 0, so each 8 zero bytes used to replay as a valid empty record (and the
+// KV store above then tried to apply an empty log entry). A zero tail must
+// be treated like any torn tail: dropped, with the log usable afterwards.
+func TestZeroFilledTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "zeros.wal")
+	w := openT(t, path)
+	for _, p := range []string{"a", "bb", "ccc"} {
+		if err := w.Append([]byte(p)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.Close()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(make([]byte, 4096)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	w = openT(t, path)
+	if got := replayAll(t, w); len(got) != 3 {
+		t.Fatalf("zero-filled tail replayed as %d records, want the 3 real ones", len(got))
+	}
+	if err := w.Append([]byte("dddd")); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	w = openT(t, path)
+	defer w.Close()
+	if got := replayAll(t, w); len(got) != 4 || string(got[3]) != "dddd" {
+		t.Fatalf("after recovery and one more append: %q", got)
+	}
+}
+
+// A zero-length header followed by real data is not a crash artifact: a
+// complete record was written after it, so it is corruption. The file is
+// built raw (record, 8 zero bytes, record) because opening the log in
+// between would rightly truncate the zeros as a tail.
+func TestZeroHeaderMidFileIsCorrupt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "zeromid.wal")
+	rec := func(p string) []byte {
+		b := make([]byte, 8+len(p))
+		binary.LittleEndian.PutUint32(b[0:4], uint32(len(p)))
+		binary.LittleEndian.PutUint32(b[4:8], crc32.Checksum([]byte(p), crc32.MakeTable(crc32.Castagnoli)))
+		copy(b[8:], p)
+		return b
+	}
+	raw := append(rec("a"), make([]byte, 8)...)
+	raw = append(raw, rec("after")...)
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, err := Open(path, Options{})
+	if err == nil {
+		err = w.Replay(func([]byte) error { return nil })
+		w.Close()
+	}
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("zero header followed by a record: err = %v, want ErrCorrupt", err)
+	}
 }

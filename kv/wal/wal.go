@@ -54,6 +54,11 @@ var (
 	ErrCorrupt = errors.New("wal: log is corrupt")
 	// ErrClosed is returned by Append after Close.
 	ErrClosed = errors.New("wal: closed")
+	// ErrEmptyPayload is returned by Append for a zero-length record. Empty
+	// records are forbidden because they are indistinguishable from the
+	// zero-filled tail a crash can leave: a header of eight zero bytes has
+	// length 0 and checksum 0, and CRC-32C of an empty payload is 0.
+	ErrEmptyPayload = errors.New("wal: empty payload")
 )
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
@@ -132,6 +137,9 @@ func (w *WAL) Append(payload []byte) error {
 func (w *WAL) AppendBatch(payloads [][]byte) error {
 	total := 0
 	for _, p := range payloads {
+		if len(p) == 0 {
+			return ErrEmptyPayload
+		}
 		if len(p) > maxPayloadSize {
 			return fmt.Errorf("wal: payload too large: %d bytes", len(p))
 		}
@@ -219,6 +227,17 @@ func (w *WAL) scan(fn func([]byte) error) (int64, error) {
 
 		length := binary.LittleEndian.Uint32(header[0:4])
 		want := binary.LittleEndian.Uint32(header[4:8])
+		if length == 0 {
+			// Writers never produce empty records (ErrEmptyPayload), so a
+			// zero length is a zero-filled region: a crash after the file
+			// grew but before its data landed. If it runs to the end of the
+			// file it is a torn tail; if real data follows, a record was
+			// written after it, so it is corruption.
+			if want == 0 && restIsZero(r) {
+				return off, nil
+			}
+			return 0, fmt.Errorf("%w: zero-length record at offset %d", ErrCorrupt, off)
+		}
 		if length > maxPayloadSize {
 			// An absurd length means the header itself is garbage. We can only
 			// tolerate that if it is the last thing in the file.
@@ -254,6 +273,26 @@ func (w *WAL) scan(fn func([]byte) error) (int64, error) {
 			}
 		}
 		off += headerSize + int64(length)
+	}
+}
+
+// restIsZero reports whether every remaining byte in r is zero. It consumes
+// r, so it is only for deciding how a scan ends.
+func restIsZero(r *bufio.Reader) bool {
+	buf := make([]byte, 64<<10)
+	for {
+		n, err := r.Read(buf)
+		for _, b := range buf[:n] {
+			if b != 0 {
+				return false
+			}
+		}
+		if err == io.EOF {
+			return true
+		}
+		if err != nil {
+			return false
+		}
 	}
 }
 
