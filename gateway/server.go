@@ -54,6 +54,11 @@ type Server struct {
 	cancelled         atomic.Uint64
 	workerErrors      atomic.Uint64
 	rateLimitFailOpen atomic.Uint64
+	kvSkipped         atomic.Uint64
+
+	// kvBreaker skips the KV-dependent steps during a KV outage; see
+	// breaker.go.
+	kvBreaker *kvBreaker
 
 	routedMu sync.Mutex
 	routedTo map[string]uint64
@@ -95,7 +100,20 @@ func New(opts Options) *Server {
 	if opts.Clock == nil {
 		opts.Clock = time.Now
 	}
+	if opts.KVCallTimeout == 0 {
+		opts.KVCallTimeout = 300 * time.Millisecond
+	}
+	if opts.KVBreakerThreshold == 0 {
+		opts.KVBreakerThreshold = 5
+	}
+	if opts.KVBreakerCooldown <= 0 {
+		opts.KVBreakerCooldown = 2 * time.Second
+	}
 	s := &Server{
+		// The breaker runs on wall time, not opts.Clock: Clock exists so
+		// tests can pin TTFT arithmetic, and a frozen clock would hold the
+		// breaker open forever.
+		kvBreaker:     newKVBreaker(opts.KVBreakerThreshold, opts.KVBreakerCooldown, time.Now),
 		opts:          opts,
 		conns:         map[string]inferv1.InferenceClient{},
 		cc:            map[string]*grpc.ClientConn{},
@@ -168,6 +186,8 @@ func (s *Server) Snapshot() Stats {
 		Cancelled:         s.cancelled.Load(),
 		WorkerErrors:      s.workerErrors.Load(),
 		RateLimitFailOpen: s.rateLimitFailOpen.Load(),
+		KVBreakerTrips:    s.kvBreaker.tripCount(),
+		KVSkipped:         s.kvSkipped.Load(),
 		RoutedTo:          map[string]uint64{},
 	}
 	s.routedMu.Lock()
@@ -176,11 +196,37 @@ func (s *Server) Snapshot() Stats {
 	}
 	s.routedMu.Unlock()
 	if s.opts.Registry != nil {
-		if live, err := s.opts.Registry.Live(context.Background()); err == nil {
+		ctx, cancel := s.kvCtx(context.Background())
+		if live, err := s.opts.Registry.Live(ctx); err == nil {
 			st.LiveWorkers = len(live)
 		}
+		cancel()
 	}
 	return st
+}
+
+// kvCtx derives the context for one request-path KV call: ctx bounded by
+// Options.KVCallTimeout. The KV client's own retry budget is sized for
+// background work that must eventually succeed; a request that is going to
+// fail open anyway should find that out in milliseconds, not seconds.
+func (s *Server) kvCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if s.opts.KVCallTimeout > 0 {
+		return context.WithTimeout(ctx, s.opts.KVCallTimeout)
+	}
+	return ctx, func() {}
+}
+
+// kvOutcome feeds one KV call's result to the breaker. reqCtx is the
+// request's context: if it is done, the call was abandoned because the
+// client left, which says nothing about the KV's health.
+func (s *Server) kvOutcome(reqCtx context.Context, kvErr error) {
+	switch {
+	case kvErr == nil || errors.Is(kvErr, ratelimit.ErrContended):
+		s.kvBreaker.success()
+	case reqCtx.Err() != nil:
+	default:
+		s.kvBreaker.failure()
+	}
 }
 
 func (s *Server) countRoute(id string) {
@@ -314,7 +360,21 @@ func (s *Server) Generate(req *gatewayv1.GenerateRequest, stream grpc.ServerStre
 	// must not be dodgeable by anything downstream.
 	if s.opts.Limiter != nil {
 		rlCtx, rlSpan := obs.Tracer("gateway").Start(ctx, "gateway.ratelimit")
-		ok, retryAfter, err := s.opts.Limiter.Take(rlCtx, tenant, 1)
+		var ok bool
+		var retryAfter time.Duration
+		var err error
+		if s.kvBreaker.allow() {
+			kctx, cancel := s.kvCtx(rlCtx)
+			ok, retryAfter, err = s.opts.Limiter.Take(kctx, tenant, 1)
+			cancel()
+			s.kvOutcome(ctx, err)
+		} else {
+			// Breaker open: the KV is known to be down, so take the
+			// outage path below without paying for another timeout.
+			s.kvSkipped.Add(1)
+			rlSpan.SetAttributes(attribute.Bool("kv_breaker_open", true))
+			err = errKVCircuitOpen
+		}
 		if err != nil {
 			// Fail open on a KV failure, never on contention; see
 			// Options.RateLimitFailOpen for the reasoning.
@@ -340,9 +400,15 @@ func (s *Server) Generate(req *gatewayv1.GenerateRequest, stream grpc.ServerStre
 
 	// 2. Semantic cache. A hit costs one KV read and no GPU. Keyed by
 	// tenant as well as prompt; see cacheKey.
-	if s.opts.Cache != nil && !req.NoCache {
+	if s.opts.Cache != nil && !req.NoCache && !s.kvBreaker.allow() {
+		// Breaker open: treat as a miss without touching the KV.
+		s.kvSkipped.Add(1)
+	} else if s.opts.Cache != nil && !req.NoCache {
 		ccCtx, ccSpan := obs.Tracer("gateway").Start(ctx, "gateway.cache_lookup")
-		text, hit, err := s.opts.Cache.Lookup(ccCtx, cacheKey(tenant, req.Prompt))
+		kctx, cancel := s.kvCtx(ccCtx)
+		text, hit, err := s.opts.Cache.Lookup(kctx, cacheKey(tenant, req.Prompt))
+		cancel()
+		s.kvOutcome(ctx, err)
 		ccSpan.SetAttributes(attribute.Bool("cache_hit", hit))
 		ccSpan.End()
 		if err == nil && hit {
@@ -361,7 +427,24 @@ func (s *Server) Generate(req *gatewayv1.GenerateRequest, stream grpc.ServerStre
 	rtCtx, rtSpan := obs.Tracer("gateway").Start(ctx, "gateway.route", trace.WithAttributes(
 		attribute.Bool("prefix_routing", s.opts.PrefixRouting),
 	))
-	live, err := s.opts.Registry.Live(rtCtx)
+	// The registry already serves its last known set on a KV error, so all
+	// the budget has to do is make that error arrive quickly. While the
+	// breaker is open (or half-open) we skip even that and use the last
+	// known set directly: otherwise every request after each CacheTTL would
+	// spend a KV timeout learning what the breaker already knows. The
+	// registry does not feed the breaker (Live hides its fallback) or
+	// consume its probe; the limiter and cache do that.
+	var live []router.Worker
+	var err error
+	known := false
+	if s.kvBreaker.isOpen() {
+		live, known = s.opts.Registry.LastKnown()
+	}
+	if !known {
+		liveCtx, cancelLive := s.kvCtx(rtCtx)
+		live, err = s.opts.Registry.Live(liveCtx)
+		cancelLive()
+	}
 	if err != nil {
 		rtSpan.End()
 		return status.Errorf(codes.Unavailable, "registry: %v", err)
@@ -618,8 +701,20 @@ func (s *Server) streamFromWorkers(
 	var full []byte
 	full = append(full, firstTok.Text...)
 	store := func() {
+		// Synchronous but bounded (and skipped while the breaker is open):
+		// the client already has its done token, so all a slow Store
+		// delays is the RPC's close, by at most KVCallTimeout. Kept
+		// synchronous so a completed request's answer is in the cache by
+		// the time Generate returns.
 		if s.opts.Cache != nil && !req.NoCache && len(full) > 0 {
-			_ = s.opts.Cache.Store(ctx, cacheKey(tenant, req.Prompt), string(full))
+			if !s.kvBreaker.allow() {
+				s.kvSkipped.Add(1)
+				return
+			}
+			kctx, cancel := s.kvCtx(ctx)
+			err := s.opts.Cache.Store(kctx, cacheKey(tenant, req.Prompt), string(full))
+			cancel()
+			s.kvOutcome(ctx, err)
 		}
 	}
 	if firstTok.Done {
@@ -668,6 +763,11 @@ func (s *Server) streamFromWorkers(
 // errStreamEndedEarly: the worker closed its stream (EOF) without ever
 // sending a done token, so what we have is not a complete answer.
 var errStreamEndedEarly = errors.New("worker stream ended before done")
+
+// errKVCircuitOpen stands in for the limiter's error while the KV breaker
+// is open, so the fail-open/fail-closed decision is made exactly as for a
+// real KV failure.
+var errKVCircuitOpen = errors.New("kv circuit breaker open")
 
 // runAttempt opens one worker stream and pumps it into the attempt's
 // channels. It exits promptly when its context is cancelled, which is what

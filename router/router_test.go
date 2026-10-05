@@ -171,6 +171,35 @@ func TestLiveServesLastKnownSetWhenKVFails(t *testing.T) {
 	}
 }
 
+// LastKnown is Live's fallback without the KV read: the last successful
+// read, lease-filtered, and never a KV call.
+func TestLastKnownNeverTouchesTheKV(t *testing.T) {
+	clk := &fakeClock{}
+	clk.ms.Store(1_700_000_000_000)
+	kv := &failingKV{memKV: newMemKV()}
+	r := NewRegistry(kv, Options{Clock: clk.now})
+	if _, ok := r.LastKnown(); ok {
+		t.Fatal("LastKnown before any read: want ok=false")
+	}
+	if _, err := r.Register(bg, Worker{ID: "a", Addr: "a:1"}, 3*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Live(bg); err != nil {
+		t.Fatal(err)
+	}
+	before := kv.gets.Load()
+	if ws, ok := r.LastKnown(); !ok || len(ws) != 1 || ws[0].ID != "a" {
+		t.Fatalf("LastKnown=%+v ok=%v, want [a]", ws, ok)
+	}
+	if n := kv.gets.Load() - before; n != 0 {
+		t.Fatalf("LastKnown made %d KV reads, want 0", n)
+	}
+	clk.advance(4 * time.Second) // lease lapsed
+	if ws, ok := r.LastKnown(); !ok || len(ws) != 0 {
+		t.Fatalf("LastKnown after lease lapse=%+v ok=%v, want empty, ok", ws, ok)
+	}
+}
+
 func TestConcurrentRegistrationsAllLand(t *testing.T) {
 	clk := &fakeClock{}
 	kv := newMemKV()

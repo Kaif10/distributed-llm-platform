@@ -237,6 +237,21 @@ func (r *Registry) Live(ctx context.Context) ([]Worker, error) {
 	return filterLive(ws, now), nil
 }
 
+// LastKnown returns the last set Live successfully read, filtered by lease,
+// without touching the KV; ok is false if there has never been a successful
+// read. It is Live's outage fallback made available on its own, for a caller
+// that already knows the KV is down (the gateway's circuit breaker) and so
+// should not spend a KV timeout to find that out again.
+func (r *Registry) LastKnown() (ws []Worker, ok bool) {
+	now := r.opts.Clock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.loaded {
+		return nil, false
+	}
+	return filterLive(r.cached, now), true
+}
+
 func filterLive(ws []Worker, now time.Time) []Worker {
 	out := make([]Worker, 0, len(ws))
 	for _, w := range ws {

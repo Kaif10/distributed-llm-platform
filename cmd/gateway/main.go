@@ -68,7 +68,10 @@ func main() {
 	defaultMaxTokens := flag.Int("default-max-tokens", 0, "max_tokens when a request says 0 (0 = 64)")
 	statsEvery := flag.Duration("stats-every", 10*time.Second, "how often to log Stats() (0 = never)")
 	sessions := flag.Int("kv-sessions", kvadapter.DefaultSessions, "KV client identities kept for concurrent mutations")
-	kvTimeout := flag.Duration("kv-timeout", 10*time.Second, "give up retrying one KV operation after this long")
+	kvTimeout := flag.Duration("kv-timeout", 10*time.Second, "give up retrying one KV operation after this long (background work such as worker registration; request-path calls use -kv-call-timeout)")
+	kvCallTimeout := flag.Duration("kv-call-timeout", 300*time.Millisecond, "bound on each request-path KV call (rate limit, cache, registry read); a KV outage fails open within this instead of -kv-timeout (negative = no bound)")
+	kvBreakerThreshold := flag.Int("kv-breaker-threshold", 5, "consecutive request-path KV failures that open the KV circuit breaker, skipping rate limiting and the cache (negative = no breaker)")
+	kvBreakerCooldown := flag.Duration("kv-breaker-cooldown", 2*time.Second, "how long the KV circuit breaker stays open before one request probes the KV")
 	verbose := flag.Bool("v", false, "log KV client retries")
 	otlpEndpoint := flag.String("otlp-endpoint", "", "OTLP/gRPC endpoint for traces, e.g. 127.0.0.1:4317 (empty = tracing disabled)")
 	metricsAddr := flag.String("metrics-addr", ":9091", "address to serve Prometheus /metrics on")
@@ -136,6 +139,9 @@ func main() {
 		KV:                   kv,
 		Limiter:              limiter,
 		RateLimitFailOpen:    *rlFailOpen,
+		KVCallTimeout:        *kvCallTimeout,
+		KVBreakerThreshold:   *kvBreakerThreshold,
+		KVBreakerCooldown:    *kvBreakerCooldown,
 		Cache:                semantic,
 		Registry:             registry,
 		PrefixRouting:        *prefixRouting,
@@ -222,6 +228,8 @@ func formatStats(s gateway.Stats) string {
 	b.WriteString(u(s.Requests))
 	b.WriteString(" rate_limited=" + u(s.RateLimited))
 	b.WriteString(" rl_fail_open=" + u(s.RateLimitFailOpen))
+	b.WriteString(" kv_breaker_trips=" + u(s.KVBreakerTrips))
+	b.WriteString(" kv_skipped=" + u(s.KVSkipped))
 	b.WriteString(" cache_hits=" + u(s.CacheHits))
 	b.WriteString(" hedges=" + u(s.HedgesLaunched) + "/" + u(s.HedgesWon))
 	b.WriteString(" cancelled=" + u(s.Cancelled))

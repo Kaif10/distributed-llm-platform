@@ -95,6 +95,26 @@ type Options struct {
 	// cmd/gateway defaults its -rl-fail-open flag to true.
 	RateLimitFailOpen bool
 
+	// KVCallTimeout bounds each KV call on the request path: the limiter's
+	// Take, the cache's Lookup and Store, and the registry read. The real
+	// KV client keeps retrying for its whole -kv-timeout (10s by default)
+	// when there is no Raft leader, so without this bound "fail open" meant
+	// a request stalled for that long once in the limiter and again in the
+	// cache before it was admitted. A healthy KV answers in milliseconds, so
+	// the bound only ever bites during an outage. 0 means 300ms; negative
+	// disables the bound (each call then waits as long as the KV client
+	// and the request's own context allow).
+	KVCallTimeout time.Duration
+	// KVBreakerThreshold is how many consecutive KV failures (errors or
+	// KVCallTimeout expiries) open the KV circuit breaker, after which the
+	// limiter and the cache are skipped (fail open / miss) for
+	// KVBreakerCooldown, then probed with one request. See kvBreaker.
+	// 0 means 5; negative disables the breaker.
+	KVBreakerThreshold int
+	// KVBreakerCooldown is how long the breaker stays open before probing.
+	// 0 means 2s.
+	KVBreakerCooldown time.Duration
+
 	// PrefixRouting picks the worker by rendezvous-hashing the prompt prefix
 	// (see router). false picks the least-loaded live worker instead; the
 	// benchmark toggles this to show the effect on prefix-cache hit rate.
@@ -143,6 +163,10 @@ type Stats struct {
 	// decision because the limiter's KV was unavailable (see
 	// Options.RateLimitFailOpen).
 	RateLimitFailOpen uint64
-	RoutedTo          map[string]uint64
-	LiveWorkers       int
+	// KVBreakerTrips counts how often the KV circuit breaker opened;
+	// KVSkipped counts limiter/cache steps skipped while it was open.
+	KVBreakerTrips uint64
+	KVSkipped      uint64
+	RoutedTo       map[string]uint64
+	LiveWorkers    int
 }
