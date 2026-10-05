@@ -91,6 +91,7 @@ func (q *Queue) keyJob(id uint64) string { return fmt.Sprintf("%s/job/%020d", q.
 func (q *Queue) keyIdem(k string) string { return q.opts.Prefix + "/idem/" + k }
 func (q *Queue) keyLeader() string       { return q.opts.Prefix + "/leader" }
 func (q *Queue) keyCursor() string       { return q.opts.Prefix + "/cursor" }
+func (q *Queue) keyDone() string         { return q.opts.Prefix + "/done" }
 func (q *Queue) nowMs() int64            { return q.opts.Clock().UnixMilli() }
 func (q *Queue) leaseOrDefault(d time.Duration) time.Duration {
 	if d <= 0 {
@@ -228,8 +229,29 @@ func (q *Queue) allocate(ctx context.Context, payload []byte, state schedv1.Stat
 		if err != nil {
 			return 0, nil, err
 		}
-		// live ids are head..tail; refuse once that window is full.
-		if tail >= head && tail-head+1 >= q.opts.MaxQueue {
+		// Admission bounds LIVE work: ids 1..tail have been allocated and
+		// `done` of them are terminal. It used to bound the head..tail span,
+		// but one long job pins head (head moves only past terminal jobs,
+		// in order), so a span bound refused new work while almost every
+		// job behind the long one had finished.
+		//
+		// done is a counter bumped after each terminal transition by the
+		// caller whose CAS made it (see countTerminal). It can lag (a crash
+		// between the job write and the bump), which only UNDER-counts
+		// finished jobs and makes admission stricter, never looser. And
+		// every id below head is terminal, so head-1 is a floor that heals
+		// any lag as head advances.
+		done, _, err := q.readCounter(ctx, q.keyDone(), 0)
+		if err != nil {
+			return 0, nil, err
+		}
+		done = max(done, head-1)
+		if done < tail && tail-done >= q.opts.MaxQueue {
+			return 0, nil, ErrQueueFull
+		}
+		// The span itself still needs a ceiling, so Claim's scans stay
+		// bounded even behind a job that runs forever.
+		if tail >= head && tail-head+1 >= q.opts.MaxQueue*spanFactor {
 			return 0, nil, ErrQueueFull
 		}
 
@@ -564,7 +586,9 @@ func (q *Queue) claimFrom(ctx context.Context, worker string, lease time.Duratio
 				next.Gen++
 				next.LastError = "lease expired; attempts exhausted"
 				next.LeaseUntilMs = 0
-				_, _ = q.casJob(ctx, id, raw, next)
+				if ok, _ := q.casJob(ctx, id, raw, next); ok {
+					q.countTerminal(ctx)
+				}
 				continue
 			}
 			next := proto.Clone(job).(*schedv1.Job)
@@ -608,12 +632,36 @@ func (q *Queue) expireStaged(ctx context.Context, id uint64, job *schedv1.Job, r
 	next.State = schedv1.State_STATE_FAILED
 	next.Gen++
 	next.LastError = "submit abandoned before it was published"
-	_, _ = q.casJob(ctx, id, raw, next)
+	if ok, _ := q.casJob(ctx, id, raw, next); ok {
+		q.countTerminal(ctx)
+	}
 }
 
 // ---------------------------------------------------------------------------
 // Worker-side mutations: all fenced by gen.
 // ---------------------------------------------------------------------------
+
+// spanFactor caps the head..tail span at this multiple of MaxQueue: admission
+// bounds live work (see allocate), and this keeps the scans behind a job
+// that never finishes bounded too.
+const spanFactor = 16
+
+// countTerminal records one more terminal job for admission control. Call it
+// only after the CAS that made a job DONE or FAILED succeeded, so a retried
+// Complete or a repeated expiry never counts twice. Best effort: if it gives
+// up, finished work is under-counted, admission is a little stricter until
+// head passes the job, and nothing is ever over-admitted.
+func (q *Queue) countTerminal(ctx context.Context) {
+	for attempt := 0; attempt < 16; attempt++ {
+		v, raw, err := q.readCounter(ctx, q.keyDone(), 0)
+		if err != nil {
+			return
+		}
+		if ok, err := q.casCounter(ctx, q.keyDone(), raw, v+1); ok || err != nil {
+			return
+		}
+	}
+}
 
 // checkHolder validates that the caller, presenting gen, still owns job.
 func checkHolder(job *schedv1.Job, gen uint64) error {
@@ -694,6 +742,7 @@ func (q *Queue) Complete(ctx context.Context, id, gen uint64, result []byte) (er
 			return err
 		}
 		if swapped {
+			q.countTerminal(ctx) // only the call that made it DONE counts it
 			return nil
 		}
 	}
@@ -735,6 +784,9 @@ func (q *Queue) Fail(ctx context.Context, id, gen uint64, reason string) (requeu
 			return false, err
 		}
 		if swapped {
+			if !requeue {
+				q.countTerminal(ctx)
+			}
 			return requeue, nil
 		}
 	}

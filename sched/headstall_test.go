@@ -66,3 +66,49 @@ func TestLongRunningHeadDoesNotStallClaims(t *testing.T) {
 		t.Fatalf("long job disturbed: %+v", j)
 	}
 }
+
+// Admission must bound LIVE work, not the head-to-tail span. One long job
+// pins head (head only moves past terminal jobs in order), so a span-based
+// bound refused new jobs once MaxQueue more had been submitted, even though
+// every one of them had already finished.
+func TestAdmissionCountsLiveJobsNotPinnedSpan(t *testing.T) {
+	const maxQueue = 16
+	q, _, clk := newTestQueue(t, Options{MaxQueue: maxQueue})
+	if _, err := q.Submit(bg, []byte("long"), ""); err != nil {
+		t.Fatal(err)
+	}
+	long, err := q.Claim(bg, "slow-worker", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10*maxQueue; i++ {
+		clk.advance(10 * time.Millisecond)
+		if _, err := q.Heartbeat(bg, long.Id, long.Gen, 0); err != nil {
+			t.Fatalf("long job lost its lease: %v", err)
+		}
+		if _, err := q.Submit(bg, []byte(fmt.Sprint(i)), ""); err != nil {
+			t.Fatalf("submit %d with only the long job live: %v", i, err)
+		}
+		job, err := q.Claim(bg, "fast-worker", 0)
+		if err != nil {
+			t.Fatalf("claim %d: %v", i, err)
+		}
+		if err := q.Complete(bg, job.Id, job.Gen, nil); err != nil {
+			t.Fatalf("complete %d: %v", i, err)
+		}
+	}
+}
+
+// ...and it must still refuse when live work genuinely reaches MaxQueue.
+func TestAdmissionStillBoundsLiveWork(t *testing.T) {
+	const maxQueue = 8
+	q, _, _ := newTestQueue(t, Options{MaxQueue: maxQueue})
+	for i := 0; i < maxQueue; i++ {
+		if _, err := q.Submit(bg, []byte(fmt.Sprint(i)), ""); err != nil {
+			t.Fatalf("submit %d of %d: %v", i, maxQueue, err)
+		}
+	}
+	if _, err := q.Submit(bg, []byte("one too many"), ""); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("with %d live jobs: err = %v, want ErrQueueFull", maxQueue, err)
+	}
+}
