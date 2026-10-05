@@ -141,6 +141,7 @@ func main() {
 		Fetcher:      fetcher,
 		PollInterval: *pollInterval,
 		QueryTimeout: *ctrlTimeout,
+		PullTimeout:  *pullTimeout,
 		MaxRaftState: *maxRaftState,
 		Raft:         rcfg,
 	})
