@@ -60,25 +60,6 @@ timing. Nothing is staged or re-typed.*
 
 ---
 
-## How this was built
-
-I built this to learn distributed systems hands-on, working with Claude Code (Anthropic's
-coding agent) throughout. I set the goal and scope, drove each phase, decided what to keep,
-cut or correct, and commissioned independent reviews of the result. Most of the code and
-documentation was written by Claude Code under that direction. For some fix rounds several
-agents worked in parallel on separate git worktrees, which is why the history contains
-`worktree-agent-…` merges.
-
-What this relies on, instead of trusting generated code:
-
-- **Checks of outcomes, not of code paths.** Linearizability checking with Porcupine, chaos
-  runs whose checks are each shown catching an injected bug, exactly-once accounting for the
-  scheduler, and multi-process end-to-end runs against real binaries.
-- **Outside review.** Three independent code reviews; every finding was reproduced with a
-  test that failed before the fix (the bug record below lists them).
-- **Corrections in place.** When a number or claim turned out to be wrong, it is corrected
-  next to the original, dated, rather than quietly replaced.
-
 ## Start here
 
 | Document | What's in it |
