@@ -15,14 +15,15 @@
 // on applyCh, and only THEN do we apply it and answer the client. The
 // "log then apply" discipline is identical; the log is just shared.
 //
-// # Why every request, including reads, goes through the log
+// # Why reads are not served from local state
 //
 // A follower's state machine can lag. If Get read local state, a client
 // could write on the leader, then read on a follower and not see its own
-// write. Logging the Get orders it against every write in the single log,
-// which is what makes it linearizable. The cost is a round of consensus per
-// read. The paper's section 8 describes cheaper options (ReadIndex, leader
-// leases); they are the Phase 2 stretch exercise.
+// write. Writes go through the log. Reads use ReadIndex (readIndexGet,
+// raft/readindex.go): the leader confirms it still leads a majority, waits
+// until it has applied the commit index, then reads locally, which is
+// linearizable without a log entry. Until a new leader has committed in its
+// own term, Get falls back to a read through the log.
 //
 // # Why the waiter checks the term
 //

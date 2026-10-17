@@ -61,8 +61,9 @@ PrefillPerChar * (len(prompt) - cachedChars)`, then one token every `TokenMs`. `
 implements the same model to the character (`:21-32`, `:67-69`) so a benchmark can mix Go and Python
 workers behind one gateway.
 
-**What this is not.** A model server. No real model on the measured path (the `hf` backend at
-`py/infer_worker.py:196-242` is explicitly untested), no continuous batching, no paged attention —
+**What this is not.** A model server. The measured path in this phase is the mock; a real backend
+(`py/hf_backend.py`, SmolLM2-135M on CPU) was added later and is measured separately in
+`BENCHMARKS.md`. No continuous batching, no paged attention —
 §12. The claim is narrower and defensible: *given a worker whose prefill cost falls when it has
 already seen your prefix*, here is what routing, hedging and cancellation do to hit rate, throughput
 and the tail, with numbers (§10).
@@ -615,8 +616,8 @@ processes for what only appears under real latency — which is where both war s
 
 - **No real model.** The measured path uses `infer/mock` and `--backend mock`. A scope limit, not a
   fudge, because the latency model is **written down** (`mock.go:8-19`) and matched
-  character-for-character by the Python worker (`py/infer_worker.py:21-32`). The `hf` backend
-  (`:196-242`) is real and untested here.
+  character-for-character by the Python worker (`py/infer_worker.py:21-32`). The real `hf`
+  backend (`py/hf_backend.py`) was added later; its numbers are labelled separately.
 - **No continuous batching, no paged attention.** The **single biggest real-world throughput lever**
   and it is absent: vLLM-style continuous batching runs many sequences per forward pass and admits new
   ones at token boundaries, typically worth multiples of throughput — far more than anything here. It

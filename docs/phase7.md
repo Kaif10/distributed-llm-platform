@@ -1,6 +1,6 @@
 # Phase 7 — What I learned building an LLM serving platform from Raft up
 
-Over about four months I built a distributed LLM inference platform in Go and Python, starting from
+Between 12 September and 6 October 2026 I built a distributed LLM serving platform in Go and Python, starting from
 an empty directory and an append-only file and ending with a Raft-replicated sharded control plane,
 a lease-and-fencing job scheduler, a serving gateway with distributed rate limiting and prefix-aware
 routing, and a chaos harness that checks the whole thing with a linearizability checker under
@@ -14,12 +14,13 @@ actually taught me, including the parts where I was wrong.
 
 ## Two things to say before anything else
 
-**The inference backend is a mock.** The Python worker defaults to `--backend mock`, which generates
+**The default inference backend is a mock.** The Python worker defaults to `--backend mock`, which generates
 pseudo-words from a fixed word list against a latency model I wrote down deliberately: prefill cost
 linear in the number of *uncached* prompt characters, a prefix cache of 64-character blocks, a fixed
-per-token decode delay, and optional injected tail stalls. There is a `--backend hf` path in the
-file; it is untested, and torch and transformers are not installed here. Every serving number in this
-project came from the mock. There is no GPU anywhere in this repository and never was.
+per-token decode delay, and optional injected tail stalls. A real backend, `--backend hf`
+(`py/hf_backend.py`, SmolLM2-135M on CPU with genuine prefix KV-cache reuse), was added later and is
+labelled separately in `BENCHMARKS.md`; every other serving number in this project came from the mock.
+There is no GPU anywhere in this repository and never was.
 
 I want to be precise about what that does and does not invalidate, because the temptation to fudge it
 is exactly why it is worth stating up front. Genuinely not measured: anything about model quality,
