@@ -239,7 +239,7 @@ O(log size) per append and is why the throughput in section 6.5 is what it is. E
    (`harness_test.go:418-423`). Avoided at `replication.go:156-159`: the scan returns at the first
    entry not of `currentTerm`. Old entries commit indirectly when a current-term entry after them
    commits. This is also why a new leader in practice appends a no-op; we do not, so an old entry can
-   stay uncommitted until the next client write (see interview question 2).
+   stay uncommitted until the next client write (see review question 2).
 2. **Resetting the election timer on a rejected vote.** Symptom: a node with a stale log keeps
    starting elections it cannot win, every request resets everyone's timer, and no one else ever
    times out; liveness dies. Shows up as `TestRejoin` (`raft_test.go:408`) and
@@ -442,7 +442,7 @@ watch the bench finish, and read `retries: N` (`cmd/kvctl/main.go:362`). Then `g
 `bench-*` keys: every acknowledged put is there. Restart the killed node and watch it install a
 snapshot or catch up on entries depending on `-maxraftstate`.
 
-## 8. Interview questions with model answers
+## 8. Review questions
 
 1. **Explain Raft in two minutes.** A replicated log. Time is divided into terms; each term has at
    most one leader, elected by a majority vote, and only the leader appends. Clients send commands

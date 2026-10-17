@@ -479,7 +479,7 @@ that is *ready* on the source side (frozen in `outgoing`) but cannot be *pulled*
 partition-length period, while ordinary client traffic against both groups' other shards keeps
 running and must still be linearizable throughout.
 
-## 11. Interview questions with model answers
+## 11. Review questions
 
 1. **How would you shard a KV store, and what decides the shard count?** Hash (or range-partition)
    keys into a fixed number of shards, assign each shard to one replica group at a time via a small
@@ -559,8 +559,8 @@ running and must still be linearizable throughout.
    open return time rather than guessing "succeeded" or "failed," because guessing wrong in either
    direction can make an actually-broken history look legal or an actually-fine history look illegal.
 
-9. **Tell me about a subtle bug you found in testing and how you found it.** (Free gift — this is
-   section 7, told as an interview answer.) Benchmarking a real multi-process sharded cluster, I saw
+9. **Tell me about a subtle bug you found in testing and how you found it.** (This is section 7,
+   told briefly.) Benchmarking a real multi-process sharded cluster, I saw
    500 puts produce 508 retries — almost exactly one retry per put. That ratio was too clean to wave
    off as network noise, so I went looking instead of shrugging. The client's sharded mode was
    supposed to cache, per group, which replica last answered as leader, so repeat requests to the same
@@ -624,6 +624,6 @@ Answer these in your own words, here, before starting Phase 4.
   `shardctrl/machine.go`'s `rebalance` alongside the "fixed number of partitions" strategy it
   describes.
 - The Spanner paper's directory/placement discussion, and CockroachDB's range-based sharding docs,
-  for the "range-sharded plus a metadata service" family this design belongs to (interview question 7).
+  for the "range-sharded plus a metadata service" family this design belongs to (review question 7).
 - Amazon's original Dynamo paper, for the opposite family (ownerless, hash-ring, eventual
   consistency) and why its trade-offs differ from this design's.

@@ -38,8 +38,8 @@ decisions based on that ack; if a crash erases it, the system lied.
 leave a record half-old, half-new anywhere, and you cannot tell which half is which. Append-only
 plus checksums means "everything before the first bad record is trusted" (`wal.go:24-28`).
 
-**Interview:** *"A client got a success response from your write API. The server then lost power.
-What can the client assume?"* Model answer: only what the server promised at ack time. Ack after
+**Review question:** *"A client got a success response from your write API. The server then lost power.
+What can the client assume?"* Answer: only what the server promised at ack time. Ack after
 `write()` but before `fsync()`: nothing, the data was in the page cache. Ack after a successful
 fsync of the log: the record is on the device and will be replayed; the in-memory state is a pure
 function of the log, so it is reconstructible. Expect the follow-up "and if the file was just
@@ -63,7 +63,7 @@ writes per second regardless of cores or clients. Measure it: `kvctl bench -c 1`
 all N. Latency per writer stays ~1 fsync; throughput becomes N per fsync. Postgres, InnoDB and etcd
 all do it. It is Exercise 3.
 
-**Two things to know for interviews.**
+**Two things worth stating precisely.**
 - New files: fsyncing `kv.wal` persists its contents, not the directory entry that names it. On
   Linux a crash right after creation can leave a fully fsynced file that does not appear in the
   directory. Production WALs fsync the parent directory after create/rename. `wal.Open` does not; it
@@ -74,7 +74,7 @@ all do it. It is Exercise 3.
   log, do not retry. `wal.Append` returns the error; note the store keeps running afterwards.
   Production code panics here.
 
-**Interview:** *"Why not just call fsync less often?"* Model answer: you can, but then you must not
+**Review question:** *"Why not just call fsync less often?"* Answer: you can, but then you must not
 ack until the fsync that covers the write has completed. Delaying the ack is group commit (safe).
 Acking early is `-nosync` (loses acknowledged writes on power loss). The knob is *how many writes
 share an fsync*, never *whether the ack waits*.
@@ -105,7 +105,7 @@ bit rot, a misdirected write, someone editing the file). Silently skipping it wo
 (`wal_test.go:83-127`) cuts the last record at every byte boundary and requires exactly n-1
 survivors.
 
-**Interview:** *"Your log has a checksum failure in the middle. Do you skip it?"* Model answer: no.
+**Review question:** *"Your log has a checksum failure in the middle. Do you skip it?"* Answer: no.
 A torn write can only be the last thing written, so anything with valid data after it was
 acknowledged. Fail loudly and let an operator (in Phase 2, a replica with an intact copy) repair it.
 Skipping silently loses a committed write and replays later entries against the wrong state.
@@ -131,7 +131,7 @@ that points at the wrong bytes (the payload then fails its CRC).
 - A corrupted-but-plausible length. The header is not checksummed; it is caught only indirectly when
   the misread payload fails its CRC.
 
-**Interview:** *"Why a checksum per record rather than one for the whole file?"* Model answer:
+**Review question:** *"Why a checksum per record rather than one for the whole file?"* Answer:
 recovery needs to know *where* the valid prefix ends. A per-file checksum says the file is bad, not
 which record; per-record checksums let recovery keep everything before the damage and decide whether
 the damage is at the tail.
@@ -153,7 +153,7 @@ goroutines hammer one key, then the test compares the live value with the value 
 The WAL keeps its own invariant for the same reason: `Append` holds a mutex across the disk write so
 file order equals call order (`wal.go:68-71`).
 
-**Interview:** *"You want to add a TTL to keys. Where do you read the clock?"* Model answer: in the
+**Review question:** *"You want to add a TTL to keys. Where do you read the clock?"* Answer: in the
 caller, never in `apply`. Stamp the entry with an absolute expiry before logging so `apply` sees a
 constant; if `apply` called `time.Now()`, a replay hours later would expire keys differently than
 the live run. Same rule in Raft: the leader decides, the log records the decision, followers apply
@@ -187,7 +187,7 @@ or two clients incrementing the same key. The server cannot tell "same intent, r
 bytes, new intent". Identity must be assigned by the party that knows the intent: the client. That
 is why `RequestMeta` exists.
 
-**Interview:** *"What does exactly-once mean in your system, precisely?"* Model answer: each
+**Review question:** *"What does exactly-once mean in your system, precisely?"* Answer: each
 `(client_id, request_id)` is applied to the state machine at most once, and every retry observes the
 result of that one application. It is a property of the state machine plus a client contract (unique
 ids, reuse on retry, one outstanding request per client); delivery is still at-least-once. Kafka's
@@ -209,7 +209,7 @@ version every successful CAS increments, so downstream services can reject a sta
 Token bucket (Phase 5): a CAS loop on `(tokens, last_refill)`. Get/Put alone cannot build any of
 these because "check, then write" is not atomic.
 
-**Interview:** *"Design a distributed lock with a KV store."* Model answer: CAS on an absent key to
+**Review question:** *"Design a distributed lock with a KV store."* Answer: CAS on an absent key to
 acquire; store owner and expiry so a crashed holder does not hold it forever; release with
 `CAS(expected=mine, ...)` so you cannot release someone else's lock after your lease expired; hand
 out an increasing token per acquisition and require every protected write to carry it, because the

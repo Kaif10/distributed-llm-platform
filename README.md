@@ -67,7 +67,7 @@ timing. Nothing is staged or re-typed.*
 | **[DESIGN.md](DESIGN.md)** | Architecture, per-endpoint consistency guarantees, nine design trade-offs each naming the alternative rejected, two full request traces, failure modes |
 | **[BENCHMARKS.md](BENCHMARKS.md)** | Every measured number with the conditions that produced it |
 | **[docs/phase7.md](docs/phase7.md)** | The narrative write-up, including the parts where the approach was wrong |
-| `docs/phase1.md` … `docs/phase6.md` | Each layer in depth: design reasoning, war stories, exercises, interview Q&A |
+| `docs/phase1.md` … `docs/phase6.md` | Each layer in depth: design reasoning, war stories, exercises, review questions |
 | [ROADMAP.md](ROADMAP.md) | The original seven-phase plan |
 
 ## What it does
@@ -411,7 +411,7 @@ docker/     Dockerfiles + compose for real-container chaos
 k6/         load test against the gateway's streaming Generate RPC
 scripts/    e2e + chaos scenarios, and the demo recorder/renderer
 py/         Python client, inference worker, generated stubs
-docs/       per-phase write-ups, exercises, interview prep
+docs/       per-phase write-ups, exercises, review questions
 ```
 
 ## Status

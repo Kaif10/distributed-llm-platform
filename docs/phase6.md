@@ -38,7 +38,7 @@ precise statement of the gap, and §3 below walks it in full. The short version:
 the network-fault injection *are* fully pinned by the seed; the nemesis's live decision-making is
 pinned only given a state that itself depends on real wall-clock timing. That is materially weaker
 than true deterministic simulation, and materially more useful than an unseeded chaos test, and the
-difference between those two claims is worth being able to state exactly in an interview.
+difference between those two claims is worth being able to state exactly.
 
 **Three pieces, in dependency order.**
 
@@ -121,8 +121,8 @@ no more.
 ## 3. What "deterministic" means here, precisely
 
 This is `chaos/api.go`'s "What deterministic means here, precisely" section (`api.go:8-48`), walked
-in full, because it is the intellectual core of the phase and the section most likely to come up,
-almost verbatim, in a systems interview about testing distributed systems.
+in full, because it is the intellectual core of the phase and the part of this phase that matters most
+for anyone testing distributed systems.
 
 **Tier 1 — the workload: fully pinned.** Each client goroutine in the harness's KV workload
 (`chaos/harness.go:78-132`) owns its own `*rand.Rand`, seeded from the scenario seed plus its client
@@ -576,7 +576,7 @@ delivery, `:32-40`), `grpc_req_duration` p95 < 5000ms (the trustworthy latency s
 that bias), and `checks` rate > 0.95.
 
 **Result: 552 checks at 100% pass rate; the p95 latency threshold correctly FAILED at ~10.6s.** This
-is a good result, not a broken script, and worth being able to defend precisely in an interview: the
+is a good result, not a broken script, and worth being able to defend precisely: the
 run drove up to 20 concurrent VUs against only **two** mock inference workers (a deliberately small
 fleet), so `grpc_req_duration`'s p95 threshold failing means the system was doing exactly what a
 correctly-functioning rate-limit-free, admission-queue-free serving layer *should* do when demand
@@ -729,7 +729,7 @@ hypothesis, and only then decide whether it needs Exercise (b)'s bisection — w
 yet, so today that means manually varying duration/nemesis-interval/node count by hand the way war
 story 1's investigation did.
 
-## 11. Interview questions with model answers
+## 11. Review questions
 
 1. **What is deterministic simulation testing, and why do FoundationDB and TigerBeetle use it?**
    Running the entire system — or a faithful model of it — inside one process, driven by a simulated

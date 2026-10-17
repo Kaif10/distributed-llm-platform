@@ -398,8 +398,7 @@ customers" and "refund policy for trial customers" as very similar. The systems 
 of the tenant), and an exact-match-only mode, which is now the default (near-duplicate hits need
 `-cache-near`) — but **which risk is acceptable is a product decision**. (An earlier version of
 this paragraph listed tenant namespacing and an exact-only mode before either existed. An outside
-review caught it; both were then built.) Say that out loud in a design interview; the wrong
-answer is presenting a similarity threshold as a correctness guarantee. Two smaller honest notes:
+review caught it; both were then built.) The wrong design answer is presenting a similarity threshold as a correctness guarantee. Two smaller honest notes:
 expiry is judged by whichever replica looks, so skew shifts expiry by the skew — a hit-rate concern,
 never a correctness one (`:101-105`); and `Store` runs *after* the last token (`server.go:480-482`), so
 its embedding cost lands on the tail of the response, not the head, and with a real embedder the right
@@ -713,7 +712,7 @@ and the strongest argument for per-worker keys. `semcache/exact/<sha256>` — un
 construction, the one part that shards beautifully. Predict which becomes the bottleneck before
 measuring, then check.
 
-## 14. Interview questions with model answers
+## 14. Review questions
 
 1. **Design ChatGPT's serving layer.** Stateless gateways in front of a fleet of model workers, all
    shared state in a linearizable store. Per request, in order: per-tenant admission control (token

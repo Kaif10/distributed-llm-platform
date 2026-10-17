@@ -518,7 +518,7 @@ should fail; the former is a normal outcome (`api.go:63-65`) and it must pass. M
 goroutine and the worker scheduling seed-driven too, so a failing seed reproduces. This is the
 Phase 6 harness in miniature.
 
-## 12. Interview questions with model answers
+## 12. Review questions
 
 1. **Design a distributed task queue.** State the guarantee first: at-least-once execution,
    exactly-once commit, handlers idempotent on job id. Store every job as a record in a linearizable
@@ -634,6 +634,6 @@ Answer these in your own words, here, before starting Phase 5.
 - The etcd lease and `concurrency` package docs, for the replicated-state-machine alternative in
   section 5 and how a leader proposes time.
 - Amazon SQS visibility-timeout documentation and the Kafka consumer-group protocol's generation id,
-  for interview question 8.
+  for review question 8.
 - 6.5840 Lab 1 (MapReduce) — the coordinator's task timeout and reassignment is this phase's reaper
   with no fence, and worth re-reading now to see what it would let a zombie do.
