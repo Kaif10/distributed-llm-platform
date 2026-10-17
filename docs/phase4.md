@@ -6,9 +6,9 @@ Code: `sched/` (`api.go`, `queue.go`, `leader.go`), `sched/worker`, `sched/grpcs
 Run: `make test-sched` (chaos test under `-race`, `Makefile:45-47`), `make e2e-sched` (real
 processes, `Makefile:51-52`), `go test -run OverRaftKV ./sched/`.
 
-Build note: the queue core (`sched/queue.go`, `sched/leader.go`) and the worker contract
-(`sched/worker/worker.go`) were written by hand and are the two places where a wrong invariant
-would silently produce a job that ran to completion twice with both results recorded. Everything
+Where correctness lives: the queue core (`sched/queue.go`, `sched/leader.go`) and the worker
+contract (`sched/worker/worker.go`) are the two places where a wrong invariant would silently
+produce a job that ran to completion twice with both results recorded. Everything
 else — gRPC translation, the KV adapter, the client-library extraction from `kvctl`, the Python
 port, the e2e script — is plumbing around those two files and was reviewed against them.
 

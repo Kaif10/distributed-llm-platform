@@ -5,13 +5,11 @@ Code: `shard/shard.go`, `shardkv/` (`api.go`, `raftcommand.go`, `server.go`), `s
 `cmd/kvctl`, `proto/shardctrl/v1`, `proto/shardkv/v1`.
 Run: `go test ./shardkv/...`, `go test ./shardctrl/...`, `go test -run Linearizability ./shardkv/...`.
 
-Build note, honestly stated: this phase's scaffolding (proto, generated stubs, cmd wiring, test
-harnesses) was produced with heavy parallel-agent orchestration. The two pieces that decide whether
-the whole thing is *correct* — `applyConfig`/`applyMigration` in `shardkv/server.go` and the
-rebalancing algorithm in `shardctrl/machine.go` — were written by hand, because these are exactly the
-places where a subtly wrong invariant does not show up until a specific interleaving hits it in
-production. Everything downstream of those two functions was reviewed against them, not the other
-way around.
+Where correctness lives: two pieces decide whether the whole phase is *correct* —
+`applyConfig`/`applyMigration` in `shardkv/server.go` and the rebalancing algorithm in
+`shardctrl/machine.go`. These are exactly the places where a subtly wrong invariant does not show up
+until a specific interleaving hits it in production. Everything else (protos, generated stubs, cmd
+wiring, test harnesses) is plumbing, reviewed against those two functions, not the other way round.
 
 ## 1. What Phase 3 builds and why
 

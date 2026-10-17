@@ -7,7 +7,7 @@ Code: `kvapi/kvapi.go`, `ratelimit/`, `router/`, `semcache/` (`semcache.go`, `em
 Run: `make test-llm` (`Makefile:55-56`), `make e2e-llm` (real processes, `Makefile:61-62`),
 `go test -bench LookupNear ./semcache/`.
 
-Build note. Three files decide whether this is correct and were written by hand: `ratelimit.Take`'s
+Where correctness lives: three pieces decide whether this phase is correct: `ratelimit.Take`'s
 CAS loop (`ratelimit/ratelimit.go:150-200`), `router.score` (`router/router.go:283-285` — four lines,
 and wrong the first time, §9.1), and `gateway.streamFromWorkers` (`gateway/server.go:332-503`), which
 owns every goroutine and every context in the request path. The protos, generated stubs, Python
