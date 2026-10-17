@@ -13,7 +13,7 @@ Run: `make test-chaos` (`Makefile:64-67`), `make simrun` (`:69-71`), `make chaos
 Build note. This phase adds no new storage engine, no new consensus code, no new RPC surface —
 every invariant it checks was built in Phases 1-5. What it adds is the harness that proves those
 invariants hold under simultaneous, seeded, adversarial conditions, and the observability to watch
-it happen. Three files carry the intellectual weight and were written and rewritten by hand:
+it happen. Three files carry the intellectual weight, and each was rewritten after testing proved it wrong:
 `chaos/nemesis.go`'s `chooseEvent` (the majority bound, §4 and war story 1), `chaos/harness.go`'s
 `Run` (the exact post-run sequence, §4 and war story 1), and `chaos/api.go`'s package doc (the
 precise statement of what "deterministic" means, §3 and war story 2 — this was rewritten late,
