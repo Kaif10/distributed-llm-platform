@@ -60,6 +60,27 @@ timing. Nothing is staged or re-typed.*
 
 ---
 
+## How this was built
+
+I built this over about three and a half weeks (12 September to 6 October 2026) to learn
+distributed systems by building one end to end. I used AI coding agents (Claude Code)
+throughout. I set the goals and scope, chose between design options at each phase, decided
+what counted as done, and commissioned three independent reviews. The agents wrote most of
+the code and documentation under that direction. Some fix rounds ran several agents in
+parallel on separate git worktrees, which is why the history contains `worktree-agent-…`
+merges.
+
+Because the code is generated, it is trusted only on evidence:
+
+- **Checks of outcomes, not of code paths.** Linearizability checking with Porcupine, chaos
+  runs whose checks are each shown catching an injected bug, exactly-once accounting for the
+  scheduler, and multi-process end-to-end runs against real binaries.
+- **Outside review.** Every finding from the three reviews was reproduced with a test that
+  failed before the fix (the bug record below lists them).
+- **Corrections in place.** This section was briefly removed (2d53e80) and is restored here.
+  Earlier docs also overstated hand-authorship and the project's duration. Those claims were
+  corrected in b159896 and 3b84eac, and the history shows both versions.
+
 ## Start here
 
 | Document | What's in it |
